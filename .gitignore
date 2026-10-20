@@ -1,0 +1,47 @@
+# Local documentation and reference manuals
+doc/
+
+# Visual Studio state and per-user project settings
+.vs/
+*.user
+*.suo
+*.sdf
+*.opensdf
+*.aps
+*.VC.db
+*.VC.opendb
+ipch/
+
+# Build trees and intermediates
+build/
+bin/
+obj/
+x64/
+ARM64/
+*.obj
+*.lib
+*.exp
+*.ilk
+*.iobj
+*.ipdb
+*.tlog
+*.lastbuildstate
+*.recipe
+*.Build.CppClean.log
+*.nativecodeanalysis.xml
+vc.nativecodeanalysis.all.xml
+*.log
+
+# Produced binaries, packages and signatures
+*.exe
+*.dll
+*.sys
+*.efi
+*.pdb
+*.cat
+*.cer
+*.pfx
+*.dmp
+
+# Dependency trees restored by vcpkg
+vcpkg_installed/

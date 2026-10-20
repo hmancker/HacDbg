@@ -1,0 +1,9 @@
+{
+  "dependencies": [
+    "keystone",
+    "zydis",
+    "spdlog",
+    "cli11"
+  ],
+  "builtin-baseline": "2750401336fb7c95f6619657a46a7e798661341c"
+}
