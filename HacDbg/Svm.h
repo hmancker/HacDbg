@@ -31,7 +31,6 @@
 
 #define SVM_EXIT_CPUID                        0x0072ull
 #define SVM_EXIT_MSR                          0x007cull
-#define SVM_EXIT_VMRUN                        0x0080ull
 #define SVM_EXIT_NPF                          0x0400ull
 
 #define SVM_TLB_CONTROL_FLUSH_GUEST           3ull
@@ -213,8 +212,7 @@ typedef struct _SVM_GUEST_CONTEXT
     VMCB* Vmcb;
     SVM_GUEST_REGISTERS* Registers;
     struct _SVM_PROCESSOR_CONTEXT* ProcessorContext;
-    UINT8 StopRequested;
-    UINT8 Reserved[7];
+    UINT8 Reserved[8];
 } SVM_GUEST_CONTEXT;
 
 /**

@@ -12,6 +12,7 @@
 #include "Logs.h"
 #include "Npt.h"
 #include "PhysicalMemory.h"
+#include "Debug.h"
 #include "../shared/hypercall/control.h"
 
 #define HACDBG_MAX_PROCESSORS 256
@@ -19,6 +20,7 @@
 C_ASSERT(sizeof(HACDBG_VERSION_INFO) == 0x30);
 C_ASSERT(sizeof(HACDBG_VERSION_STRING) <= HACDBG_VERSION_STRING_SIZE);
 
+#if HACDBG_DIAGNOSTICS
 #define HACDBG_LOAD_STAGE_START          0
 #define HACDBG_LOAD_STAGE_SVM_SUPPORT    1
 #define HACDBG_LOAD_STAGE_PHYSICAL_MEMORY 2
@@ -30,6 +32,7 @@ C_ASSERT(sizeof(HACDBG_VERSION_STRING) <= HACDBG_VERSION_STRING_SIZE);
 #define HACDBG_LOAD_STAGE_PROCESSORS     8
 #define HACDBG_LOAD_STAGE_COMPLETE       9
 #define HACDBG_REGISTRY_PATH_CHARS       512
+#endif
 
 EXTERN_C VOID
 SvmLaunchVm(
@@ -45,6 +48,8 @@ static PDEVICE_OBJECT g_DeviceObject;
 
 DRIVER_INITIALIZE DriverEntry;
 
+#if HACDBG_DIAGNOSTICS
+// 把加载阶段和状态写入服务注册表，便于失败后定位。
 static VOID
 HacDbgWriteRegistryDword(
     _In_ PCUNICODE_STRING RegistryPath,
@@ -67,6 +72,7 @@ HacDbgWriteRegistryDword(
                           REG_DWORD, &Value, sizeof(Value));
 }
 
+// 记录当前阶段和 NTSTATUS。
 static VOID
 HacDbgRecordLoadStatus(
     _In_ PCUNICODE_STRING RegistryPath,
@@ -78,6 +84,7 @@ HacDbgRecordLoadStatus(
     HacDbgWriteRegistryDword(RegistryPath, L"LastLoadStatus", (ULONG)Status);
 }
 
+// 记录阶段内部的细分失败原因。
 static VOID
 HacDbgRecordLoadDetail(
     _In_ PCUNICODE_STRING RegistryPath,
@@ -87,6 +94,7 @@ HacDbgRecordLoadDetail(
     HacDbgWriteRegistryDword(RegistryPath, L"LastLoadDetail", Detail);
 }
 
+// 记录失败阶段并原样返回状态码。
 static NTSTATUS
 HacDbgRecordFailure(
     _In_ PCUNICODE_STRING RegistryPath,
@@ -97,7 +105,16 @@ HacDbgRecordFailure(
     HacDbgRecordLoadStatus(RegistryPath, Stage, Status);
     return Status;
 }
+#else
+//
+// 诊断关闭时，这三个记录点编译为空；失败路径仍然原样返回状态码。
+//
+#define HacDbgRecordLoadStatus(...) ((VOID)0)
+#define HacDbgRecordLoadDetail(...) ((VOID)0)
+#define HacDbgRecordFailure(RegistryPath, Stage, Status) (Status)
+#endif
 
+// 在当前逻辑处理器上启用 SVM，并切入 VMRUN 循环。
 static VOID
 SvmVirtualizeProcessor(
     _Inout_ SVM_PROCESSOR_CONTEXT* ProcessorContext
@@ -114,7 +131,7 @@ SvmVirtualizeProcessor(
 
     if (!NT_SUCCESS(SvmCheckSupport()))
     {
-        DbgPrint("HacDbg: Err, SVM support disappeared on processor %u.\n",
+        HACDBG_LOG("HacDbg: Err, SVM support disappeared on processor %u.\n",
                  KeGetCurrentProcessorNumber());
         ProcessorContext->LaunchCompleted = TRUE;
         return;
@@ -122,10 +139,7 @@ SvmVirtualizeProcessor(
 
     ProcessorContext->StopRequested = FALSE;
     ProcessorContext->Virtualized = TRUE;
-    //
-    // Keep interrupts out of the window where the processor leaves its
-    // original stack and enters the host VMRUN stack.
-    //
+    // 关中断，避免切换宿主栈期间被中断打断。
     _disable();
     //
     // INVARIANT: The per-processor VMCB and host save area are 4 KiB-aligned,
@@ -139,14 +153,12 @@ SvmVirtualizeProcessor(
     //
     __svm_clgi();
 
-    //
-    // INVARIANT: HostStack is a nonpaged 32 KiB stack owned by this
-    // processor, and both VMCBs are mapped in the host address space.
-    //
+    // HostStack 是本处理器独占的 32 KiB 非分页栈。
     SvmLaunchVm(ProcessorContext,
                 (PVOID)((ULONG_PTR)ProcessorContext->HostStack + 0x8000));
 }
 
+// 用停止 CPUID 让当前处理器退出 VMRUN。
 static VOID
 SvmStopProcessor(
     _Inout_ SVM_PROCESSOR_CONTEXT* ProcessorContext
@@ -163,6 +175,7 @@ SvmStopProcessor(
     __cpuidex(registers, HACDBG_STOP_CPUID_LEAF, HACDBG_STOP_CPUID_SUBLEAF);
 }
 
+// 释放单个处理器的 VMCB、宿主保存区和宿主栈。
 static VOID
 SvmFreeProcessorContext(
     _Inout_ SVM_PROCESSOR_CONTEXT* ProcessorContext
@@ -188,6 +201,7 @@ SvmFreeProcessorContext(
     ExFreePoolWithTag(ProcessorContext, 'VcaH');
 }
 
+// 先建好全部处理器上下文，再逐个进入 VMRUN。
 static NTSTATUS
 SvmStartAllProcessors(
     VOID
@@ -202,11 +216,7 @@ SvmStartAllProcessors(
         return STATUS_NOT_SUPPORTED;
     }
 
-    //
-    // Build every per-processor context before any VMRUN. Hiding VMCB pages
-    // allocates NPT split tables, so no guest may be running while these
-    // tables are being edited.
-    //
+    // 隐藏 VMCB 页会分配 NPT 拆分页，必须在任何客户运行前完成。
     for (index = 0; index < g_ProcessorCount; index++)
     {
         PROCESSOR_NUMBER processorNumber;
@@ -289,6 +299,7 @@ SvmStartAllProcessors(
     return status;
 }
 
+// 让所有已虚拟化的处理器退出客户。
 static VOID
 SvmStopAllProcessors(
     VOID
@@ -324,6 +335,7 @@ SvmStopAllProcessors(
     }
 }
 
+// 恢复 S0 后重新虚拟化所有处理器。
 static NTSTATUS
 SvmRestartAllProcessors(
     VOID
@@ -376,6 +388,7 @@ SvmRestartAllProcessors(
     return STATUS_SUCCESS;
 }
 
+// 睡眠前停止 SVM，恢复后重新启动。
 static VOID
 SvmPowerCallback(
     _In_ PVOID CallbackContext,
@@ -399,7 +412,7 @@ SvmPowerCallback(
             status = SvmRestartAllProcessors();
             if (!NT_SUCCESS(status))
             {
-                DbgPrint("HacDbg: Err, processor virtualization after resume failed: 0x%08x.\n", status);
+                HACDBG_LOG("HacDbg: Err, processor virtualization after resume failed: 0x%08x.\n", status);
             }
             else
             {
@@ -415,6 +428,7 @@ SvmPowerCallback(
     }
 }
 
+// 在目标处理器上执行刷新 CPUID，触发 NPT TLB 刷新。
 static ULONG_PTR
 NTAPI
 HacDbgFlushIpi(
@@ -428,6 +442,7 @@ HacDbgFlushIpi(
     return 0;
 }
 
+// 完成一个成功返回的 IRP。
 static NTSTATUS
 HacDbgCompleteSuccess(
     _Inout_ PIRP Irp
@@ -439,6 +454,7 @@ HacDbgCompleteSuccess(
     return STATUS_SUCCESS;
 }
 
+// 允许三环打开控制设备。
 static NTSTATUS
 _Dispatch_type_(IRP_MJ_CREATE)
 HacDbgCreate(
@@ -450,6 +466,7 @@ HacDbgCreate(
     return HacDbgCompleteSuccess(Irp);
 }
 
+// 关闭控制设备句柄。
 static NTSTATUS
 _Dispatch_type_(IRP_MJ_CLOSE)
 HacDbgClose(
@@ -461,6 +478,7 @@ HacDbgClose(
     return HacDbgCompleteSuccess(Irp);
 }
 
+// 句柄清理，当前无需额外处理。
 static NTSTATUS
 _Dispatch_type_(IRP_MJ_CLEANUP)
 HacDbgCleanup(
@@ -472,6 +490,7 @@ HacDbgCleanup(
     return HacDbgCompleteSuccess(Irp);
 }
 
+// 分派 hypercall 和 NPT 刷新 IOCTL，并要求管理员权限。
 static NTSTATUS
 _Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 HacDbgDeviceControl(
@@ -504,7 +523,7 @@ HacDbgDeviceControl(
 
     if (isAdmin == FALSE)
     {
-        DbgPrint("HacDbg: Err, IOCTL 0x%08x denied for non-admin caller.\n",
+        HACDBG_LOG("HacDbg: Err, IOCTL 0x%08x denied for non-admin caller.\n",
                  stack->Parameters.DeviceIoControl.IoControlCode);
         status = STATUS_ACCESS_DENIED;
     }
@@ -520,7 +539,7 @@ HacDbgDeviceControl(
         if (inputLength < sizeof(*request) || outputLength < sizeof(*request) ||
             Irp->AssociatedIrp.SystemBuffer == NULL)
         {
-            DbgPrint("HacDbg: Err, hypercall IOCTL buffer too small: in=%u out=%u need=%u.\n",
+            HACDBG_LOG("HacDbg: Err, hypercall IOCTL buffer too small: in=%u out=%u need=%u.\n",
                      inputLength, outputLength, (ULONG)sizeof(*request));
             status = STATUS_BUFFER_TOO_SMALL;
         }
@@ -533,7 +552,7 @@ HacDbgDeviceControl(
             {
                 request->Status = (UINT32)status;
                 request->Result = 0;
-                DbgPrint("HacDbg: Err, IOCTL hypercall dispatch failed: 0x%08x.\n", status);
+                HACDBG_LOG("HacDbg: Err, IOCTL hypercall dispatch failed: 0x%08x.\n", status);
             }
 
             Irp->IoStatus.Information = sizeof(*request);
@@ -546,7 +565,7 @@ HacDbgDeviceControl(
 
         if (outputLength < sizeof(*version) || Irp->AssociatedIrp.SystemBuffer == NULL)
         {
-            DbgPrint("HacDbg: Err, version IOCTL buffer too small: out=%u need=%u.\n",
+            HACDBG_LOG("HacDbg: Err, version IOCTL buffer too small: out=%u need=%u.\n",
                      outputLength, (ULONG)sizeof(*version));
             status = STATUS_BUFFER_TOO_SMALL;
         }
@@ -567,7 +586,7 @@ HacDbgDeviceControl(
     }
     else
     {
-        DbgPrint("HacDbg: Err, unknown IOCTL 0x%08x in=%u out=%u.\n",
+        HACDBG_LOG("HacDbg: Err, unknown IOCTL 0x%08x in=%u out=%u.\n",
                  stack->Parameters.DeviceIoControl.IoControlCode, inputLength, outputLength);
         status = STATUS_INVALID_DEVICE_REQUEST;
     }
@@ -583,6 +602,7 @@ HacDbgDeviceControl(
     return status;
 }
 
+// 创建 \Device\HacDbg 及其符号链接。
 static NTSTATUS
 HacDbgCreateDevice(
     _In_ PDRIVER_OBJECT DriverObject
@@ -629,6 +649,7 @@ HacDbgCreateDevice(
     return STATUS_SUCCESS;
 }
 
+// 删除控制设备和符号链接。
 static VOID
 HacDbgDeleteDevice(
     VOID
@@ -647,6 +668,7 @@ HacDbgDeleteDevice(
     g_DeviceObject = NULL;
 }
 
+// 卸载：停止所有处理器，再释放全局资源。
 static VOID
 DriverUnload(
     _In_ PDRIVER_OBJECT DriverObject
@@ -656,7 +678,7 @@ DriverUnload(
 
     UNREFERENCED_PARAMETER(DriverObject);
 
-    DbgPrint("HacDbg: DriverUnload start.\n");
+    HACDBG_LOG("HacDbg: DriverUnload start.\n");
 
     if (g_PowerCallbackRegistration != NULL)
     {
@@ -686,9 +708,10 @@ DriverUnload(
     NptCleanup();
     PhysicalMemoryCleanup();
 
-    DbgPrint("HacDbg: DriverUnload complete.\n");
+    HACDBG_LOG("HacDbg: DriverUnload complete.\n");
 }
 
+// 驱动入口：按固定顺序初始化各模块，最后虚拟化所有处理器。
 EXTERN_C NTSTATUS
 DriverEntry(
     _In_ PDRIVER_OBJECT DriverObject,
@@ -700,11 +723,12 @@ DriverEntry(
     OBJECT_ATTRIBUTES callbackAttributes;
     PCALLBACK_OBJECT callbackObject;
 
+    HACDBG_LOG("HacDbg: DriverEntry start: driver version %s.\n", HACDBG_VERSION_STRING);
+
+#if !HACDBG_DIAGNOSTICS
     UNREFERENCED_PARAMETER(RegistryPath);
+#endif
 
-    DbgPrint("HacDbg: DriverEntry start: driver version %s.\n", HACDBG_VERSION_STRING);
-
-    ExInitializeDriverRuntime(DrvRtPoolNxOptIn);
     DriverObject->DriverUnload = DriverUnload;
     HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_START, STATUS_SUCCESS);
     HacDbgRecordLoadDetail(RegistryPath, 0);
@@ -714,21 +738,21 @@ DriverEntry(
     status = SvmCheckSupport();
     if (!NT_SUCCESS(status))
     {
-        DbgPrint("HacDbg: Err, SVM or NPT is unavailable.\n");
+        HACDBG_LOG("HacDbg: Err, SVM or NPT is unavailable.\n");
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_SVM_SUPPORT, status);
     }
 
     status = PhysicalMemoryInitialize();
     if (!NT_SUCCESS(status))
     {
-        DbgPrint("HacDbg: Err, physical memory map initialization failed: 0x%08x.\n", status);
+        HACDBG_LOG("HacDbg: Err, physical memory map initialization failed: 0x%08x.\n", status);
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_PHYSICAL_MEMORY, status);
     }
 
     status = NptInitialize();
     if (!NT_SUCCESS(status))
     {
-        DbgPrint("HacDbg: Err, nested page table initialization failed: 0x%08x.\n", status);
+        HACDBG_LOG("HacDbg: Err, nested page table initialization failed: 0x%08x.\n", status);
         NptCleanup();
         PhysicalMemoryCleanup();
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_NPT, status);
@@ -737,7 +761,7 @@ DriverEntry(
     status = LogsInitialize();
     if (!NT_SUCCESS(status))
     {
-        DbgPrint("HacDbg: Err, log initialization failed: 0x%08x.\n", status);
+        HACDBG_LOG("HacDbg: Err, log initialization failed: 0x%08x.\n", status);
         NptCleanup();
         PhysicalMemoryCleanup();
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_LOGS, status);
@@ -746,7 +770,7 @@ DriverEntry(
     status = SvmInitializeShared();
     if (!NT_SUCCESS(status))
     {
-        DbgPrint("HacDbg: Err, MSR permission map initialization failed: 0x%08x.\n", status);
+        HACDBG_LOG("HacDbg: Err, MSR permission map initialization failed: 0x%08x.\n", status);
         HacDbgRecordLoadDetail(RegistryPath, SvmGetSharedFailureDetail());
         LogsCleanup();
         NptCleanup();
@@ -757,7 +781,7 @@ DriverEntry(
     status = HacDbgCreateDevice(DriverObject);
     if (!NT_SUCCESS(status))
     {
-        DbgPrint("HacDbg: Err, control device creation failed: 0x%08x.\n", status);
+        HACDBG_LOG("HacDbg: Err, control device creation failed: 0x%08x.\n", status);
         SvmCleanupShared();
         LogsCleanup();
         NptCleanup();
@@ -773,7 +797,7 @@ DriverEntry(
     status = ExCreateCallback(&callbackObject, &callbackAttributes, FALSE, TRUE);
     if (!NT_SUCCESS(status))
     {
-        DbgPrint("HacDbg: Err, power callback open failed: 0x%08x.\n", status);
+        HACDBG_LOG("HacDbg: Err, power callback open failed: 0x%08x.\n", status);
         HacDbgDeleteDevice();
         SvmCleanupShared();
         LogsCleanup();
@@ -787,7 +811,7 @@ DriverEntry(
 
     if (g_PowerCallbackRegistration == NULL)
     {
-        DbgPrint("HacDbg: Err, power callback registration failed.\n");
+        HACDBG_LOG("HacDbg: Err, power callback registration failed.\n");
         HacDbgDeleteDevice();
         SvmCleanupShared();
         LogsCleanup();
@@ -801,7 +825,7 @@ DriverEntry(
     {
         ULONG index;
 
-        DbgPrint("HacDbg: Err, processor virtualization failed: 0x%08x.\n", status);
+        HACDBG_LOG("HacDbg: Err, processor virtualization failed: 0x%08x.\n", status);
         HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_PROCESSORS, status);
         SvmStopAllProcessors();
         HacDbgDeleteDevice();
@@ -831,6 +855,6 @@ DriverEntry(
 
     g_VirtualizationSuspended = FALSE;
     HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_COMPLETE, STATUS_SUCCESS);
-    DbgPrint("HacDbg: DriverEntry complete.\n");
+    HACDBG_LOG("HacDbg: DriverEntry complete.\n");
     return STATUS_SUCCESS;
 }

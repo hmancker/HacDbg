@@ -6,6 +6,7 @@
  */
 
 #include "Logs.h"
+#include "Debug.h"
 #include "PhysicalMemory.h"
 
 #define HACDBG_LOGS_TAG     'GcaH'
@@ -16,6 +17,7 @@ static UINT64 g_LogCount;
 static UINT64 g_LogNext;
 static HACDBG_SPIN_LOCK g_LogLock;
 
+// 分配非分页日志环。
 NTSTATUS
 LogsInitialize(
     VOID
@@ -31,7 +33,7 @@ LogsInitialize(
                                                  HACDBG_LOGS_TAG);
     if (g_Logs == NULL)
     {
-        DbgPrint("HacDbg: Err, log ring allocation failed: %Iu bytes.\n",
+        HACDBG_LOG("HacDbg: Err, log ring allocation failed: %Iu bytes.\n",
                  sizeof(trap_frame_log_t) * HACDBG_LOG_CAPACITY);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -44,6 +46,7 @@ LogsInitialize(
     return STATUS_SUCCESS;
 }
 
+// 释放日志环。
 VOID
 LogsCleanup(
     VOID
@@ -60,6 +63,7 @@ LogsCleanup(
     g_LogNext = 0;
 }
 
+// 追加一条日志，写满后覆盖最旧记录。
 VOID
 LogsAdd(
     _In_ const trap_frame_log_t* Log
@@ -78,6 +82,7 @@ LogsAdd(
     HacDbgSpinLockRelease(&g_LogLock);
 }
 
+// 把待处理日志写入客户缓冲区并清空；写入失败返回 -1。
 UINT64
 LogsFlush(
     _In_ UINT64 DestinationCr3,
@@ -99,7 +104,7 @@ LogsFlush(
 
     if (count != 0)
     {
-        DbgPrint("HacDbg: flushing %I64u log entries cr3=0x%I64x destination=0x%I64x.\n",
+        HACDBG_LOG("HacDbg: flushing %I64u log entries cr3=0x%I64x destination=0x%I64x.\n",
                  count, DestinationCr3, Destination.Value);
     }
 
@@ -111,7 +116,7 @@ LogsFlush(
                               &g_Logs[sourceIndex],
                               sizeof(trap_frame_log_t)) != sizeof(trap_frame_log_t))
         {
-            DbgPrint("HacDbg: Err, log flush write failed index=%I64u cr3=0x%I64x "
+            HACDBG_LOG("HacDbg: Err, log flush write failed index=%I64u cr3=0x%I64x "
                      "destination=0x%I64x.\n",
                      index, DestinationCr3,
                      Destination.Value + (index * sizeof(trap_frame_log_t)));

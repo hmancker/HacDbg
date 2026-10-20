@@ -6,6 +6,7 @@
  */
 
 #include "PhysicalMemory.h"
+#include "Debug.h"
 
 #define HACDBG_PHYSICAL_TAG        'PcaH'
 #define HACDBG_PHYSICAL_MAP_CHUNK  0x200000ull
@@ -23,14 +24,22 @@ static BOOLEAN g_FiveLevelPaging;
 static volatile LONG g_PhysicalFailureLogCount;
 static volatile LONG g_TranslationFailureLogCount;
 
+// 每条失败路径最多打印 64 次，避免刷屏。
 static BOOLEAN
 PhysicalMemoryShouldLogFailure(
     _Inout_ volatile LONG* Counter
     )
 {
+#if HACDBG_DISABLE_DEBUG_LOG
+    // 日志关闭时不累计计数，直接跳过整段输出。
+    UNREFERENCED_PARAMETER(Counter);
+    return FALSE;
+#else
     return InterlockedIncrement(Counter) <= 64;
+#endif
 }
 
+// 释放 RAM 范围表。
 static VOID
 PhysicalMemoryFreeRanges(
     VOID
@@ -45,6 +54,7 @@ PhysicalMemoryFreeRanges(
     g_RangeCount = 0;
 }
 
+// 查找物理地址所在的 RAM 范围，并返回剩余可用字节数。
 static BOOLEAN
 PhysicalMemoryFindRange(
     _In_ UINT64 Address,
@@ -66,6 +76,7 @@ PhysicalMemoryFindRange(
     return FALSE;
 }
 
+// 把请求长度裁剪到 RAM 范围和单次映射上限。
 static SIZE_T
 PhysicalMemoryAvailableSize(
     _In_ UINT64 Address,
@@ -92,6 +103,7 @@ PhysicalMemoryAvailableSize(
     return Size;
 }
 
+// 读取固件 RAM 范围表，只记录，不建立常驻映射。
 NTSTATUS
 PhysicalMemoryInitialize(
     VOID
@@ -110,7 +122,7 @@ PhysicalMemoryInitialize(
     ranges = MmGetPhysicalMemoryRanges();
     if (ranges == NULL)
     {
-        DbgPrint("HacDbg: Err, MmGetPhysicalMemoryRanges returned NULL.\n");
+        HACDBG_LOG("HacDbg: Err, MmGetPhysicalMemoryRanges returned NULL.\n");
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
@@ -121,7 +133,7 @@ PhysicalMemoryInitialize(
 
     if (rangeCount == 0)
     {
-        DbgPrint("HacDbg: Err, firmware reported no RAM ranges.\n");
+        HACDBG_LOG("HacDbg: Err, firmware reported no RAM ranges.\n");
         ExFreePool(ranges);
         return STATUS_NOT_FOUND;
     }
@@ -131,7 +143,7 @@ PhysicalMemoryInitialize(
                                                 HACDBG_PHYSICAL_TAG);
     if (g_Ranges == NULL)
     {
-        DbgPrint("HacDbg: Err, RAM range table allocation failed for %u entries.\n", rangeCount);
+        HACDBG_LOG("HacDbg: Err, RAM range table allocation failed for %u entries.\n", rangeCount);
         ExFreePool(ranges);
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -157,7 +169,7 @@ PhysicalMemoryInitialize(
 
         if (end > HACDBG_GUEST_PHYSICAL_LIMIT)
         {
-            DbgPrint("HacDbg: Err, RAM range [0x%I64x, 0x%I64x) exceeds the 1 TiB NPT limit.\n",
+            HACDBG_LOG("HacDbg: Err, RAM range [0x%I64x, 0x%I64x) exceeds the 1 TiB NPT limit.\n",
                      start, end);
             status = STATUS_NOT_SUPPORTED;
             break;
@@ -172,17 +184,18 @@ PhysicalMemoryInitialize(
 
     if (!NT_SUCCESS(status) || g_RangeCount == 0)
     {
-        DbgPrint("HacDbg: Err, RAM range scan failed: status=0x%08x count=%u.\n",
+        HACDBG_LOG("HacDbg: Err, RAM range scan failed: status=0x%08x count=%u.\n",
                  status, g_RangeCount);
         PhysicalMemoryFreeRanges();
         return NT_SUCCESS(status) ? STATUS_NOT_FOUND : status;
     }
 
-    DbgPrint("HacDbg: RAM map ready: %u ranges.\n", g_RangeCount);
+    HACDBG_LOG("HacDbg: RAM map ready: %u ranges.\n", g_RangeCount);
     g_Initialized = TRUE;
     return STATUS_SUCCESS;
 }
 
+// 释放 RAM 范围表。
 VOID
 PhysicalMemoryCleanup(
     VOID
@@ -197,6 +210,7 @@ PhysicalMemoryCleanup(
     g_Initialized = FALSE;
 }
 
+// 记录客户是否启用五级页表。
 VOID
 PhysicalMemorySetFiveLevelPaging(
     _In_ BOOLEAN Enabled
@@ -205,6 +219,7 @@ PhysicalMemorySetFiveLevelPaging(
     g_FiveLevelPaging = Enabled;
 }
 
+// 临时映射一段客户物理内存，优先 MmMapIoSpace，失败后退回 MmMapIoSpaceEx。
 PVOID
 PhysicalMemoryMapTemporary(
     _In_ GUEST_PHYSICAL_ADDRESS Address,
@@ -226,7 +241,7 @@ PhysicalMemoryMapTemporary(
     {
         if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
         {
-            DbgPrint("HacDbg: Err, physical map rejected pa=0x%I64x size=0x%I64x irql=%u.\n",
+            HACDBG_LOG("HacDbg: Err, physical map rejected pa=0x%I64x size=0x%I64x irql=%u.\n",
                      Address.Value, (UINT64)Size, KeGetCurrentIrql());
         }
         return NULL;
@@ -237,7 +252,7 @@ PhysicalMemoryMapTemporary(
     {
         if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
         {
-            DbgPrint("HacDbg: Err, physical map rejected pa=0x%I64x: not in %u RAM ranges.\n",
+            HACDBG_LOG("HacDbg: Err, physical map rejected pa=0x%I64x: not in %u RAM ranges.\n",
                      Address.Value, g_RangeCount);
         }
         return NULL;
@@ -249,7 +264,7 @@ PhysicalMemoryMapTemporary(
     {
         if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
         {
-            DbgPrint("HacDbg: Err, MmMapIoSpace cached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
+            HACDBG_LOG("HacDbg: Err, MmMapIoSpace cached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
                      Address.Value, (UINT64)Size, KeGetCurrentIrql());
         }
 
@@ -258,7 +273,7 @@ PhysicalMemoryMapTemporary(
         {
             if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
             {
-                DbgPrint("HacDbg: Err, MmMapIoSpaceEx cached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
+                HACDBG_LOG("HacDbg: Err, MmMapIoSpaceEx cached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
                          Address.Value, (UINT64)Size, KeGetCurrentIrql());
             }
 
@@ -267,7 +282,7 @@ PhysicalMemoryMapTemporary(
             {
                 if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
                 {
-                    DbgPrint("HacDbg: Err, MmMapIoSpaceEx noncached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
+                    HACDBG_LOG("HacDbg: Err, MmMapIoSpaceEx noncached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
                              Address.Value, (UINT64)Size, KeGetCurrentIrql());
                 }
                 return NULL;
@@ -279,6 +294,7 @@ PhysicalMemoryMapTemporary(
     return mapped;
 }
 
+// 解除临时映射。
 VOID
 PhysicalMemoryUnmapTemporary(
     _In_ PVOID Base,
@@ -291,6 +307,7 @@ PhysicalMemoryUnmapTemporary(
     }
 }
 
+// 按页跨页复制；读优先 MmCopyMemory，写使用临时映射。
 static SIZE_T
 PhysicalMemoryCopy(
     _In_ GUEST_PHYSICAL_ADDRESS Address,
@@ -324,7 +341,7 @@ PhysicalMemoryCopy(
             {
                 if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
                 {
-                    DbgPrint("HacDbg: Err, physical read rejected pa=0x%I64x size=0x%I64x.\n",
+                    HACDBG_LOG("HacDbg: Err, physical read rejected pa=0x%I64x size=0x%I64x.\n",
                              Address.Value + copied, (UINT64)(Size - copied));
                 }
                 break;
@@ -345,7 +362,7 @@ PhysicalMemoryCopy(
 
             if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
             {
-                DbgPrint("HacDbg: Err, MmCopyMemory read failed pa=0x%I64x size=0x%I64x "
+                HACDBG_LOG("HacDbg: Err, MmCopyMemory read failed pa=0x%I64x size=0x%I64x "
                          "status=0x%08x transferred=0x%I64x; falling back to mapping.\n",
                          Address.Value + copied, (UINT64)copySize, copyStatus, (UINT64)transferred);
             }
@@ -376,6 +393,7 @@ PhysicalMemoryCopy(
     return copied;
 }
 
+// 读客户物理内存。
 SIZE_T
 PhysicalMemoryRead(
     _In_ GUEST_PHYSICAL_ADDRESS Address,
@@ -386,6 +404,7 @@ PhysicalMemoryRead(
     return PhysicalMemoryCopy(Address, Buffer, Size, FALSE);
 }
 
+// 写客户物理内存。
 SIZE_T
 PhysicalMemoryWrite(
     _In_ GUEST_PHYSICAL_ADDRESS Address,
@@ -396,6 +415,7 @@ PhysicalMemoryWrite(
     return PhysicalMemoryCopy(Address, (PVOID)Buffer, Size, TRUE);
 }
 
+// 按 CR3 遍历四/五级页表，支持 4 KiB、2 MiB 和 1 GiB 页。
 BOOLEAN
 _Success_(return != FALSE)
 GuestVirtualToPhysical(
@@ -423,7 +443,7 @@ GuestVirtualToPhysical(
         {
             if (PhysicalMemoryShouldLogFailure(&g_TranslationFailureLogCount) != FALSE)
             {
-                DbgPrint("HacDbg: Err, VA walk read failed level=%u cr3=0x%I64x va=0x%I64x "
+                HACDBG_LOG("HacDbg: Err, VA walk read failed level=%u cr3=0x%I64x va=0x%I64x "
                          "entry_pa=0x%I64x read=%I64x.\n",
                          level, Cr3, VirtualAddress.Value, entryAddress.Value, (UINT64)read);
             }
@@ -434,7 +454,7 @@ GuestVirtualToPhysical(
         {
             if (PhysicalMemoryShouldLogFailure(&g_TranslationFailureLogCount) != FALSE)
             {
-                DbgPrint("HacDbg: Err, VA walk not present level=%u cr3=0x%I64x va=0x%I64x "
+                HACDBG_LOG("HacDbg: Err, VA walk not present level=%u cr3=0x%I64x va=0x%I64x "
                          "entry_pa=0x%I64x entry=0x%I64x.\n",
                          level, Cr3, VirtualAddress.Value, entryAddress.Value, entry);
             }
@@ -464,6 +484,7 @@ GuestVirtualToPhysical(
     return TRUE;
 }
 
+// 按页把客户虚拟地址复制到宿主缓冲区或写回客户。
 static SIZE_T
 GuestVirtualCopy(
     _In_ UINT64 Cr3,
@@ -490,7 +511,7 @@ GuestVirtualCopy(
 
         if (GuestVirtualToPhysical(Cr3, current, &physical) == FALSE)
         {
-            DbgPrint("HacDbg: Err, guest virtual copy translation failed cr3=0x%I64x va=0x%I64x "
+            HACDBG_LOG("HacDbg: Err, guest virtual copy translation failed cr3=0x%I64x va=0x%I64x "
                      "offset=0x%I64x.\n",
                      Cr3, current.Value, (UINT64)copied);
             break;
@@ -512,7 +533,7 @@ GuestVirtualCopy(
 
         if (actual != chunk)
         {
-            DbgPrint("HacDbg: Err, guest virtual copy short cr3=0x%I64x va=0x%I64x pa=0x%I64x "
+            HACDBG_LOG("HacDbg: Err, guest virtual copy short cr3=0x%I64x va=0x%I64x pa=0x%I64x "
                      "chunk=0x%I64x actual=0x%I64x.\n",
                      Cr3, current.Value, physical.Value, (UINT64)chunk, (UINT64)actual);
             break;
@@ -522,6 +543,7 @@ GuestVirtualCopy(
     return copied;
 }
 
+// 读客户虚拟内存。
 SIZE_T
 GuestVirtualRead(
     _In_ UINT64 Cr3,
@@ -533,6 +555,7 @@ GuestVirtualRead(
     return GuestVirtualCopy(Cr3, Address, Buffer, Size, FALSE);
 }
 
+// 写客户虚拟内存。
 SIZE_T
 GuestVirtualWrite(
     _In_ UINT64 Cr3,

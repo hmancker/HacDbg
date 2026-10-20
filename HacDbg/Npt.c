@@ -6,6 +6,7 @@
  */
 
 #include "Npt.h"
+#include "Debug.h"
 
 #define HACDBG_NPT_TAG              'TcaH'
 #define HACDBG_NPT_MAX_HOOKS        256
@@ -65,6 +66,7 @@ NptFindHidden(
     _In_ UINT64 Page
     );
 
+// 按页块从非分页池切出 NPT 表，块首强制 4 KiB 对齐。
 static BOOLEAN
 NptCarveChunk(
     _In_ UINT64 SlotStart,
@@ -111,6 +113,7 @@ NptCarveChunk(
     return TRUE;
 }
 
+// 分配一张固定表页（PML4/PDPT/PD）。
 _Success_(return != NULL)
 static VOID*
 NptAllocatePage(
@@ -144,6 +147,7 @@ NptAllocatePage(
     return g_PageVirtual[index];
 }
 
+// 按需分配一张 4 KiB 拆分表页。
 _Success_(return != NULL)
 static VOID*
 NptAllocateSplitPage(
@@ -180,6 +184,7 @@ NptAllocateSplitPage(
     return g_PageVirtual[index];
 }
 
+// 物理地址查回宿主虚拟地址，只扫描已切出的页。
 static UINT64*
 NptVirtualFromPhysical(
     _In_ UINT64 PhysicalAddress
@@ -208,6 +213,7 @@ NptVirtualFromPhysical(
     return NULL;
 }
 
+// 从 NPT 表项取出下一级表页。
 static UINT64*
 NptPageFromEntry(
     _In_ UINT64 Entry
@@ -222,6 +228,7 @@ NptPageFromEntry(
     return NptVirtualFromPhysical(physical);
 }
 
+// 取得客户页对应的 PTE；遇到 2 MiB 大页时临时拆成 4 KiB 表。
 static UINT64*
 NptPte(
     _In_ UINT64 RootPa,
@@ -296,6 +303,7 @@ NptPte(
     return &pt[(GuestPage >> PAGE_SHIFT) & 0x1ffull];
 }
 
+// 查找已注册的执行钩子。
 static BOOLEAN
 NptFindHook(
     _In_ UINT64 TargetPage,
@@ -320,6 +328,7 @@ NptFindHook(
     return FALSE;
 }
 
+// 查找已隐藏的客户物理页。
 static BOOLEAN
 NptFindHidden(
     _In_ UINT64 Page
@@ -338,6 +347,7 @@ NptFindHidden(
     return FALSE;
 }
 
+// 让钩子页相邻的两页在钩子表中保持可执行。
 static VOID
 NptSetAdjacentExecutable(
     _In_ UINT64 TargetPage
@@ -365,6 +375,7 @@ NptSetAdjacentExecutable(
     }
 }
 
+// 建立主 NPT 和钩子 NPT，覆盖前 1 TiB 客户物理地址。
 NTSTATUS
 NptInitialize(
     VOID
@@ -475,6 +486,7 @@ NptInitialize(
     return STATUS_SUCCESS;
 }
 
+// 释放所有 NPT 表和拆分页块。
 VOID
 NptCleanup(
     VOID
@@ -501,6 +513,7 @@ NptCleanup(
     g_Initialized = FALSE;
 }
 
+// 返回主 NPT 根物理地址。
 UINT64
 NptMainRootPa(
     VOID
@@ -509,14 +522,7 @@ NptMainRootPa(
     return g_MainRootPa;
 }
 
-UINT64
-NptHookRootPa(
-    VOID
-    )
-{
-    return g_HookRootPa;
-}
-
+// 返回固定表和拆分页的剩余页数。
 UINT32
 NptFreeTableCount(
     VOID
@@ -526,6 +532,7 @@ NptFreeTableCount(
                     (HACDBG_NPT_SPLIT_PAGES - g_SplitPagesUsed));
 }
 
+// 在主表中禁止目标页执行，在钩子表中把该页指向影子页。
 BOOLEAN
 NptAddHook(
     _In_ GUEST_PHYSICAL_ADDRESS TargetPage,
@@ -541,7 +548,7 @@ NptAddHook(
     if (g_Initialized == FALSE || (TargetPage.Value & (PAGE_SIZE - 1)) != 0 ||
         (ShadowPage.Value & (PAGE_SIZE - 1)) != 0)
     {
-        DbgPrint("HacDbg: Err, NPT hook rejected initialized=%u target=0x%I64x shadow=0x%I64x.\n",
+        HACDBG_LOG("HacDbg: Err, NPT hook rejected initialized=%u target=0x%I64x shadow=0x%I64x.\n",
                  g_Initialized, TargetPage.Value, ShadowPage.Value);
         return FALSE;
     }
@@ -550,7 +557,7 @@ NptAddHook(
 
     if (NptFindHook(target, NULL) != FALSE)
     {
-        DbgPrint("HacDbg: Err, NPT hook already exists for page 0x%I64x.\n", target);
+        HACDBG_LOG("HacDbg: Err, NPT hook already exists for page 0x%I64x.\n", target);
         HacDbgSpinLockRelease(&g_NptLock);
         return FALSE;
     }
@@ -565,7 +572,7 @@ NptAddHook(
 
     if (index == HACDBG_NPT_MAX_HOOKS)
     {
-        DbgPrint("HacDbg: Err, NPT hook table is full.\n");
+        HACDBG_LOG("HacDbg: Err, NPT hook table is full.\n");
         HacDbgSpinLockRelease(&g_NptLock);
         return FALSE;
     }
@@ -575,7 +582,7 @@ NptAddHook(
 
     if (mainPte == NULL || hookPte == NULL)
     {
-        DbgPrint("HacDbg: Err, NPT hook PTE lookup failed target=0x%I64x main=%p hook=%p.\n",
+        HACDBG_LOG("HacDbg: Err, NPT hook PTE lookup failed target=0x%I64x main=%p hook=%p.\n",
                  target, mainPte, hookPte);
         HacDbgSpinLockRelease(&g_NptLock);
         return FALSE;
@@ -596,6 +603,7 @@ NptAddHook(
     return TRUE;
 }
 
+// 撤销执行钩子，恢复主表可执行属性。
 BOOLEAN
 NptRemoveHook(
     _In_ GUEST_PHYSICAL_ADDRESS TargetPage
@@ -650,6 +658,7 @@ NptRemoveHook(
     return TRUE;
 }
 
+// 把目标页在主表和钩子表中替换成零页。
 BOOLEAN
 NptHidePage(
     _In_ GUEST_PHYSICAL_ADDRESS TargetPage
@@ -662,7 +671,7 @@ NptHidePage(
 
     if (g_Initialized == FALSE || (TargetPage.Value & (PAGE_SIZE - 1)) != 0)
     {
-        DbgPrint("HacDbg: Err, NPT hide rejected initialized=%u page=0x%I64x.\n",
+        HACDBG_LOG("HacDbg: Err, NPT hide rejected initialized=%u page=0x%I64x.\n",
                  g_Initialized, TargetPage.Value);
         return FALSE;
     }
@@ -671,7 +680,7 @@ NptHidePage(
 
     if (NptFindHidden(target) != FALSE)
     {
-        DbgPrint("HacDbg: Err, NPT page 0x%I64x is already hidden.\n", target);
+        HACDBG_LOG("HacDbg: Err, NPT page 0x%I64x is already hidden.\n", target);
         HacDbgSpinLockRelease(&g_NptLock);
         return FALSE;
     }
@@ -686,7 +695,7 @@ NptHidePage(
 
     if (index == HACDBG_NPT_MAX_HIDDEN)
     {
-        DbgPrint("HacDbg: Err, NPT hidden page table is full.\n");
+        HACDBG_LOG("HacDbg: Err, NPT hidden page table is full.\n");
         HacDbgSpinLockRelease(&g_NptLock);
         return FALSE;
     }
@@ -696,7 +705,7 @@ NptHidePage(
 
     if (mainPte == NULL || hookPte == NULL)
     {
-        DbgPrint("HacDbg: Err, NPT hide PTE lookup failed page=0x%I64x main=%p hook=%p.\n",
+        HACDBG_LOG("HacDbg: Err, NPT hide PTE lookup failed page=0x%I64x main=%p hook=%p.\n",
                  target, mainPte, hookPte);
         HacDbgSpinLockRelease(&g_NptLock);
         return FALSE;
@@ -721,6 +730,7 @@ NptHidePage(
     return TRUE;
 }
 
+// 执行型 NPF 时在两张 NPT 根之间切换。
 BOOLEAN
 NptHandleNestedPageFault(
     _Inout_ VMCB* Vmcb

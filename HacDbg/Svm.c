@@ -6,6 +6,7 @@
  */
 
 #include "Svm.h"
+#include "Debug.h"
 #include "Hypercall.h"
 #include "Npt.h"
 #include "PhysicalMemory.h"
@@ -72,6 +73,7 @@ C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, Registers) == 0x58);
 C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, TlbFlushRequested) == 0xD8);
 C_ASSERT(sizeof(SVM_PROCESSOR_CONTEXT) == 0xE0);
 
+// 分配非分页内存并返回 4 KiB 对齐的首地址，原指针写入 AllocationBase。
 static PVOID
 SvmAllocateAligned(
     _In_ SIZE_T Size,
@@ -93,6 +95,7 @@ SvmAllocateAligned(
     return aligned;
 }
 
+// 从 GDT 描述符取出段属性字段。
 static UINT16
 SvmSegmentAttributes(
     _In_ UINT16 Selector,
@@ -110,6 +113,7 @@ SvmSegmentAttributes(
     return (UINT16)(((descriptor >> 40) & 0xffu) | (((descriptor >> 52) & 0xfu) << 8));
 }
 
+// 从 GDT 描述符取出段界限，展开粒度位。
 static UINT32
 SvmSegmentLimit(
     _In_ UINT16 Selector,
@@ -136,6 +140,7 @@ SvmSegmentLimit(
     return limit;
 }
 
+// 检查 CPUID 中的 SVM/NPT 支持位和 VM_CR.SVMDIS。
 NTSTATUS
 SvmCheckSupport(
     VOID
@@ -171,6 +176,7 @@ SvmCheckSupport(
     return STATUS_SUCCESS;
 }
 
+// 分配 8 KiB 连续内存作 MSRPM，并隐藏其两张页表页。
 NTSTATUS
 SvmInitializeShared(
     VOID
@@ -215,7 +221,7 @@ SvmInitializeShared(
 
     if ((g_MsrpmPa & (PAGE_SIZE - 1)) != 0)
     {
-        DbgPrint("HacDbg: Err, MSRPM physical address is not page-aligned: 0x%I64x.\n",
+        HACDBG_LOG("HacDbg: Err, MSRPM physical address is not page-aligned: 0x%I64x.\n",
                  g_MsrpmPa);
         g_SharedFailureDetail = 2;
         SvmCleanupShared();
@@ -224,7 +230,7 @@ SvmInitializeShared(
 
     if (NptHidePage(HacDbgGuestPhysicalAddress(g_MsrpmPa)) == FALSE)
     {
-        DbgPrint("HacDbg: Err, hiding the first MSRPM page failed: 0x%I64x.\n", g_MsrpmPa);
+        HACDBG_LOG("HacDbg: Err, hiding the first MSRPM page failed: 0x%I64x.\n", g_MsrpmPa);
         g_SharedFailureDetail = 3;
         SvmCleanupShared();
         return STATUS_UNSUCCESSFUL;
@@ -232,7 +238,7 @@ SvmInitializeShared(
 
     if (NptHidePage(HacDbgGuestPhysicalAddress(g_MsrpmPa + PAGE_SIZE)) == FALSE)
     {
-        DbgPrint("HacDbg: Err, hiding the second MSRPM page failed: 0x%I64x.\n",
+        HACDBG_LOG("HacDbg: Err, hiding the second MSRPM page failed: 0x%I64x.\n",
                  g_MsrpmPa + PAGE_SIZE);
         g_SharedFailureDetail = 4;
         SvmCleanupShared();
@@ -242,6 +248,7 @@ SvmInitializeShared(
     return STATUS_SUCCESS;
 }
 
+// 释放 MSRPM 连续内存。
 VOID
 SvmCleanupShared(
     VOID
@@ -257,6 +264,7 @@ SvmCleanupShared(
     g_MsrpmPa = 0;
 }
 
+// 返回 MSRPM 初始化的细分失败码。
 ULONG
 SvmGetSharedFailureDetail(
     VOID
@@ -265,6 +273,7 @@ SvmGetSharedFailureDetail(
     return g_SharedFailureDetail;
 }
 
+// 置位 EFER.SVME 和 NXE，允许执行 SVM 指令。
 VOID
 SvmEnable(
     VOID
@@ -273,6 +282,7 @@ SvmEnable(
     __writemsr(HACDBG_MSR_EFER, __readmsr(HACDBG_MSR_EFER) | HACDBG_EFER_SVME | HACDBG_EFER_NXE);
 }
 
+// 清除 EFER.SVME 并复位 VM_HSAVE_PA。
 VOID
 SvmDisable(
     VOID
@@ -282,6 +292,7 @@ SvmDisable(
     __writemsr(SVM_MSR_VM_HSAVE_PA, 0);
 }
 
+// 把当前处理器上下文登记到全局数组，供跨处理器刷新使用。
 static VOID
 SvmRegisterProcessor(
     _In_ SVM_PROCESSOR_CONTEXT* ProcessorContext
@@ -301,6 +312,7 @@ SvmRegisterProcessor(
     HacDbgSpinLockRelease(&g_ProcessorLock);
 }
 
+// 分配本处理器的 VMCB、宿主保存区和宿主栈，并在 NPT 中隐藏它们。
 NTSTATUS
 SvmInitialize(
     _Out_ SVM_PROCESSOR_CONTEXT* ProcessorContext,
@@ -331,7 +343,7 @@ SvmInitialize(
     if (ProcessorContext->GuestVmcb == NULL || ProcessorContext->HostVmcb == NULL ||
         ProcessorContext->HostSaveArea == NULL || ProcessorContext->HostStack == NULL)
     {
-        DbgPrint("HacDbg: Err, processor allocation failed: guest=%p host=%p save=%p stack=%p.\n",
+        HACDBG_LOG("HacDbg: Err, processor allocation failed: guest=%p host=%p save=%p stack=%p.\n",
                  ProcessorContext->GuestVmcb, ProcessorContext->HostVmcb,
                  ProcessorContext->HostSaveArea, ProcessorContext->HostStack);
         return STATUS_INSUFFICIENT_RESOURCES;
@@ -370,7 +382,7 @@ SvmInitialize(
             NptHidePage(HacDbgGuestPhysicalAddress(ProcessorContext->HostVmcbPa)) == FALSE ||
             NptHidePage(HacDbgGuestPhysicalAddress(hostSaveAreaPa)) == FALSE)
         {
-            DbgPrint("HacDbg: Err, hiding processor state failed: guest_vmcb=0x%I64x "
+            HACDBG_LOG("HacDbg: Err, hiding processor state failed: guest_vmcb=0x%I64x "
                      "host_vmcb=0x%I64x host_save=0x%I64x.\n",
                      ProcessorContext->GuestVmcbPa, ProcessorContext->HostVmcbPa,
                      hostSaveAreaPa);
@@ -385,6 +397,7 @@ SvmInitialize(
     }
 }
 
+// 用当前上下文填充客户 VMCB，并设置 VM_HSAVE_PA。
 VOID
 SvmPrepareLaunch(
     _Inout_ SVM_PROCESSOR_CONTEXT* ProcessorContext,
@@ -467,6 +480,7 @@ SvmPrepareLaunch(
     __writemsr(SVM_MSR_VM_HSAVE_PA, (UINT64)hostSavePhysical.QuadPart);
 }
 
+// 把宿主状态写回，关闭 SVM，恢复客户控制寄存器后退出 VMRUN 循环。
 static VOID
 SvmStopCurrentProcessor(
     _Inout_ SVM_GUEST_CONTEXT* GuestContext
@@ -503,9 +517,9 @@ SvmStopCurrentProcessor(
     __writemsr(HACDBG_MSR_PAT, GuestContext->Vmcb->StateSaveArea.GPat);
     __writecr3(GuestContext->Vmcb->StateSaveArea.Cr3);
 
-    GuestContext->StopRequested = TRUE;
 }
 
+// 处理 EFER 的 MSR 拦截，其余 MSR 透传。
 static VOID
 SvmHandleMsrAccess(
     _Inout_ SVM_GUEST_CONTEXT* GuestContext
@@ -559,6 +573,7 @@ SvmHandleMsrAccess(
     }
 }
 
+// VMEXIT 总入口：恢复宿主状态，按退出码分派，返回 TRUE 表示离开 VMRUN。
 BOOLEAN
 SvmHandleVmExit(
     _Inout_ SVM_GUEST_CONTEXT* GuestContext
@@ -637,7 +652,7 @@ SvmHandleVmExit(
     case SVM_EXIT_NPF:
         if (NptHandleNestedPageFault(vmcb) == FALSE)
         {
-            DbgPrint("HacDbg: Err, unhandled NPF exit=%u info1=0x%I64x info2=0x%I64x "
+            HACDBG_LOG("HacDbg: Err, unhandled NPF exit=%u info1=0x%I64x info2=0x%I64x "
                      "ncr3=0x%I64x rip=0x%I64x.\n",
                      (UINT32)vmcb->ControlArea.ExitCode, vmcb->ControlArea.ExitInfo1,
                      vmcb->ControlArea.ExitInfo2, vmcb->ControlArea.NCr3,
@@ -648,7 +663,7 @@ SvmHandleVmExit(
         break;
 
     default:
-        DbgPrint("HacDbg: Err, unhandled VMEXIT code=0x%I64x info1=0x%I64x info2=0x%I64x "
+        HACDBG_LOG("HacDbg: Err, unhandled VMEXIT code=0x%I64x info1=0x%I64x info2=0x%I64x "
                  "rip=0x%I64x cr3=0x%I64x.\n",
                  vmcb->ControlArea.ExitCode, vmcb->ControlArea.ExitInfo1,
                  vmcb->ControlArea.ExitInfo2, vmcb->StateSaveArea.Rip,
@@ -661,6 +676,7 @@ SvmHandleVmExit(
     return FALSE;
 }
 
+// 给所有已注册处理器打 TLB 刷新标记。
 VOID
 SvmFlushAllProcessors(
     VOID

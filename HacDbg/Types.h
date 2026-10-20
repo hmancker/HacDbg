@@ -20,36 +20,12 @@ typedef struct _GUEST_PHYSICAL_ADDRESS
 } GUEST_PHYSICAL_ADDRESS;
 
 /**
- * @brief A physical address used by the host page tables.
- */
-typedef struct _HOST_PHYSICAL_ADDRESS
-{
-    UINT64 Value;
-} HOST_PHYSICAL_ADDRESS;
-
-/**
- * @brief A virtual address available in the host address space.
- */
-typedef struct _HOST_VIRTUAL_ADDRESS
-{
-    UINT64 Value;
-} HOST_VIRTUAL_ADDRESS;
-
-/**
  * @brief A virtual address in the guest address space.
  */
 typedef struct _GUEST_VIRTUAL_ADDRESS
 {
     UINT64 Value;
 } GUEST_VIRTUAL_ADDRESS;
-
-/**
- * @brief A 4 KiB page frame number.
- */
-typedef struct _PAGE_FRAME_NUMBER
-{
-    UINT64 Value;
-} PAGE_FRAME_NUMBER;
 
 /**
  * @brief A small lock that is safe to acquire above DISPATCH_LEVEL.
@@ -118,34 +94,6 @@ HacDbgGuestPhysicalAddress(
     return address;
 }
 
-static __inline HOST_PHYSICAL_ADDRESS
-/**
- * @brief Wraps an integer as a host physical address.
- *
- * @param Value Integer value.
- */
-HacDbgHostPhysicalAddress(
-    _In_ UINT64 Value
-    )
-{
-    HOST_PHYSICAL_ADDRESS address = { Value };
-    return address;
-}
-
-static __inline HOST_VIRTUAL_ADDRESS
-/**
- * @brief Wraps a host pointer as a host virtual address.
- *
- * @param Value Host pointer.
- */
-HacDbgHostVirtualAddress(
-    _In_ PVOID Value
-    )
-{
-    HOST_VIRTUAL_ADDRESS address = { (UINT64)(ULONG_PTR)Value };
-    return address;
-}
-
 static __inline GUEST_VIRTUAL_ADDRESS
 /**
  * @brief Wraps an integer as a guest virtual address.
@@ -158,18 +106,4 @@ HacDbgGuestVirtualAddress(
 {
     GUEST_VIRTUAL_ADDRESS address = { Value };
     return address;
-}
-
-static __inline PAGE_FRAME_NUMBER
-/**
- * @brief Wraps an integer as a page frame number.
- *
- * @param Value Page frame number.
- */
-HacDbgPageFrameNumber(
-    _In_ UINT64 Value
-    )
-{
-    PAGE_FRAME_NUMBER frame = { Value };
-    return frame;
 }

@@ -35,14 +35,6 @@ NptMainRootPa(
     VOID
     );
 
-UINT64
-/**
- * @brief Returns the physical address of the execute-hook NPT root.
- */
-NptHookRootPa(
-    VOID
-    );
-
 UINT32
 /**
  * @brief Returns the number of unused 4 KiB NPT table pages.
