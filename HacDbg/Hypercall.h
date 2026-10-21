@@ -7,7 +7,8 @@
 
 #pragma once
 
-#include "Svm.h"
+#include "Config.h"
+#include "Guest.h"
 #include "../shared/hypercall/control.h"
 
 VOID
@@ -22,10 +23,10 @@ VOID
 /**
  * @brief Handles a CPUID VMEXIT, including HacDbg hypercalls.
  *
- * @param GuestContext Current guest context.
+ * @param View Guest registers, CR3, and RIP. The caller advances RIP.
  */
 HypercallHandleCpuid(
-    _Inout_ SVM_GUEST_CONTEXT* GuestContext
+    _Inout_ HACDBG_GUEST_VIEW* View
     );
 
 NTSTATUS

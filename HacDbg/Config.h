@@ -25,3 +25,12 @@
 #else
 #define HACDBG_DIAGNOSTICS 1
 #endif
+
+//
+// 0: 编译 AMD SVM。1: 编译 Intel VT-x。一次只链接一种后端。
+// Visual Studio 里编 Debug / Release 时以这个值为准，工程会按它
+// 排除另一边的源文件。DebugIntel / ReleaseIntel 由工程传入 1。
+//
+#ifndef HACDBG_BACKEND_INTEL
+#define HACDBG_BACKEND_INTEL 1
+#endif

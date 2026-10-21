@@ -42,9 +42,18 @@
     <ClCompile Include="Svm.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Ept.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="Vmx.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <MASM Include="SvmAsm.asm">
+      <Filter>Source Files</Filter>
+    </MASM>
+    <MASM Include="VmxAsm.asm">
       <Filter>Source Files</Filter>
     </MASM>
   </ItemGroup>
@@ -67,7 +76,16 @@
     <ClInclude Include="PhysicalMemory.h">
       <Filter>Header Files</Filter>
     </ClInclude>
+    <ClInclude Include="Ept.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Guest.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
     <ClInclude Include="Svm.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Vmx.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Types.h">

@@ -17,6 +17,14 @@
       <Configuration>Release</Configuration>
       <Platform>ARM64</Platform>
     </ProjectConfiguration>
+    <ProjectConfiguration Include="DebugIntel|x64">
+      <Configuration>DebugIntel</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="ReleaseIntel|x64">
+      <Configuration>ReleaseIntel</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
   </ItemGroup>
   <PropertyGroup Label="Globals">
     <ProjectGuid>{FABD76D3-7659-8060-AF5D-DC7C09E2837E}</ProjectGuid>
@@ -56,6 +64,20 @@
     <ConfigurationType>Driver</ConfigurationType>
     <DriverType>WDM</DriverType>
   </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugIntel|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseIntel|x64'" Label="Configuration">
+    <TargetVersion>Windows10</TargetVersion>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>WindowsKernelModeDriver10.0</PlatformToolset>
+    <ConfigurationType>Driver</ConfigurationType>
+    <DriverType>WDM</DriverType>
+  </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <ImportGroup Label="ExtensionSettings">
   </ImportGroup>
@@ -77,6 +99,18 @@
     <IncludePath>$(ProjectDir)..\shared;$(IntDir);$(IncludePath)</IncludePath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <OutDir>$(MSBuildProjectDirectory)\..\build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\..\build\$(Platform)\$(Configuration)\obj\HacDbg\</IntDir>
+    <IncludePath>$(ProjectDir)..\shared;$(IntDir);$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='DebugIntel|x64'">
+    <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
+    <OutDir>$(MSBuildProjectDirectory)\..\build\$(Platform)\$(Configuration)\</OutDir>
+    <IntDir>$(MSBuildProjectDirectory)\..\build\$(Platform)\$(Configuration)\obj\HacDbg\</IntDir>
+    <IncludePath>$(ProjectDir)..\shared;$(IntDir);$(IncludePath)</IncludePath>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseIntel|x64'">
     <DebuggerFlavor>DbgengKernelDebugger</DebuggerFlavor>
     <OutDir>$(MSBuildProjectDirectory)\..\build\$(Platform)\$(Configuration)\</OutDir>
     <IntDir>$(MSBuildProjectDirectory)\..\build\$(Platform)\$(Configuration)\obj\HacDbg\</IntDir>
@@ -114,13 +148,68 @@
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
   </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='DebugIntel|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <CompileAs>CompileAsC</CompileAs>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>HACDBG_BACKEND_INTEL=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='ReleaseIntel|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <TreatWarningAsError>true</TreatWarningAsError>
+      <CompileAs>CompileAsC</CompileAs>
+      <LanguageStandard_C>stdc17</LanguageStandard_C>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalIncludeDirectories>$(ProjectDir)..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>HACDBG_BACKEND_INTEL=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <DriverSign>
+      <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
+    </DriverSign>
+  </ItemDefinitionGroup>
+  <!--
+    Debug / Release 按 Config.h 里的 HACDBG_BACKEND_INTEL 决定编哪一边。
+  -->
+  <PropertyGroup>
+    <HacDbgBackendIntel Condition="$([System.Text.RegularExpressions.Regex]::IsMatch($([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\Config.h')), '#define[ \t]+HACDBG_BACKEND_INTEL[ \t]+1'))">1</HacDbgBackendIntel>
+    <HacDbgBackendIntel Condition="'$(HacDbgBackendIntel)'==''">0</HacDbgBackendIntel>
+  </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="Driver.c" />
     <ClCompile Include="Hypercall.c" />
     <ClCompile Include="Logs.c" />
-    <ClCompile Include="Npt.c" />
+    <ClCompile Include="Npt.c">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='DebugIntel'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseIntel'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64' and '$(HacDbgBackendIntel)'=='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64' and '$(HacDbgBackendIntel)'=='1'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="PhysicalMemory.c" />
-    <ClCompile Include="Svm.c" />
+    <ClCompile Include="Svm.c">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='DebugIntel'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseIntel'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64' and '$(HacDbgBackendIntel)'=='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64' and '$(HacDbgBackendIntel)'=='1'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="Ept.c">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64' and '$(HacDbgBackendIntel)'!='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64' and '$(HacDbgBackendIntel)'!='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="Vmx.c">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64' and '$(HacDbgBackendIntel)'!='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64' and '$(HacDbgBackendIntel)'!='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="Config.h" />
@@ -129,11 +218,24 @@
     <ClInclude Include="Logs.h" />
     <ClInclude Include="Npt.h" />
     <ClInclude Include="PhysicalMemory.h" />
+    <ClInclude Include="Ept.h" />
+    <ClInclude Include="Guest.h" />
     <ClInclude Include="Svm.h" />
     <ClInclude Include="Types.h" />
+    <ClInclude Include="Vmx.h" />
   </ItemGroup>
   <ItemGroup>
-    <MASM Include="SvmAsm.asm" />
+    <MASM Include="SvmAsm.asm">
+      <ExcludedFromBuild Condition="'$(Configuration)'=='DebugIntel'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseIntel'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64' and '$(HacDbgBackendIntel)'=='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64' and '$(HacDbgBackendIntel)'=='1'">true</ExcludedFromBuild>
+    </MASM>
+    <MASM Include="VmxAsm.asm">
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Debug|x64' and '$(HacDbgBackendIntel)'!='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='Release|x64' and '$(HacDbgBackendIntel)'!='1'">true</ExcludedFromBuild>
+      <ExcludedFromBuild Condition="'$(Platform)'=='ARM64'">true</ExcludedFromBuild>
+    </MASM>
   </ItemGroup>
   <ItemGroup>
     <Inf Include="HacDbg.inf" />

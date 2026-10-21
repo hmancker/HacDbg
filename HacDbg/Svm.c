@@ -47,6 +47,9 @@ SvmLaunchVm(
     _In_ PVOID HostStackTop
     );
 
+C_ASSERT(sizeof(SVM_GUEST_REGISTERS) == sizeof(HACDBG_GUEST_REGISTERS));
+C_ASSERT(FIELD_OFFSET(SVM_GUEST_REGISTERS, Rax) == FIELD_OFFSET(HACDBG_GUEST_REGISTERS, Rax));
+C_ASSERT(FIELD_OFFSET(SVM_GUEST_REGISTERS, R15) == FIELD_OFFSET(HACDBG_GUEST_REGISTERS, R15));
 C_ASSERT(FIELD_OFFSET(SVM_GUEST_REGISTERS, Rax) == 0x00);
 C_ASSERT(FIELD_OFFSET(SVM_GUEST_REGISTERS, Rcx) == 0x08);
 C_ASSERT(FIELD_OFFSET(SVM_GUEST_REGISTERS, Rdx) == 0x10);
@@ -642,7 +645,18 @@ SvmHandleVmExit(
     switch (vmcb->ControlArea.ExitCode)
     {
     case SVM_EXIT_CPUID:
-        HypercallHandleCpuid(GuestContext);
+        {
+            HACDBG_GUEST_VIEW view;
+
+            view.Registers = (HACDBG_GUEST_REGISTERS*)GuestContext->Registers;
+            view.Cr3 = vmcb->StateSaveArea.Cr3;
+            view.Rip = vmcb->StateSaveArea.Rip;
+            view.InGuest = TRUE;
+            HypercallHandleCpuid(&view);
+            vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip != 0
+                                          ? vmcb->ControlArea.NRip
+                                          : vmcb->StateSaveArea.Rip + 2;
+        }
         break;
 
     case SVM_EXIT_MSR:

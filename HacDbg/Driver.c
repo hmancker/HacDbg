@@ -7,13 +7,41 @@
 
 #include <ntifs.h>
 
-#include "Svm.h"
+#include "Config.h"
 #include "Hypercall.h"
 #include "Logs.h"
-#include "Npt.h"
 #include "PhysicalMemory.h"
 #include "Debug.h"
 #include "../shared/hypercall/control.h"
+#if HACDBG_BACKEND_INTEL
+#include "Vmx.h"
+#include "Ept.h"
+#define HACDBG_CHECK_SUPPORT     VmxCheckSupport
+#define HACDBG_PAGING_INITIALIZE EptInitialize
+#define HACDBG_PAGING_CLEANUP    EptCleanup
+#define HACDBG_SHARED_INITIALIZE VmxInitializeShared
+#define HACDBG_SHARED_CLEANUP    VmxCleanupShared
+#define HACDBG_SHARED_DETAIL     VmxGetSharedFailureDetail
+#define HACDBG_START_ALL         VmxStartAllProcessors
+#define HACDBG_STOP_ALL          VmxStopAllProcessors
+#define HACDBG_RESTART_ALL       VmxRestartAllProcessors
+#define HACDBG_FREE_ALL          VmxFreeAllProcessors
+#define HACDBG_VENDOR_NAME       "Intel VT-x"
+#else
+#include "Svm.h"
+#include "Npt.h"
+#define HACDBG_CHECK_SUPPORT     SvmCheckSupport
+#define HACDBG_PAGING_INITIALIZE NptInitialize
+#define HACDBG_PAGING_CLEANUP    NptCleanup
+#define HACDBG_SHARED_INITIALIZE SvmInitializeShared
+#define HACDBG_SHARED_CLEANUP    SvmCleanupShared
+#define HACDBG_SHARED_DETAIL     SvmGetSharedFailureDetail
+#define HACDBG_START_ALL         SvmStartAllProcessors
+#define HACDBG_STOP_ALL          SvmStopAllProcessors
+#define HACDBG_RESTART_ALL       SvmRestartAllProcessors
+#define HACDBG_FREE_ALL          SvmFreeAllProcessors
+#define HACDBG_VENDOR_NAME       "AMD SVM"
+#endif
 
 #define HACDBG_MAX_PROCESSORS 256
 
@@ -34,6 +62,11 @@ C_ASSERT(sizeof(HACDBG_VERSION_STRING) <= HACDBG_VERSION_STRING_SIZE);
 #define HACDBG_REGISTRY_PATH_CHARS       512
 #endif
 
+static PVOID g_PowerCallbackRegistration;
+static BOOLEAN g_VirtualizationSuspended;
+static PDEVICE_OBJECT g_DeviceObject;
+
+#if !HACDBG_BACKEND_INTEL
 EXTERN_C VOID
 SvmLaunchVm(
     _In_ SVM_PROCESSOR_CONTEXT* ProcessorContext,
@@ -42,9 +75,7 @@ SvmLaunchVm(
 
 static SVM_PROCESSOR_CONTEXT* g_Contexts[HACDBG_MAX_PROCESSORS];
 static ULONG g_ProcessorCount;
-static PVOID g_PowerCallbackRegistration;
-static BOOLEAN g_VirtualizationSuspended;
-static PDEVICE_OBJECT g_DeviceObject;
+#endif
 
 DRIVER_INITIALIZE DriverEntry;
 
@@ -114,6 +145,7 @@ HacDbgRecordFailure(
 #define HacDbgRecordFailure(RegistryPath, Stage, Status) (Status)
 #endif
 
+#if !HACDBG_BACKEND_INTEL
 // 在当前逻辑处理器上启用 SVM，并切入 VMRUN 循环。
 static VOID
 SvmVirtualizeProcessor(
@@ -388,7 +420,30 @@ SvmRestartAllProcessors(
     return STATUS_SUCCESS;
 }
 
-// 睡眠前停止 SVM，恢复后重新启动。
+static VOID
+SvmFreeAllProcessors(
+    VOID
+    )
+{
+    ULONG index;
+
+    for (index = 0; index < HACDBG_MAX_PROCESSORS; index++)
+    {
+        if (g_Contexts[index] != NULL)
+        {
+            if (g_Contexts[index]->Virtualized != FALSE)
+            {
+                KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x48444301ull, index, 0, 0);
+            }
+
+            SvmFreeProcessorContext(g_Contexts[index]);
+            g_Contexts[index] = NULL;
+        }
+    }
+}
+#endif
+
+// 睡眠前停止虚拟化，恢复后重新启动。
 static VOID
 SvmPowerCallback(
     _In_ PVOID CallbackContext,
@@ -409,7 +464,7 @@ SvmPowerCallback(
     {
         if (g_VirtualizationSuspended != FALSE)
         {
-            status = SvmRestartAllProcessors();
+            status = HACDBG_RESTART_ALL();
             if (!NT_SUCCESS(status))
             {
                 HACDBG_LOG("HacDbg: Err, processor virtualization after resume failed: 0x%08x.\n", status);
@@ -422,7 +477,7 @@ SvmPowerCallback(
     }
     else
     {
-        SvmStopAllProcessors();
+        HACDBG_STOP_ALL();
         HypercallInitialize();
         g_VirtualizationSuspended = TRUE;
     }
@@ -435,10 +490,16 @@ HacDbgFlushIpi(
     _In_ ULONG_PTR Context
     )
 {
-    int registers[4];
-
     UNREFERENCED_PARAMETER(Context);
-    __cpuidex(registers, HACDBG_FLUSH_CPUID_LEAF, HACDBG_FLUSH_CPUID_SUBLEAF);
+#if HACDBG_BACKEND_INTEL
+    VmxRequestTlbFlushOnCurrentProcessor();
+#else
+    {
+        int registers[4];
+
+        __cpuidex(registers, HACDBG_FLUSH_CPUID_LEAF, HACDBG_FLUSH_CPUID_SUBLEAF);
+    }
+#endif
     return 0;
 }
 
@@ -674,8 +735,6 @@ DriverUnload(
     _In_ PDRIVER_OBJECT DriverObject
     )
 {
-    ULONG index;
-
     UNREFERENCED_PARAMETER(DriverObject);
 
     HACDBG_LOG("HacDbg: DriverUnload start.\n");
@@ -687,25 +746,12 @@ DriverUnload(
     }
 
     HacDbgDeleteDevice();
-    SvmStopAllProcessors();
-
-    for (index = 0; index < HACDBG_MAX_PROCESSORS; index++)
-    {
-        if (g_Contexts[index] != NULL)
-        {
-            if (g_Contexts[index]->Virtualized != FALSE)
-            {
-                KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x48444301ull, index, 0, 0);
-            }
-
-            SvmFreeProcessorContext(g_Contexts[index]);
-            g_Contexts[index] = NULL;
-        }
-    }
+    HACDBG_STOP_ALL();
+    HACDBG_FREE_ALL();
 
     LogsCleanup();
-    SvmCleanupShared();
-    NptCleanup();
+    HACDBG_SHARED_CLEANUP();
+    HACDBG_PAGING_CLEANUP();
     PhysicalMemoryCleanup();
 
     HACDBG_LOG("HacDbg: DriverUnload complete.\n");
@@ -723,7 +769,8 @@ DriverEntry(
     OBJECT_ATTRIBUTES callbackAttributes;
     PCALLBACK_OBJECT callbackObject;
 
-    HACDBG_LOG("HacDbg: DriverEntry start: driver version %s.\n", HACDBG_VERSION_STRING);
+    HACDBG_LOG("HacDbg: DriverEntry start: driver version %s (%s).\n",
+             HACDBG_VERSION_STRING, HACDBG_VENDOR_NAME);
 
 #if !HACDBG_DIAGNOSTICS
     UNREFERENCED_PARAMETER(RegistryPath);
@@ -735,10 +782,10 @@ DriverEntry(
 
     PhysicalMemorySetFiveLevelPaging((__readcr4() & (1ull << 12)) != 0);
 
-    status = SvmCheckSupport();
+    status = HACDBG_CHECK_SUPPORT();
     if (!NT_SUCCESS(status))
     {
-        HACDBG_LOG("HacDbg: Err, SVM or NPT is unavailable.\n");
+        HACDBG_LOG("HacDbg: Err, virtualization support is unavailable.\n");
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_SVM_SUPPORT, status);
     }
 
@@ -749,11 +796,11 @@ DriverEntry(
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_PHYSICAL_MEMORY, status);
     }
 
-    status = NptInitialize();
+    status = HACDBG_PAGING_INITIALIZE();
     if (!NT_SUCCESS(status))
     {
-        HACDBG_LOG("HacDbg: Err, nested page table initialization failed: 0x%08x.\n", status);
-        NptCleanup();
+        HACDBG_LOG("HacDbg: Err, nested paging initialization failed: 0x%08x.\n", status);
+        HACDBG_PAGING_CLEANUP();
         PhysicalMemoryCleanup();
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_NPT, status);
     }
@@ -762,18 +809,18 @@ DriverEntry(
     if (!NT_SUCCESS(status))
     {
         HACDBG_LOG("HacDbg: Err, log initialization failed: 0x%08x.\n", status);
-        NptCleanup();
+        HACDBG_PAGING_CLEANUP();
         PhysicalMemoryCleanup();
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_LOGS, status);
     }
 
-    status = SvmInitializeShared();
+    status = HACDBG_SHARED_INITIALIZE();
     if (!NT_SUCCESS(status))
     {
-        HACDBG_LOG("HacDbg: Err, MSR permission map initialization failed: 0x%08x.\n", status);
-        HacDbgRecordLoadDetail(RegistryPath, SvmGetSharedFailureDetail());
+        HACDBG_LOG("HacDbg: Err, shared virtualization state initialization failed: 0x%08x.\n", status);
+        HacDbgRecordLoadDetail(RegistryPath, HACDBG_SHARED_DETAIL());
         LogsCleanup();
-        NptCleanup();
+        HACDBG_PAGING_CLEANUP();
         PhysicalMemoryCleanup();
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_MSRPM, status);
     }
@@ -782,9 +829,9 @@ DriverEntry(
     if (!NT_SUCCESS(status))
     {
         HACDBG_LOG("HacDbg: Err, control device creation failed: 0x%08x.\n", status);
-        SvmCleanupShared();
+        HACDBG_SHARED_CLEANUP();
         LogsCleanup();
-        NptCleanup();
+        HACDBG_PAGING_CLEANUP();
         PhysicalMemoryCleanup();
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_DEVICE, status);
     }
@@ -799,9 +846,9 @@ DriverEntry(
     {
         HACDBG_LOG("HacDbg: Err, power callback open failed: 0x%08x.\n", status);
         HacDbgDeleteDevice();
-        SvmCleanupShared();
+        HACDBG_SHARED_CLEANUP();
         LogsCleanup();
-        NptCleanup();
+        HACDBG_PAGING_CLEANUP();
         PhysicalMemoryCleanup();
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_POWER, status);
     }
@@ -813,42 +860,27 @@ DriverEntry(
     {
         HACDBG_LOG("HacDbg: Err, power callback registration failed.\n");
         HacDbgDeleteDevice();
-        SvmCleanupShared();
+        HACDBG_SHARED_CLEANUP();
         LogsCleanup();
-        NptCleanup();
+        HACDBG_PAGING_CLEANUP();
         PhysicalMemoryCleanup();
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_POWER, STATUS_UNSUCCESSFUL);
     }
 
-    status = SvmStartAllProcessors();
+    status = HACDBG_START_ALL();
     if (!NT_SUCCESS(status))
     {
-        ULONG index;
-
         HACDBG_LOG("HacDbg: Err, processor virtualization failed: 0x%08x.\n", status);
         HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_PROCESSORS, status);
-        SvmStopAllProcessors();
+        HACDBG_STOP_ALL();
         HacDbgDeleteDevice();
         ExUnregisterCallback(g_PowerCallbackRegistration);
         g_PowerCallbackRegistration = NULL;
-
-        for (index = 0; index < HACDBG_MAX_PROCESSORS; index++)
-        {
-            if (g_Contexts[index] != NULL)
-            {
-                if (g_Contexts[index]->Virtualized != FALSE)
-                {
-                    KeBugCheckEx(MANUALLY_INITIATED_CRASH, 0x48444302ull, index, 0, 0);
-                }
-
-                SvmFreeProcessorContext(g_Contexts[index]);
-                g_Contexts[index] = NULL;
-            }
-        }
+        HACDBG_FREE_ALL();
 
         LogsCleanup();
-        SvmCleanupShared();
-        NptCleanup();
+        HACDBG_SHARED_CLEANUP();
+        HACDBG_PAGING_CLEANUP();
         PhysicalMemoryCleanup();
         return status;
     }

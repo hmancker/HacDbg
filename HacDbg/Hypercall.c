@@ -8,8 +8,24 @@
 #include "Hypercall.h"
 #include "Debug.h"
 #include "Logs.h"
-#include "Npt.h"
 #include "PhysicalMemory.h"
+#if HACDBG_BACKEND_INTEL
+#include "Ept.h"
+#include "Vmx.h"
+#define HacDbgSlatAddHook EptAddHook
+#define HacDbgSlatRemoveHook EptRemoveHook
+#define HacDbgSlatHidePage EptHidePage
+#define HacDbgSlatFreePages EptFreeTableCount
+#define HacDbgSlatFlush VmxFlushAllProcessors
+#else
+#include "Npt.h"
+#include "Svm.h"
+#define HacDbgSlatAddHook NptAddHook
+#define HacDbgSlatRemoveHook NptRemoveHook
+#define HacDbgSlatHidePage NptHidePage
+#define HacDbgSlatFreePages NptFreeTableCount
+#define HacDbgSlatFlush SvmFlushAllProcessors
+#endif
 
 #include "../shared/hypercall/hypercall_def.h"
 
@@ -84,7 +100,7 @@ HypercallInitialize(
 // 追加一条断点日志，并按需从客户栈补回被 pop 的寄存器。
 static VOID
 HypercallCopyStack(
-    _In_ SVM_GUEST_CONTEXT* GuestContext,
+    _In_ HACDBG_GUEST_VIEW* GuestContext,
     _Inout_ trap_frame_log_t* Log,
     _In_ UINT64 PoppedCount
     )
@@ -125,21 +141,21 @@ HypercallCopyStack(
     }
 
     Log->rsp += PoppedCount * sizeof(UINT64);
-    Log->cr3 = GuestContext->Vmcb->StateSaveArea.Cr3;
+    Log->cr3 = GuestContext->Cr3;
 }
 
 // 记录一份完整的陷阱帧。
 static VOID
 HypercallLogState(
-    _In_ SVM_GUEST_CONTEXT* GuestContext,
+    _In_ HACDBG_GUEST_VIEW* GuestContext,
     _In_ UINT64 PoppedCount,
     _In_ UINT64 LogRip,
     _In_ UINT64 Cr3Filter
     )
 {
     trap_frame_log_t log;
-    SVM_GUEST_REGISTERS* registers = GuestContext->Registers;
-    UINT64 guestCr3 = GuestContext->Vmcb->StateSaveArea.Cr3;
+    HACDBG_GUEST_REGISTERS* registers = GuestContext->Registers;
+    UINT64 guestCr3 = GuestContext->Cr3;
 
     if (Cr3Filter != 0 && (guestCr3 & HACDBG_CR3_MASK) != (Cr3Filter & HACDBG_CR3_MASK))
     {
@@ -173,12 +189,12 @@ HypercallLogState(
 // 断点 stub 轮询：首次命中挂起，收到放行后返回 1。
 static UINT64
 HypercallBreakpointPausePoll(
-    _Inout_ SVM_GUEST_CONTEXT* GuestContext
+    _Inout_ HACDBG_GUEST_VIEW* GuestContext
     )
 {
     UINT64 cr3Filter = GuestContext->Registers->Rdx;
     UINT64 breakpointRip = GuestContext->Registers->R8;
-    UINT64 guestCr3 = GuestContext->Vmcb->StateSaveArea.Cr3;
+    UINT64 guestCr3 = GuestContext->Cr3;
     UINT64 guestRsp = GuestContext->Registers->Rsp;
     BOOLEAN owner;
 
@@ -492,13 +508,13 @@ HypercallCopyVirtual(
 // hypercall 分发表，CPUID 和 IOCTL 两条路径共用。
 static VOID
 HypercallExecute(
-    _Inout_ SVM_GUEST_CONTEXT* GuestContext,
+    _Inout_ HACDBG_GUEST_VIEW* GuestContext,
     _In_ UINT64 CurrentCr3,
     _In_ BOOLEAN SafeVirtualRead,
     _In_ const hypercall_info_t* Information
     )
 {
-    SVM_GUEST_REGISTERS* registers = GuestContext->Registers;
+    HACDBG_GUEST_REGISTERS* registers = GuestContext->Registers;
     UINT64 result = 0;
 
     switch (Information->call_type)
@@ -533,32 +549,32 @@ HypercallExecute(
         break;
 
     case add_slat_code_hook:
-        result = NptAddHook(HacDbgGuestPhysicalAddress(registers->Rdx),
-                            HacDbgGuestPhysicalAddress(registers->R8)) != FALSE;
+        result = HacDbgSlatAddHook(HacDbgGuestPhysicalAddress(registers->Rdx),
+                                   HacDbgGuestPhysicalAddress(registers->R8)) != FALSE;
         if (result != 0)
         {
-            SvmFlushAllProcessors();
+            HacDbgSlatFlush();
         }
         break;
 
     case remove_slat_code_hook:
-        result = NptRemoveHook(HacDbgGuestPhysicalAddress(registers->Rdx)) != FALSE;
+        result = HacDbgSlatRemoveHook(HacDbgGuestPhysicalAddress(registers->Rdx)) != FALSE;
         if (result != 0)
         {
-            SvmFlushAllProcessors();
+            HacDbgSlatFlush();
         }
         break;
 
     case hide_guest_physical_page:
-        result = NptHidePage(HacDbgGuestPhysicalAddress(registers->Rdx)) != FALSE;
+        result = HacDbgSlatHidePage(HacDbgGuestPhysicalAddress(registers->Rdx)) != FALSE;
         if (result != 0)
         {
-            SvmFlushAllProcessors();
+            HacDbgSlatFlush();
         }
         break;
 
     case log_current_state:
-        if (GuestContext->Vmcb == NULL)
+        if (GuestContext->InGuest == FALSE)
         {
             break;
         }
@@ -569,7 +585,7 @@ HypercallExecute(
         }
         else
         {
-            HypercallLogState(GuestContext, HACDBG_LOG_POPPED_ONE, GuestContext->Vmcb->StateSaveArea.Rip, 0);
+            HypercallLogState(GuestContext, HACDBG_LOG_POPPED_ONE, GuestContext->Rip, 0);
         }
         break;
 
@@ -578,15 +594,15 @@ HypercallExecute(
         break;
 
     case get_heap_free_page_count:
-        result = NptFreeTableCount();
+        result = HacDbgSlatFreePages();
         break;
 
     case flush_slat_cache:
-        SvmFlushAllProcessors();
+        HacDbgSlatFlush();
         break;
 
     case breakpoint_pause_poll:
-        result = GuestContext->Vmcb == NULL ? 0 : HypercallBreakpointPausePoll(GuestContext);
+        result = GuestContext->InGuest == FALSE ? 0 : HypercallBreakpointPausePoll(GuestContext);
         break;
 
     case breakpoint_resume:
@@ -610,7 +626,7 @@ HypercallExecute(
 // CPUID 入口：命中调用描述则分派，否则透传真实 CPUID。
 VOID
 HypercallHandleCpuid(
-    _Inout_ SVM_GUEST_CONTEXT* GuestContext
+    _Inout_ HACDBG_GUEST_VIEW* GuestContext
     )
 {
     hypercall_info_t information = { 0 };
@@ -623,7 +639,7 @@ HypercallHandleCpuid(
     if (information.primary_key == hypercall_primary_key &&
         information.secondary_key == hypercall_secondary_key)
     {
-        HypercallExecute(GuestContext, GuestContext->Vmcb->StateSaveArea.Cr3, FALSE, &information);
+        HypercallExecute(GuestContext, GuestContext->Cr3, FALSE, &information);
     }
     else
     {
@@ -632,15 +648,9 @@ HypercallHandleCpuid(
         GuestContext->Registers->Rbx = registers.Ebx;
         GuestContext->Registers->Rcx = registers.Ecx;
         GuestContext->Registers->Rdx = registers.Edx;
-    }
-
-    if (GuestContext->Vmcb->ControlArea.NRip != 0)
-    {
-        GuestContext->Vmcb->StateSaveArea.Rip = GuestContext->Vmcb->ControlArea.NRip;
-    }
-    else
-    {
-        GuestContext->Vmcb->StateSaveArea.Rip += 2;
+#if HACDBG_BACKEND_INTEL
+        VmxConcealCpuid(leaf, GuestContext->Registers);
+#endif
     }
 }
 
@@ -650,8 +660,8 @@ HypercallHandleIoctl(
     _Inout_ HACDBG_HYPERCALL_REQUEST* Request
     )
 {
-    SVM_GUEST_REGISTERS registers = { 0 };
-    SVM_GUEST_CONTEXT context = { 0 };
+    HACDBG_GUEST_REGISTERS registers = { 0 };
+    HACDBG_GUEST_VIEW context = { 0 };
     hypercall_info_t information = { 0 };
     hypercall_type_t callType;
 
