@@ -818,8 +818,7 @@ VmxHandleEptViolation(
     UINT64 guestPhysical;
     UINT64 currentEptp;
     UINT64 nextEptp;
-
-    UNREFERENCED_PARAMETER(ProcessorContext);
+    BOOLEAN invalidateEpt;
 
     if (VmxRead(VMCS_EXIT_QUALIFICATION, &qualification) == FALSE ||
         VmxRead(VMCS_GUEST_PHYSICAL_ADDRESS, &guestPhysical) == FALSE ||
@@ -828,16 +827,23 @@ VmxHandleEptViolation(
         return FALSE;
     }
 
-    if (EptHandleViolation(qualification, guestPhysical, currentEptp, &nextEptp) == FALSE)
+    if (EptHandleViolation(qualification, guestPhysical, ProcessorContext->GuestCr3,
+                           ProcessorContext->GuestRip, currentEptp, &nextEptp,
+                           &invalidateEpt) == FALSE)
     {
-        HACDBG_LOG("HacDbg: Err, unhandled EPT violation qual=0x%I64x gpa=0x%I64x.\n",
-                 qualification, guestPhysical);
+        HACDBG_LOG("HacDbg: Err, unhandled EPT violation qual=0x%I64x gpa=0x%I64x rip=0x%I64x.\n",
+                 qualification, guestPhysical, ProcessorContext->GuestRip);
         return FALSE;
     }
 
     if (nextEptp != currentEptp && VmxWrite(VMCS_CTRL_EPT_POINTER, nextEptp) == FALSE)
     {
         return FALSE;
+    }
+
+    if (invalidateEpt != FALSE)
+    {
+        VmxFlushAllProcessors();
     }
 
     return TRUE;

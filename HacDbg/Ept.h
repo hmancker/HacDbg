@@ -101,16 +101,26 @@ BOOLEAN
 /**
  * @brief Selects the EPT root for an execute violation.
  *
+ * @details When the faulting instruction crosses two guest pages that are not
+ * both executable in one root, the missing half is made executable in the hook
+ * map. InvalidateEpt is then TRUE and the caller must invalidate EPT.
+ *
  * @param Qualification VM-exit qualification for the EPT violation.
  * @param GuestPhysical Faulting guest-physical address.
+ * @param GuestCr3 Guest CR3 used to translate GuestRip.
+ * @param GuestRip Guest instruction pointer at the violation.
  * @param CurrentEptp EPTP installed in the current VMCS.
  * @param NextEptp Receives the EPTP to install when this function returns TRUE.
+ * @param InvalidateEpt Receives TRUE when a hook-map entry was changed.
  *
  * @return TRUE when the violation was handled; otherwise FALSE.
  */
 EptHandleViolation(
     _In_ UINT64 Qualification,
     _In_ UINT64 GuestPhysical,
+    _In_ UINT64 GuestCr3,
+    _In_ UINT64 GuestRip,
     _In_ UINT64 CurrentEptp,
-    _Out_ UINT64* NextEptp
+    _Out_ UINT64* NextEptp,
+    _Out_ BOOLEAN* InvalidateEpt
     );

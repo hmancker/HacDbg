@@ -7,6 +7,7 @@
 
 #include "Npt.h"
 #include "Debug.h"
+#include "PhysicalMemory.h"
 
 #define HACDBG_NPT_TAG              'TcaH'
 #define HACDBG_NPT_MAX_HOOKS        256
@@ -357,32 +358,69 @@ NptFindHidden(
     return FALSE;
 }
 
-// 让钩子页相邻的两页在钩子表中保持可执行。
+//
+// Clears NX for one guest page in the hook map. A shadow page or a hidden
+// page is left unchanged. The caller holds g_NptLock. A 2 MiB leaf is split.
+//
+static BOOLEAN
+NptGrantHookExecute(
+    _In_ UINT64 Page
+    )
+{
+    UINT64* pte;
+
+    Page &= NPT_ADDRESS_MASK;
+
+    if (NptFindHook(Page, NULL) != FALSE || NptFindHidden(Page) != FALSE)
+    {
+        return FALSE;
+    }
+
+    pte = NptPte(g_HookRootPa, Page, TRUE);
+    if (pte == NULL)
+    {
+        return FALSE;
+    }
+
+    if ((*pte & NPT_NX) == 0)
+    {
+        return TRUE;
+    }
+
+    *pte &= ~NPT_NX;
+    KeMemoryBarrier();
+    return TRUE;
+}
+
+// 让钩子页数值上相邻的两页在钩子表中保持可执行。大页里这就是虚拟邻页。
 static VOID
 NptSetAdjacentExecutable(
     _In_ UINT64 TargetPage
     )
 {
-    UINT64* pte;
-
-    if (TargetPage >= PAGE_SIZE && NptFindHidden(TargetPage - PAGE_SIZE) == FALSE)
+    if (TargetPage >= PAGE_SIZE)
     {
-        pte = NptPte(g_HookRootPa, TargetPage - PAGE_SIZE, TRUE);
-
-        if (pte != NULL)
-        {
-            *pte &= ~NPT_NX;
-        }
+        NptGrantHookExecute(TargetPage - PAGE_SIZE);
     }
 
-    pte = NptFindHidden(TargetPage + PAGE_SIZE) == FALSE
-              ? NptPte(g_HookRootPa, TargetPage + PAGE_SIZE, TRUE)
-              : NULL;
+    NptGrantHookExecute(TargetPage + PAGE_SIZE);
+}
 
-    if (pte != NULL)
+// 客户 RIP 所在的 4 KiB 客户物理页。翻译失败时返回全 1。
+static UINT64
+NptGuestRipPage(
+    _In_ UINT64 GuestCr3,
+    _In_ UINT64 GuestRip
+    )
+{
+    GUEST_PHYSICAL_ADDRESS physical = { 0 };
+
+    if (GuestVirtualToPhysical(GuestCr3, HacDbgGuestVirtualAddress(GuestRip), &physical) == FALSE)
     {
-            *pte &= ~NPT_NX;
+        return ~0ull;
     }
+
+    return physical.Value & NPT_ADDRESS_MASK;
 }
 
 // 建立主 NPT 和钩子 NPT，覆盖前 1 TiB 客户物理地址。
@@ -755,14 +793,39 @@ NptHandleNestedPageFault(
     UINT64 physical = Vmcb->ControlArea.ExitInfo2;
     UINT64 page = physical & NPT_ADDRESS_MASK;
     UINT64 currentRoot = Vmcb->ControlArea.NCr3 & NPT_ADDRESS_MASK;
+    UINT64 ripPage;
     BOOLEAN hooked;
+    BOOLEAN granted;
 
+    //
+    // ExitInfo1 bit 0 is page present. Bit 4 is an instruction fetch.
+    //
     if ((exitInfo & (1ull << 4)) == 0 || (exitInfo & 1ull) == 0)
     {
         return FALSE;
     }
 
     hooked = NptFindHook(page, NULL);
+
+    //
+    // An instruction is at most 15 bytes, so only a RIP in the last 14 bytes
+    // of its page can touch the next page. Other fetches keep the fast path.
+    //
+    if ((Vmcb->StateSaveArea.Rip & (PAGE_SIZE - 1)) > (PAGE_SIZE - 15))
+    {
+        ripPage = NptGuestRipPage(Vmcb->StateSaveArea.Cr3, Vmcb->StateSaveArea.Rip);
+    }
+    else
+    {
+        ripPage = page;
+    }
+
+    //
+    // The fetched instruction can cross two virtually adjacent pages whose
+    // guest physical addresses are not numerically adjacent. User images are
+    // mapped as 4 KiB pages, so GPA±4 KiB is the wrong neighbor. Leaving each
+    // half executable in a different NPT root makes the fetch bounce forever.
+    //
     if (hooked != FALSE)
     {
         if (currentRoot != (g_HookRootPa & NPT_ADDRESS_MASK))
@@ -771,11 +834,39 @@ NptHandleNestedPageFault(
             Vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_GUEST;
             Vmcb->ControlArea.VmcbClean &= ~(1ull << 4);
         }
+
+        if (ripPage != ~0ull && ripPage != page)
+        {
+            HacDbgSpinLockAcquire(&g_NptLock);
+            granted = NptGrantHookExecute(ripPage);
+            HacDbgSpinLockRelease(&g_NptLock);
+            if (granted == FALSE)
+            {
+                return FALSE;
+            }
+
+            SvmFlushAllProcessors();
+        }
+
         return TRUE;
     }
 
     if (currentRoot == (g_HookRootPa & NPT_ADDRESS_MASK))
     {
+        if (ripPage != ~0ull && ripPage != page && NptFindHook(ripPage, NULL) != FALSE)
+        {
+            HacDbgSpinLockAcquire(&g_NptLock);
+            granted = NptGrantHookExecute(page);
+            HacDbgSpinLockRelease(&g_NptLock);
+            if (granted == FALSE)
+            {
+                return FALSE;
+            }
+
+            SvmFlushAllProcessors();
+            return TRUE;
+        }
+
         Vmcb->ControlArea.NCr3 = g_MainRootPa;
         Vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_GUEST;
         Vmcb->ControlArea.VmcbClean &= ~(1ull << 4);

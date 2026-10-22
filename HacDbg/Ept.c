@@ -7,6 +7,7 @@
 
 #include "Ept.h"
 #include "Debug.h"
+#include "PhysicalMemory.h"
 
 #define HACDBG_EPT_TAG               'TcaH'
 #define HACDBG_EPT_MAX_HOOKS         256
@@ -723,31 +724,69 @@ EptPte(
     return &pt[(GuestPage >> PAGE_SHIFT) & 0x1ffull];
 }
 
+//
+// Makes one guest page executable in the hook map without replacing a shadow
+// or a hidden page. The caller holds g_EptLock. A 2 MiB leaf is split first.
+//
+static BOOLEAN
+EptGrantHookExecute(
+    _In_ UINT64 Page
+    )
+{
+    UINT64* pte;
+
+    Page &= EPT_ADDRESS_MASK;
+
+    if (EptFindHook(Page, NULL) != FALSE || EptFindHidden(Page) != FALSE)
+    {
+        return FALSE;
+    }
+
+    pte = EptPte(g_HookEptp, Page, TRUE);
+    if (pte == NULL)
+    {
+        return FALSE;
+    }
+
+    if ((*pte & EPT_EXECUTE) != 0)
+    {
+        return TRUE;
+    }
+
+    *pte |= EPT_EXECUTE;
+    KeMemoryBarrier();
+    return TRUE;
+}
+
+// 让钩子页数值上相邻的两页在钩子表中保持可执行。大页里这就是虚拟邻页。
 static VOID
 EptSetAdjacentExecutable(
     _In_ UINT64 TargetPage
     )
 {
-    UINT64* pte;
-
-    if (TargetPage >= PAGE_SIZE && EptFindHidden(TargetPage - PAGE_SIZE) == FALSE)
+    if (TargetPage >= PAGE_SIZE)
     {
-        pte = EptPte(g_HookEptp, TargetPage - PAGE_SIZE, TRUE);
-
-        if (pte != NULL)
-        {
-            *pte |= EPT_EXECUTE;
-        }
+        EptGrantHookExecute(TargetPage - PAGE_SIZE);
     }
 
-    pte = EptFindHidden(TargetPage + PAGE_SIZE) == FALSE
-              ? EptPte(g_HookEptp, TargetPage + PAGE_SIZE, TRUE)
-              : NULL;
+    EptGrantHookExecute(TargetPage + PAGE_SIZE);
+}
 
-    if (pte != NULL)
+// 客户 RIP 所在的 4 KiB 客户物理页。翻译失败时返回全 1。
+static UINT64
+EptGuestRipPage(
+    _In_ UINT64 GuestCr3,
+    _In_ UINT64 GuestRip
+    )
+{
+    GUEST_PHYSICAL_ADDRESS physical = { 0 };
+
+    if (GuestVirtualToPhysical(GuestCr3, HacDbgGuestVirtualAddress(GuestRip), &physical) == FALSE)
     {
-        *pte |= EPT_EXECUTE;
+        return ~0ull;
     }
+
+    return physical.Value & EPT_ADDRESS_MASK;
 }
 
 NTSTATUS
@@ -1140,15 +1179,21 @@ BOOLEAN
 EptHandleViolation(
     _In_ UINT64 Qualification,
     _In_ UINT64 GuestPhysical,
+    _In_ UINT64 GuestCr3,
+    _In_ UINT64 GuestRip,
     _In_ UINT64 CurrentEptp,
-    _Out_ UINT64* NextEptp
+    _Out_ UINT64* NextEptp,
+    _Out_ BOOLEAN* InvalidateEpt
     )
 {
     UINT64 page = GuestPhysical & EPT_ADDRESS_MASK;
     UINT64 currentRoot = CurrentEptp & EPT_ADDRESS_MASK;
+    UINT64 ripPage;
     BOOLEAN hooked;
+    BOOLEAN granted;
 
     *NextEptp = CurrentEptp;
+    *InvalidateEpt = FALSE;
 
     //
     // Bit 2 of the EPT-violation qualification is an instruction fetch.
@@ -1160,6 +1205,27 @@ EptHandleViolation(
     }
 
     hooked = EptFindHook(page, NULL);
+
+    //
+    // An instruction is at most 15 bytes, so only a RIP in the last 14 bytes
+    // of its page can touch the next page. Other fetches keep the fast path.
+    //
+    if ((GuestRip & (PAGE_SIZE - 1)) > (PAGE_SIZE - 15))
+    {
+        ripPage = EptGuestRipPage(GuestCr3, GuestRip);
+    }
+    else
+    {
+        ripPage = page;
+    }
+
+    //
+    // A fetched instruction can start on one guest page and finish on the next
+    // virtual page. Those two guest physical pages are not necessarily
+    // numerically adjacent: user images are 4 KiB mappings. GPA±4 KiB only
+    // matches a large page. If each half is executable in a different EPT root,
+    // the fetch bounces between the roots and never retires.
+    //
     if (hooked != FALSE)
     {
         if (currentRoot != (g_HookEptp & EPT_ADDRESS_MASK))
@@ -1167,11 +1233,38 @@ EptHandleViolation(
             *NextEptp = g_HookEptp;
         }
 
+        if (ripPage != ~0ull && ripPage != page)
+        {
+            HacDbgSpinLockAcquire(&g_EptLock);
+            granted = EptGrantHookExecute(ripPage);
+            HacDbgSpinLockRelease(&g_EptLock);
+            if (granted == FALSE)
+            {
+                return FALSE;
+            }
+
+            *InvalidateEpt = TRUE;
+        }
+
         return TRUE;
     }
 
     if (currentRoot == (g_HookEptp & EPT_ADDRESS_MASK))
     {
+        if (ripPage != ~0ull && ripPage != page && EptFindHook(ripPage, NULL) != FALSE)
+        {
+            HacDbgSpinLockAcquire(&g_EptLock);
+            granted = EptGrantHookExecute(page);
+            HacDbgSpinLockRelease(&g_EptLock);
+            if (granted == FALSE)
+            {
+                return FALSE;
+            }
+
+            *InvalidateEpt = TRUE;
+            return TRUE;
+        }
+
         *NextEptp = g_MainEptp;
         return TRUE;
     }

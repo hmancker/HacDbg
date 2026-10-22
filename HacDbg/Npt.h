@@ -85,6 +85,10 @@ BOOLEAN
 /**
  * @brief Handles an execute-only nested page fault by selecting an NPT root.
  *
+ * @details An instruction that crosses into a guest page which is not
+ * numerically adjacent to the hooked page is made executable in the hook map.
+ * Other processors are asked to flush the guest TLB when that entry changes.
+ *
  * @param Vmcb Current processor VMCB.
  *
  * @return TRUE when the fault was handled; otherwise FALSE.
