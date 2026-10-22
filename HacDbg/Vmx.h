@@ -342,7 +342,7 @@ VmxFlushAllProcessors(
 
 VOID
 /**
- * @brief Clears the VMX capability bit from a passed-through CPUID leaf.
+ * @brief Clears CPUID.1 ECX[5] when virtualization hiding is enabled.
  *
  * @param Leaf CPUID leaf that produced Registers.
  * @param Registers Guest EAX/EBX/ECX/EDX to edit.

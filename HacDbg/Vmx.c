@@ -412,6 +412,22 @@ VmxHandleCpuid(
     return VmxAdvanceRip();
 }
 
+//
+// Guest CR4.VMXE stays set in the VMCS. The read shadow includes that bit
+// only when virtualization is left visible.
+//
+static UINT64
+VmxCr4ReadShadow(
+    _In_ UINT64 GuestCr4
+    )
+{
+#if HACDBG_HIDE_VIRTUALIZATION
+    return GuestCr4 & ~VMX_CR4_VMXE;
+#else
+    return GuestCr4;
+#endif
+}
+
 static BOOLEAN
 VmxHandleCrAccess(
     _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
@@ -444,7 +460,7 @@ VmxHandleCrAccess(
     newCr4 |= VMX_CR4_VMXE;
 
     if (VmxWrite(VMCS_GUEST_CR4, newCr4) == FALSE ||
-        VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, newCr4 & ~VMX_CR4_VMXE) == FALSE)
+        VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, VmxCr4ReadShadow(newCr4)) == FALSE)
     {
         return FALSE;
     }
@@ -670,6 +686,7 @@ VmxHandleMsr(
     UINT64 value;
     BOOLEAN timeHandled = FALSE;
 
+#if HACDBG_HIDE_VIRTUALIZATION
     if (msr == VMX_MSR_FEATURE_CONTROL)
     {
         if (Write != FALSE)
@@ -692,6 +709,7 @@ VmxHandleMsr(
         VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
         return TRUE;
     }
+#endif
 
     if (g_SyntheticMsrPassthrough != 0 &&
         msr >= VMX_MSR_SYNTHETIC_FIRST &&
@@ -1076,7 +1094,10 @@ VmxLoadControls(
 
     g_PinControls = VmxAdjust(0, pinMsr);
     g_ProcControls = VmxAdjust(VMX_PROC_USE_MSR_BITMAPS | VMX_PROC_ACTIVATE_SECONDARY, procMsr);
-    desired2 = VMX_PROC2_CONCEAL_VMX_FROM_PT | VMX_PROC2_ENABLE_EPT;
+    desired2 = VMX_PROC2_ENABLE_EPT;
+#if HACDBG_HIDE_VIRTUALIZATION
+    desired2 |= VMX_PROC2_CONCEAL_VMX_FROM_PT;
+#endif
     __cpuidex(cpuInfo, 0x80000001, 0);
     if ((cpuInfo[3] & (1 << 27)) != 0)
     {
@@ -1112,12 +1133,17 @@ VmxLoadControls(
     }
 
     g_ProcControls2 = VmxAdjust(desired2, VMX_MSR_PROCBASED_CTLS2);
-    g_ExitControls = VmxAdjust(VMX_EXIT_HOST_ADDR_SPACE_SIZE | VMX_EXIT_SAVE_DEBUG |
-                               VMX_EXIT_CONCEAL_VMX_FROM_PT,
-                               exitMsr);
-    g_EntryControls = VmxAdjust(VMX_ENTRY_IA32E_MODE_GUEST | VMX_ENTRY_LOAD_DEBUG |
-                                VMX_ENTRY_CONCEAL_VMX_FROM_PT,
-                                entryMsr);
+    {
+        UINT32 exitRequested = VMX_EXIT_HOST_ADDR_SPACE_SIZE | VMX_EXIT_SAVE_DEBUG;
+        UINT32 entryRequested = VMX_ENTRY_IA32E_MODE_GUEST | VMX_ENTRY_LOAD_DEBUG;
+
+#if HACDBG_HIDE_VIRTUALIZATION
+        exitRequested |= VMX_EXIT_CONCEAL_VMX_FROM_PT;
+        entryRequested |= VMX_ENTRY_CONCEAL_VMX_FROM_PT;
+#endif
+        g_ExitControls = VmxAdjust(exitRequested, exitMsr);
+        g_EntryControls = VmxAdjust(entryRequested, entryMsr);
+    }
 
     if ((g_PinControls & (VMX_PIN_EXTERNAL_INT_EXITING | VMX_PIN_NMI_EXITING)) != 0 ||
         (g_ProcControls & (VMX_PROC_HLT_EXITING | VMX_PROC_INVLPG_EXITING |
@@ -1251,10 +1277,15 @@ VmxConcealCpuid(
     _Inout_ HACDBG_GUEST_REGISTERS* Registers
     )
 {
+#if HACDBG_HIDE_VIRTUALIZATION
     if (Leaf == 1)
     {
         Registers->Rcx &= ~VMX_CPUID_VMX_BIT;
     }
+#else
+    UNREFERENCED_PARAMETER(Leaf);
+    UNREFERENCED_PARAMETER(Registers);
+#endif
 }
 
 static NTSTATUS
@@ -1267,7 +1298,6 @@ VmxPrepareProcessor(
     UINT32 revision = (UINT32)(basic & 0x7FFFFFFFu);
     ULONG_PTR hostTop;
     PHYSICAL_ADDRESS physical;
-    UINT32 msr;
 
     ProcessorContext->Vmxon = VmxAllocateAligned(PAGE_SIZE, &ProcessorContext->VmxonAllocation);
     ProcessorContext->Vmcs = VmxAllocateAligned(PAGE_SIZE, &ProcessorContext->VmcsAllocation);
@@ -1285,13 +1315,19 @@ VmxPrepareProcessor(
     *(UINT32*)ProcessorContext->Vmcs = revision;
     RtlZeroMemory(ProcessorContext->MsrBitmap, PAGE_SIZE);
 
-    VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_FEATURE_CONTROL, VMX_MSR_BITMAP_READ_LOW);
-    VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_FEATURE_CONTROL, VMX_MSR_BITMAP_WRITE_LOW);
-    for (msr = (UINT32)VMX_MSR_BASIC; msr <= 0x4FFu; msr++)
+#if HACDBG_HIDE_VIRTUALIZATION
     {
-        VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, msr, VMX_MSR_BITMAP_READ_LOW);
-        VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, msr, VMX_MSR_BITMAP_WRITE_LOW);
+        UINT32 msr;
+
+        VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_FEATURE_CONTROL, VMX_MSR_BITMAP_READ_LOW);
+        VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_FEATURE_CONTROL, VMX_MSR_BITMAP_WRITE_LOW);
+        for (msr = (UINT32)VMX_MSR_BASIC; msr <= 0x4FFu; msr++)
+        {
+            VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, msr, VMX_MSR_BITMAP_READ_LOW);
+            VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, msr, VMX_MSR_BITMAP_WRITE_LOW);
+        }
     }
+#endif
 
     physical = MmGetPhysicalAddress(ProcessorContext->Vmxon);
     ProcessorContext->VmxonPa = (UINT64)physical.QuadPart;
@@ -1398,7 +1434,7 @@ VmxFillVmcs(
         VmxWrite(VMCS_CTRL_CR0_MASK, 0) == FALSE ||
         VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, cr0) == FALSE ||
         VmxWrite(VMCS_CTRL_CR4_MASK, VMX_CR4_VMXE) == FALSE ||
-        VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, guestCr4 & ~VMX_CR4_VMXE) == FALSE)
+        VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, VmxCr4ReadShadow(guestCr4)) == FALSE)
     {
         return FALSE;
     }

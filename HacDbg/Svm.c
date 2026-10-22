@@ -434,8 +434,8 @@ SvmPrepareLaunch(
     vmcb->StateSaveArea.SsLimit = SvmSegmentLimit(Context->SegSs, gdtr.Base);
 
     //
-    // VMRUN rejects a guest EFER with SVME clear. The guest-visible value is
-    // masked in the EFER read intercept below.
+    // VMRUN rejects a guest EFER with SVME clear. The read intercept drops
+    // SVME from the value returned to the guest when virtualization is hidden.
     //
     vmcb->StateSaveArea.Efer = __readmsr(HACDBG_MSR_EFER);
     vmcb->StateSaveArea.Cr0 = __readcr0();
@@ -551,7 +551,10 @@ SvmHandleMsrAccess(
         }
         else
         {
-            value = vmcb->StateSaveArea.Efer & ~HACDBG_EFER_SVME;
+            value = vmcb->StateSaveArea.Efer;
+#if HACDBG_HIDE_VIRTUALIZATION
+            value &= ~HACDBG_EFER_SVME;
+#endif
             registers->Rax = (UINT32)value;
             registers->Rdx = value >> 32;
         }

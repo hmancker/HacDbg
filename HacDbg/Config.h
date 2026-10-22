@@ -34,3 +34,16 @@
 #ifndef HACDBG_BACKEND_INTEL
 #define HACDBG_BACKEND_INTEL 0
 #endif
+
+//
+// 客户是否看到虚拟化能力。
+//   1 - 隐藏（默认）。Intel 清掉 CPUID.1 ECX[5]，CR4 读影子不带 VMXE，
+//       IA32_FEATURE_CONTROL 显示为已锁定且不允许 VMX，0x480-0x4FF 注入 #GP，
+//       并对 Processor Trace 隐藏 VMX。AMD 的 EFER 读结果不带 SVME。
+//   0 - 不隐藏。上述位按真实状态返回。
+// 两种取值都不把 VMCS、VMCB 和 MSR 位图映射进客户，也不模拟嵌套 VMX。
+// VMX 指令仍然注入 #UD。
+//
+#ifndef HACDBG_HIDE_VIRTUALIZATION
+#define HACDBG_HIDE_VIRTUALIZATION 1
+#endif
