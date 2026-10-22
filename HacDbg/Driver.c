@@ -483,26 +483,6 @@ SvmPowerCallback(
     }
 }
 
-// 在目标处理器上执行刷新 CPUID，触发 NPT TLB 刷新。
-static ULONG_PTR
-NTAPI
-HacDbgFlushIpi(
-    _In_ ULONG_PTR Context
-    )
-{
-    UNREFERENCED_PARAMETER(Context);
-#if HACDBG_BACKEND_INTEL
-    VmxRequestTlbFlushOnCurrentProcessor();
-#else
-    {
-        int registers[4];
-
-        __cpuidex(registers, HACDBG_FLUSH_CPUID_LEAF, HACDBG_FLUSH_CPUID_SUBLEAF);
-    }
-#endif
-    return 0;
-}
-
 // 完成一个成功返回的 IRP。
 static NTSTATUS
 HacDbgCompleteSuccess(
@@ -551,7 +531,7 @@ HacDbgCleanup(
     return HacDbgCompleteSuccess(Irp);
 }
 
-// 分派 hypercall 和 NPT 刷新 IOCTL，并要求管理员权限。
+// 控制设备不再执行调试命令。命令 IOCTL 一律拒绝，并要求管理员权限。
 static NTSTATUS
 _Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 HacDbgDeviceControl(
@@ -588,62 +568,13 @@ HacDbgDeviceControl(
                  stack->Parameters.DeviceIoControl.IoControlCode);
         status = STATUS_ACCESS_DENIED;
     }
-    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FLUSH_SLAT)
+    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FLUSH_SLAT ||
+             stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_HYPERCALL ||
+             stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_QUERY_VERSION)
     {
-        KeIpiGenericCall(HacDbgFlushIpi, 0);
-        status = STATUS_SUCCESS;
-    }
-    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_HYPERCALL)
-    {
-        HACDBG_HYPERCALL_REQUEST* request;
-
-        if (inputLength < sizeof(*request) || outputLength < sizeof(*request) ||
-            Irp->AssociatedIrp.SystemBuffer == NULL)
-        {
-            HACDBG_LOG("HacDbg: Err, hypercall IOCTL buffer too small: in=%u out=%u need=%u.\n",
-                     inputLength, outputLength, (ULONG)sizeof(*request));
-            status = STATUS_BUFFER_TOO_SMALL;
-        }
-        else
-        {
-            request = (HACDBG_HYPERCALL_REQUEST*)Irp->AssociatedIrp.SystemBuffer;
-
-            status = HypercallHandleIoctl(request);
-            if (!NT_SUCCESS(status))
-            {
-                request->Status = (UINT32)status;
-                request->Result = 0;
-                HACDBG_LOG("HacDbg: Err, IOCTL hypercall dispatch failed: 0x%08x.\n", status);
-            }
-
-            Irp->IoStatus.Information = sizeof(*request);
-            status = STATUS_SUCCESS;
-        }
-    }
-    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_QUERY_VERSION)
-    {
-        HACDBG_VERSION_INFO* version;
-
-        if (outputLength < sizeof(*version) || Irp->AssociatedIrp.SystemBuffer == NULL)
-        {
-            HACDBG_LOG("HacDbg: Err, version IOCTL buffer too small: out=%u need=%u.\n",
-                     outputLength, (ULONG)sizeof(*version));
-            status = STATUS_BUFFER_TOO_SMALL;
-        }
-        else
-        {
-            version = (HACDBG_VERSION_INFO*)Irp->AssociatedIrp.SystemBuffer;
-            RtlZeroMemory(version, sizeof(*version));
-            version->Major = HACDBG_VERSION_MAJOR;
-            version->Minor = HACDBG_VERSION_MINOR;
-            version->Patch = HACDBG_VERSION_PATCH;
-            version->HypercallAbiVersion = HACDBG_HYPERCALL_REQUEST_VERSION;
-            RtlCopyMemory(version->VersionString, HACDBG_VERSION_STRING,
-                          sizeof(HACDBG_VERSION_STRING));
-
-            Irp->IoStatus.Information = sizeof(*version);
-            status = STATUS_SUCCESS;
-        }
+        HACDBG_LOG("HacDbg: Err, IOCTL 0x%08x is not a command path.\n",
+                 stack->Parameters.DeviceIoControl.IoControlCode);
+        status = STATUS_INVALID_DEVICE_REQUEST;
     }
     else
     {
@@ -653,12 +584,7 @@ HacDbgDeviceControl(
     }
 
     Irp->IoStatus.Status = status;
-    if ((stack->Parameters.DeviceIoControl.IoControlCode != HACDBG_IOCTL_HYPERCALL &&
-         stack->Parameters.DeviceIoControl.IoControlCode != HACDBG_IOCTL_QUERY_VERSION) ||
-        !NT_SUCCESS(status))
-    {
-        Irp->IoStatus.Information = 0;
-    }
+    Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
 }

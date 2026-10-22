@@ -33,7 +33,7 @@ std::uint8_t hook::set_up()
 	}
 
 	const std::uint64_t shadow_page_physical = hypercall::translate_guest_virtual_address(
-		reinterpret_cast<std::uint64_t>(kernel_detour_holder_shadow_page_mapped), sys::current_cr3);
+		reinterpret_cast<std::uint64_t>(kernel_detour_holder_shadow_page_mapped), sys::directory_for_local_memory());
 
 	if (shadow_page_physical == 0)
 	{
@@ -185,7 +185,7 @@ static std::uint8_t set_up_inline_hook(std::uint8_t* shadow_page_virtual, const 
 		std::uint8_t* overflow_shadow_page_virtual = shadow_page_virtual + page_size;
 
 		overflow_shadow_page_physical_address = hypercall::translate_guest_virtual_address(
-			reinterpret_cast<std::uint64_t>(overflow_shadow_page_virtual), sys::current_cr3);
+			reinterpret_cast<std::uint64_t>(overflow_shadow_page_virtual), sys::directory_for_local_memory());
 
 		if (overflow_shadow_page_physical_address == 0)
 		{
@@ -302,7 +302,7 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 	}
 
 	const std::uint64_t shadow_page_physical = hypercall::translate_guest_virtual_address(
-		reinterpret_cast<std::uint64_t>(shadow_page_virtual), sys::current_cr3);
+		reinterpret_cast<std::uint64_t>(shadow_page_virtual), sys::directory_for_local_memory());
 
 	if (shadow_page_physical == 0)
 	{

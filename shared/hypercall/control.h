@@ -10,7 +10,8 @@
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 //
-// Carries one usermode-originated hypercall through the control device.
+// Kept so a caller that still sends the old control-device request is
+// rejected. Debugger commands enter through CPUID, not this IOCTL.
 //
 #define HACDBG_IOCTL_HYPERCALL \
     CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)

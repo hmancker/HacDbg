@@ -13,7 +13,7 @@
 //   1 - 全部关闭，生成静默驱动
 //
 #ifndef HACDBG_DISABLE_DEBUG_LOG
-#define HACDBG_DISABLE_DEBUG_LOG 1
+#define HACDBG_DISABLE_DEBUG_LOG 0
 #endif
 
 //
@@ -32,5 +32,5 @@
 // 排除另一边的源文件。DebugIntel / ReleaseIntel 由工程传入 1。
 //
 #ifndef HACDBG_BACKEND_INTEL
-#define HACDBG_BACKEND_INTEL 1
+#define HACDBG_BACKEND_INTEL 0
 #endif

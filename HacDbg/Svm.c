@@ -441,6 +441,7 @@ SvmPrepareLaunch(
     vmcb->StateSaveArea.Cr0 = __readcr0();
     vmcb->StateSaveArea.Cr2 = __readcr2();
     vmcb->StateSaveArea.Cr3 = __readcr3();
+    HypercallNoteKernelCr3(vmcb->StateSaveArea.Cr3);
     vmcb->StateSaveArea.Cr4 = __readcr4();
     vmcb->StateSaveArea.GPat = __readmsr(HACDBG_MSR_PAT);
     vmcb->StateSaveArea.Rflags = Context->EFlags;
@@ -587,6 +588,11 @@ SvmHandleVmExit(
 
     __svm_vmload(processor->HostVmcbPa);
     GuestContext->Registers->Rax = vmcb->StateSaveArea.Rax;
+
+    if (vmcb->StateSaveArea.Cpl == 0)
+    {
+        HypercallNoteKernelCr3(vmcb->StateSaveArea.Cr3);
+    }
     vmcb->ControlArea.TlbControl =
         InterlockedExchange(&processor->TlbFlushRequested, 0) != 0 ? SVM_TLB_CONTROL_FLUSH_GUEST : 0;
 

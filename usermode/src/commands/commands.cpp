@@ -9461,17 +9461,17 @@ static void process_version(const CLI::App* const)
 	if (hypercall::query_driver_version(driver_major, driver_minor, driver_patch, driver_abi,
 	                                    driver_version) == 1)
 	{
-		fmt::print("HacDbg driver:   {}\n", driver_version);
+		fmt::print("HacDbg hypervisor: {}\n", driver_version);
 
 		if (driver_version != HACDBG_VERSION_STRING)
 		{
-			fmt::print("Version mismatch: usermode {} driver {}\n", HACDBG_VERSION_STRING,
+			fmt::print("Version mismatch: usermode {} hypervisor {}\n", HACDBG_VERSION_STRING,
 			           driver_version);
 		}
 	}
 	else
 	{
-		fmt::print("HacDbg driver:   unavailable\n");
+		fmt::print("HacDbg hypervisor: unavailable\n");
 	}
 
 	const std::string path = symbol_parser::search_path();

@@ -55,4 +55,10 @@ namespace sys
 	};
 
 	inline std::uint64_t current_cr3 = 0;
+	inline std::uint64_t local_user_cr3 = 0;
+
+	inline std::uint64_t directory_for_local_memory()
+	{
+		return local_user_cr3 != 0 ? local_user_cr3 : current_cr3;
+	}
 }

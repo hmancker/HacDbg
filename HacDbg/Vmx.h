@@ -246,7 +246,9 @@ typedef struct _VMX_PROCESSOR_CONTEXT
     PVOID VmcsAllocation;
     PVOID MsrBitmapAllocation;
     PVOID HostStackAllocation;
-    INT64 TscOffset;
+    UINT64 TscBeforeVmxon;
+    UINT64 TscAfterVmxon;
+    UINT64 VpRuntime;
     volatile LONG InveptRequested;
     UINT16 Vpid;
     UINT8 Virtualized;
@@ -335,14 +337,6 @@ VOID
  * @brief Asks every processor to invalidate EPT translations on its next exit.
  */
 VmxFlushAllProcessors(
-    VOID
-    );
-
-VOID
-/**
- * @brief Marks the current processor for an EPT invalidation and forces an exit.
- */
-VmxRequestTlbFlushOnCurrentProcessor(
     VOID
     );
 

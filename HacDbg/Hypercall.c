@@ -29,15 +29,10 @@
 
 #include "../shared/hypercall/hypercall_def.h"
 
-#include <intrin.h>
-
 #define HACDBG_CR3_MASK         0xFFFFFFFFFFFFF000ull
 #define HACDBG_LOG_POPPED_FIVE  5
 #define HACDBG_LOG_POPPED_THREE 3
 #define HACDBG_LOG_POPPED_ONE   1
-#define HACDBG_RESERVED_MASK    0x1FFFFFFFFFull
-#define HACDBG_KERNEL_VA_START  0xFFFF800000000000ull
-#define HACDBG_SAFE_COPY_TAG    'ScaH'
 
 C_ASSERT(sizeof(hypercall_info_t) == sizeof(UINT64));
 C_ASSERT(sizeof(trap_frame_log_t) == 0xb8);
@@ -56,32 +51,36 @@ static BOOLEAN g_BreakpointGoRequested;
 static UINT64 g_BreakpointOwnerRsp;
 static UINT64 g_BreakpointOwnerCr3;
 static HACDBG_SPIN_LOCK g_BreakpointLock;
-static volatile LONG g_SafeCopyFailureLogCount;
+static UINT64 g_KernelCr3;
 
-// 只允许三环通过 IOCTL 发起的调用类型。
-static BOOLEAN
-HypercallIsIoctlAllowed(
-    _In_ hypercall_type_t CallType
+//
+// 记录内核页表根。三环 CPUID 退出时的客户 CR3 在 KPTI 下是用户目录，
+// 不能用来翻译内核地址。
+//
+VOID
+HypercallNoteKernelCr3(
+    _In_ UINT64 Cr3
     )
 {
-    switch (CallType)
-    {
-    case guest_physical_memory_operation:
-    case guest_virtual_memory_operation:
-    case translate_guest_virtual_address:
-    case read_guest_cr3:
-    case add_slat_code_hook:
-    case remove_slat_code_hook:
-    case hide_guest_physical_page:
-    case flush_logs:
-    case get_heap_free_page_count:
-    case flush_slat_cache:
-    case breakpoint_resume:
-        return TRUE;
+    UINT64 directory = Cr3 & HACDBG_CR3_MASK;
 
-    default:
-        return FALSE;
+    if (directory != 0)
+    {
+        g_KernelCr3 = directory;
     }
+}
+
+static VOID
+HypercallFillVersion(
+    _Out_ HACDBG_VERSION_INFO* Info
+    )
+{
+    RtlZeroMemory(Info, sizeof(*Info));
+    Info->Major = HACDBG_VERSION_MAJOR;
+    Info->Minor = HACDBG_VERSION_MINOR;
+    Info->Patch = HACDBG_VERSION_PATCH;
+    Info->HypercallAbiVersion = HACDBG_HYPERCALL_REQUEST_VERSION;
+    RtlCopyMemory(Info->VersionString, HACDBG_VERSION_STRING, sizeof(HACDBG_VERSION_STRING));
 }
 
 // 复位断点暂停状态。
@@ -263,12 +262,6 @@ HypercallCopyPhysical(
         GUEST_PHYSICAL_ADDRESS guestPhysical = HacDbgGuestPhysicalAddress(GuestPhysical + copied);
         GUEST_VIRTUAL_ADDRESS guestVirtual = HacDbgGuestVirtualAddress(GuestVirtual + copied);
         UINT64 chunk;
-        SIZE_T bufferMappedSize = 0;
-        SIZE_T guestMappedSize = 0;
-        PUCHAR guestMapped;
-        PUCHAR bufferMapped;
-        PUCHAR destination;
-        PUCHAR source;
 
         if (GuestVirtualToPhysical(CurrentCr3, guestVirtual, &bufferPhysical) == FALSE)
         {
@@ -281,137 +274,55 @@ HypercallCopyPhysical(
         chunk = min(chunk, PAGE_SIZE - (guestPhysical.Value & (PAGE_SIZE - 1)));
         chunk = min(chunk, PAGE_SIZE - (bufferPhysical.Value & (PAGE_SIZE - 1)));
 
-        guestMapped = (PUCHAR)PhysicalMemoryMapTemporary(guestPhysical, (SIZE_T)chunk,
-                                                         &guestMappedSize);
-        if (guestMapped == NULL)
         {
-            HACDBG_LOG("HacDbg: Err, physical copy source map failed pa=0x%I64x size=0x%I64x\n",
-                     guestPhysical.Value, chunk);
-            break;
-        }
+            UCHAR bounce[PAGE_SIZE];
+            GUEST_PHYSICAL_ADDRESS from;
+            GUEST_PHYSICAL_ADDRESS to;
+            SIZE_T got;
+            SIZE_T put;
 
-        bufferMapped = (PUCHAR)PhysicalMemoryMapTemporary(bufferPhysical, (SIZE_T)chunk,
-                                                          &bufferMappedSize);
-        if (bufferMapped == NULL)
-        {
-            HACDBG_LOG("HacDbg: Err, physical copy buffer map failed pa=0x%I64x size=0x%I64x\n",
-                     bufferPhysical.Value, chunk);
-            PhysicalMemoryUnmapTemporary(guestMapped, guestMappedSize);
-            break;
-        }
+            if (Operation == memory_operation_t_READ)
+            {
+                from = guestPhysical;
+                to = bufferPhysical;
+            }
+            else
+            {
+                from = bufferPhysical;
+                to = guestPhysical;
+            }
 
-        chunk = min(chunk, (UINT64)guestMappedSize);
-        chunk = min(chunk, (UINT64)bufferMappedSize);
+            got = PhysicalMemoryRead(from, bounce, (SIZE_T)chunk);
+            if (got == 0)
+            {
+                HACDBG_LOG("HacDbg: Err, physical copy read failed pa=0x%I64x size=0x%I64x\n",
+                         from.Value, chunk);
+                break;
+            }
 
-        if (chunk == 0)
-        {
-            PhysicalMemoryUnmapTemporary(bufferMapped, bufferMappedSize);
-            PhysicalMemoryUnmapTemporary(guestMapped, guestMappedSize);
-            break;
-        }
+            put = PhysicalMemoryWrite(to, bounce, got);
+            if (put == 0)
+            {
+                HACDBG_LOG("HacDbg: Err, physical copy write failed pa=0x%I64x size=0x%I64x\n",
+                         to.Value, (UINT64)got);
+                break;
+            }
 
-        if (Operation == memory_operation_t_READ)
-        {
-            destination = bufferMapped;
-            source = guestMapped;
+            copied += put;
+            if (put != chunk)
+            {
+                break;
+            }
         }
-        else
-        {
-            destination = guestMapped;
-            source = bufferMapped;
-        }
-
-        RtlMoveMemory(destination, source, (SIZE_T)chunk);
-        PhysicalMemoryUnmapTemporary(bufferMapped, bufferMappedSize);
-        PhysicalMemoryUnmapTemporary(guestMapped, guestMappedSize);
-        copied += chunk;
     }
 
     return copied;
 }
 
-// 在调用方上下文用 MmCopyMemory 读内核虚拟地址，避免手工遍历缺页。
-static UINT64
-HypercallCopyVirtualSafe(
-    _In_ UINT64 DestinationVa,
-    _In_ UINT64 SourceVa,
-    _In_ UINT64 Size
-    )
-{
-    SIZE_T allocationSize;
-    PVOID temporary;
-    UINT64 copied = 0;
-
-    if (Size == 0 || KeGetCurrentIrql() > APC_LEVEL)
-    {
-        return 0;
-    }
-
-    allocationSize = (SIZE_T)min(Size, hypercall_memory_chunk_size);
-    temporary = ExAllocatePool2(POOL_FLAG_NON_PAGED, allocationSize, HACDBG_SAFE_COPY_TAG);
-    if (temporary == NULL)
-    {
-        HACDBG_LOG("HacDbg: Err, safe virtual copy allocation failed size=0x%I64x.\n",
-                 (UINT64)allocationSize);
-        return 0;
-    }
-
-    while (copied < Size)
-    {
-        MM_COPY_ADDRESS source = { 0 };
-        SIZE_T transferred = 0;
-        SIZE_T chunk = (SIZE_T)min(Size - copied, (UINT64)allocationSize);
-        NTSTATUS status;
-
-        source.VirtualAddress = (PVOID)(ULONG_PTR)(SourceVa + copied);
-        status = MmCopyMemory(temporary, source, chunk, MM_COPY_MEMORY_VIRTUAL, &transferred);
-        if (!NT_SUCCESS(status) || transferred == 0)
-        {
-#if !HACDBG_DISABLE_DEBUG_LOG
-            if (InterlockedIncrement(&g_SafeCopyFailureLogCount) <= 64)
-            {
-                HACDBG_LOG("HacDbg: Err, safe virtual read failed va=0x%I64x size=0x%I64x "
-                         "status=0x%08x transferred=0x%I64x.\n",
-                         SourceVa + copied, (UINT64)chunk, status, (UINT64)transferred);
-            }
-#endif
-            break;
-        }
-
-        __try
-        {
-            ProbeForWrite((PVOID)(ULONG_PTR)(DestinationVa + copied), transferred, sizeof(UCHAR));
-            RtlCopyMemory((PVOID)(ULONG_PTR)(DestinationVa + copied), temporary, transferred);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER)
-        {
-#if !HACDBG_DISABLE_DEBUG_LOG
-            if (InterlockedIncrement(&g_SafeCopyFailureLogCount) <= 64)
-            {
-                HACDBG_LOG("HacDbg: Err, safe virtual copy to user failed dest=0x%I64x size=0x%I64x.\n",
-                         DestinationVa + copied, (UINT64)transferred);
-            }
-#endif
-            break;
-        }
-
-        copied += transferred;
-        if (transferred != chunk)
-        {
-            break;
-        }
-    }
-
-    ExFreePoolWithTag(temporary, HACDBG_SAFE_COPY_TAG);
-
-    return copied;
-}
-
-// 通用虚拟地址复制；当前 CR3 的内核读走安全路径，其余按页翻译。
+// 按客户页表翻译两侧虚拟地址。调用发生在 CPUID 退出里。
 static UINT64
 HypercallCopyVirtual(
     _In_ UINT64 CurrentCr3,
-    _In_ BOOLEAN SafeVirtualRead,
     _In_ UINT64 Operation,
     _In_ UINT64 DestinationOrSourceCr3,
     _In_ UINT64 First,
@@ -421,13 +332,6 @@ HypercallCopyVirtual(
 {
     UINT64 copied = 0;
     UINT64 limit = min(Size, hypercall_memory_chunk_size);
-
-    if (Operation == memory_operation_t_READ && SafeVirtualRead != FALSE &&
-        (CurrentCr3 & HACDBG_CR3_MASK) == (DestinationOrSourceCr3 & HACDBG_CR3_MASK) &&
-        Second >= HACDBG_KERNEL_VA_START)
-    {
-        return HypercallCopyVirtualSafe(First, Second, limit);
-    }
 
     while (copied < limit)
     {
@@ -444,10 +348,6 @@ HypercallCopyVirtual(
         GUEST_PHYSICAL_ADDRESS sourcePhysical;
         UINT64 virtualPageLeft;
         UINT64 chunk;
-        SIZE_T destinationMappedSize = 0;
-        SIZE_T sourceMappedSize = 0;
-        PUCHAR source;
-        PUCHAR destination;
 
         if (GuestVirtualToPhysical(destinationCr3, HacDbgGuestVirtualAddress(destinationVa + copied),
                                    &destinationPhysical) == FALSE ||
@@ -467,50 +367,43 @@ HypercallCopyVirtual(
         chunk = min(chunk, PAGE_SIZE - (destinationPhysical.Value & (PAGE_SIZE - 1)));
         chunk = min(chunk, PAGE_SIZE - (sourcePhysical.Value & (PAGE_SIZE - 1)));
 
-        source = (PUCHAR)PhysicalMemoryMapTemporary(sourcePhysical, (SIZE_T)chunk,
-                                                    &sourceMappedSize);
-        if (source == NULL)
         {
-            HACDBG_LOG("HacDbg: Err, virtual copy source map failed pa=0x%I64x size=0x%I64x\n",
-                     sourcePhysical.Value, chunk);
-            break;
+            UCHAR bounce[PAGE_SIZE];
+            SIZE_T got;
+            SIZE_T put;
+
+            got = PhysicalMemoryRead(sourcePhysical, bounce, (SIZE_T)chunk);
+            if (got == 0)
+            {
+                HACDBG_LOG("HacDbg: Err, virtual copy read failed pa=0x%I64x size=0x%I64x\n",
+                         sourcePhysical.Value, chunk);
+                break;
+            }
+
+            put = PhysicalMemoryWrite(destinationPhysical, bounce, got);
+            if (put == 0)
+            {
+                HACDBG_LOG("HacDbg: Err, virtual copy write failed pa=0x%I64x size=0x%I64x\n",
+                         destinationPhysical.Value, (UINT64)got);
+                break;
+            }
+
+            copied += put;
+            if (put != chunk)
+            {
+                break;
+            }
         }
-
-        destination = (PUCHAR)PhysicalMemoryMapTemporary(destinationPhysical, (SIZE_T)chunk,
-                                                         &destinationMappedSize);
-        if (destination == NULL)
-        {
-            HACDBG_LOG("HacDbg: Err, virtual copy destination map failed pa=0x%I64x size=0x%I64x\n",
-                     destinationPhysical.Value, chunk);
-            PhysicalMemoryUnmapTemporary(source, sourceMappedSize);
-            break;
-        }
-
-        chunk = min(chunk, (UINT64)sourceMappedSize);
-        chunk = min(chunk, (UINT64)destinationMappedSize);
-
-        if (chunk == 0)
-        {
-            PhysicalMemoryUnmapTemporary(destination, destinationMappedSize);
-            PhysicalMemoryUnmapTemporary(source, sourceMappedSize);
-            break;
-        }
-
-        RtlMoveMemory(destination, source, (SIZE_T)chunk);
-        PhysicalMemoryUnmapTemporary(destination, destinationMappedSize);
-        PhysicalMemoryUnmapTemporary(source, sourceMappedSize);
-        copied += chunk;
     }
 
     return copied;
 }
 
-// hypercall 分发表，CPUID 和 IOCTL 两条路径共用。
+// CPUID 退出里的 hypercall 分发表。
 static VOID
 HypercallExecute(
     _Inout_ HACDBG_GUEST_VIEW* GuestContext,
     _In_ UINT64 CurrentCr3,
-    _In_ BOOLEAN SafeVirtualRead,
     _In_ const hypercall_info_t* Information
     )
 {
@@ -528,7 +421,7 @@ HypercallExecute(
     {
         UINT64 operation = Information->call_reserved_data & 1;
         UINT64 cr3 = ((Information->call_reserved_data >> 1) & 0xFFFFFFFFFull) << PAGE_SHIFT;
-        result = HypercallCopyVirtual(CurrentCr3, SafeVirtualRead, operation, cr3,
+        result = HypercallCopyVirtual(CurrentCr3, operation, cr3,
                                       registers->Rdx, registers->R8,
                                       registers->R9);
         break;
@@ -545,7 +438,7 @@ HypercallExecute(
     }
 
     case read_guest_cr3:
-        result = CurrentCr3;
+        result = g_KernelCr3;
         break;
 
     case add_slat_code_hook:
@@ -599,7 +492,23 @@ HypercallExecute(
 
     case flush_slat_cache:
         HacDbgSlatFlush();
+        result = 1;
         break;
+
+    case query_hypervisor_version:
+    {
+        HACDBG_VERSION_INFO info;
+
+        if (registers->R8 < sizeof(info) || registers->Rdx == 0)
+        {
+            break;
+        }
+
+        HypercallFillVersion(&info);
+        result = GuestVirtualWrite(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx),
+                                   &info, sizeof(info));
+        break;
+    }
 
     case breakpoint_pause_poll:
         result = GuestContext->InGuest == FALSE ? 0 : HypercallBreakpointPausePoll(GuestContext);
@@ -639,7 +548,7 @@ HypercallHandleCpuid(
     if (information.primary_key == hypercall_primary_key &&
         information.secondary_key == hypercall_secondary_key)
     {
-        HypercallExecute(GuestContext, GuestContext->Cr3, FALSE, &information);
+        HypercallExecute(GuestContext, GuestContext->Cr3, &information);
     }
     else
     {
@@ -652,55 +561,5 @@ HypercallHandleCpuid(
         VmxConcealCpuid(leaf, GuestContext->Registers);
 #endif
     }
-}
-
-// IOCTL 入口：校验版本和类型后，用调用方 CR3 构造上下文执行。
-NTSTATUS
-HypercallHandleIoctl(
-    _Inout_ HACDBG_HYPERCALL_REQUEST* Request
-    )
-{
-    HACDBG_GUEST_REGISTERS registers = { 0 };
-    HACDBG_GUEST_VIEW context = { 0 };
-    hypercall_info_t information = { 0 };
-    hypercall_type_t callType;
-
-    if (Request == NULL || Request->Version != HACDBG_HYPERCALL_REQUEST_VERSION)
-    {
-        return STATUS_REVISION_MISMATCH;
-    }
-
-    if (Request->CallType > 0xF || Request->Reserved > HACDBG_RESERVED_MASK)
-    {
-        return STATUS_INVALID_PARAMETER;
-    }
-
-    callType = (hypercall_type_t)Request->CallType;
-    if (HypercallIsIoctlAllowed(callType) == FALSE)
-    {
-        HACDBG_LOG("HacDbg: Err, IOCTL hypercall type 0x%I64x is not allowed.\n", Request->CallType);
-        return STATUS_INVALID_DEVICE_REQUEST;
-    }
-
-    information.call_type = callType;
-    information.call_reserved_data = Request->Reserved;
-
-    UINT64 currentCr3 = Request->ProcessCr3 != 0 ? Request->ProcessCr3 : __readcr3();
-
-    registers.Rdx = Request->Rdx;
-    registers.R8 = Request->R8;
-    registers.R9 = Request->R9;
-    context.Registers = &registers;
-
-    //
-    // The driver is both the control path and the SVM host, so this dispatch
-    // costs no second VM exit. The synthetic context carries the caller's CR3
-    // so buffer virtual addresses resolve like the CPUID path.
-    //
-    HypercallExecute(&context, currentCr3, TRUE, &information);
-
-    Request->Result = registers.Rax;
-    Request->Status = STATUS_SUCCESS;
-    return STATUS_SUCCESS;
 }
 

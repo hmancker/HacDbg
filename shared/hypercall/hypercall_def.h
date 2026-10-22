@@ -25,7 +25,8 @@ typedef enum _hypercall_type_t
     get_heap_free_page_count,
     flush_slat_cache,
     breakpoint_pause_poll,
-    breakpoint_resume
+    breakpoint_resume,
+    query_hypervisor_version
 #ifdef __cplusplus
 };
 #else

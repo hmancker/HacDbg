@@ -57,7 +57,7 @@ static std::vector<std::uint8_t> dump_kernel_module(const std::uint64_t module_b
 		const std::uint64_t source_physical = hypercall::translate_guest_virtual_address(
 			module_base_address, sys::current_cr3);
 		const std::uint64_t destination_physical = hypercall::translate_guest_virtual_address(
-			reinterpret_cast<std::uint64_t>(headers.data()), sys::current_cr3);
+			reinterpret_cast<std::uint64_t>(headers.data()), sys::directory_for_local_memory());
 		const std::uint64_t physical_bytes_read =
 			source_physical == 0
 				? 0
@@ -523,6 +523,35 @@ static std::uint8_t parse_ntoskrnl()
 	return 1;
 }
 
+static std::uint64_t capture_local_user_cr3()
+{
+	constexpr std::uint64_t log_capacity = 2048;
+
+	hypercall::log_current_state();
+
+	std::vector<trap_frame_log_t> logs(static_cast<std::size_t>(log_capacity));
+	const std::uint64_t flushed = hypercall::flush_logs(logs);
+
+	if (flushed == static_cast<std::uint64_t>(-1) || flushed == 0)
+	{
+		return 0;
+	}
+
+	const std::uint64_t self = reinterpret_cast<std::uint64_t>(&sys::current_cr3);
+
+	for (std::uint64_t index = flushed; index > 0; index--)
+	{
+		const std::uint64_t cr3 = logs[static_cast<std::size_t>(index - 1)].cr3;
+
+		if (cr3 != 0 && hypercall::translate_guest_virtual_address(self, cr3) != 0)
+		{
+			return cr3;
+		}
+	}
+
+	return 0;
+}
+
 std::uint8_t sys::set_up()
 {
 	current_cr3 = hypercall::read_guest_cr3();
@@ -532,6 +561,18 @@ std::uint8_t sys::set_up()
 		LOG_ERR("hyperv-attachment doesn't seem to be loaded");
 
 		return 0;
+	}
+
+	//
+	// read_guest_cr3 is the kernel directory. Under KPTI that directory has
+	// no user half, so it cannot translate shadow pages allocated in this
+	// process. The CR3 at this CPUID exit is the directory that maps them.
+	//
+	local_user_cr3 = capture_local_user_cr3();
+
+	if (local_user_cr3 == 0)
+	{
+		LOG_ERR("debugger user directory does not map local memory");
 	}
 
 	if (parse_ntoskrnl() == 0)

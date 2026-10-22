@@ -8,8 +8,18 @@
 #include "PhysicalMemory.h"
 #include "Debug.h"
 
+#include <intrin.h>
+
 #define HACDBG_PHYSICAL_TAG        'PcaH'
 #define HACDBG_PHYSICAL_MAP_CHUNK  0x200000ull
+#define PHYSICAL_PTE_FRAME         0x000FFFFFFFFFF000ull
+#define PHYSICAL_PTE_PRESENT       0x1ull
+#define PHYSICAL_PTE_WRITE         0x2ull
+#define PHYSICAL_PTE_LARGE         0x80ull
+#define PHYSICAL_PTE_ACCESSED      0x20ull
+#define PHYSICAL_PTE_DIRTY         0x40ull
+#define PHYSICAL_PTE_NX            (1ull << 63)
+#define PHYSICAL_CR4_LA57          (1ull << 12)
 
 typedef struct _PHYSICAL_RANGE
 {
@@ -17,12 +27,23 @@ typedef struct _PHYSICAL_RANGE
     UINT64 End;
 } PHYSICAL_RANGE;
 
+typedef struct _PHYSICAL_MAP_SLOT
+{
+    PVOID Window;
+    PMDL Mdl;
+    PVOID MappedBase;
+    volatile UINT64* Pte;
+    volatile LONG Busy;
+} PHYSICAL_MAP_SLOT;
+
 static PHYSICAL_RANGE* g_Ranges;
 static ULONG g_RangeCount;
 static BOOLEAN g_Initialized;
 static BOOLEAN g_FiveLevelPaging;
 static volatile LONG g_PhysicalFailureLogCount;
 static volatile LONG g_TranslationFailureLogCount;
+static PHYSICAL_MAP_SLOT* g_MapSlots;
+static ULONG g_MapSlotCount;
 
 // 每条失败路径最多打印 64 次，避免刷屏。
 static BOOLEAN
@@ -37,6 +58,216 @@ PhysicalMemoryShouldLogFailure(
 #else
     return InterlockedIncrement(Counter) <= 64;
 #endif
+}
+
+// 释放加载时留出的临时映射槽。
+static VOID
+PhysicalMemoryFreeSlots(
+    VOID
+    )
+{
+    ULONG index;
+
+    if (g_MapSlots == NULL)
+    {
+        return;
+    }
+
+    for (index = 0; index < g_MapSlotCount; index++)
+    {
+        PHYSICAL_MAP_SLOT* slot = &g_MapSlots[index];
+
+        if (slot->Pte != NULL && slot->MappedBase != NULL)
+        {
+            *slot->Pte = 0;
+            __invlpg(slot->Window);
+            slot->MappedBase = NULL;
+        }
+        else if (slot->MappedBase != NULL && slot->Window != NULL && slot->Mdl != NULL)
+        {
+            MmUnmapReservedMapping(slot->Window, HACDBG_PHYSICAL_TAG, slot->Mdl);
+            slot->MappedBase = NULL;
+        }
+
+        if (slot->Window != NULL)
+        {
+            MmFreeMappingAddress(slot->Window, HACDBG_PHYSICAL_TAG);
+        }
+
+        if (slot->Mdl != NULL)
+        {
+            IoFreeMdl(slot->Mdl);
+        }
+    }
+
+    ExFreePoolWithTag(g_MapSlots, HACDBG_PHYSICAL_TAG);
+    g_MapSlots = NULL;
+    g_MapSlotCount = 0;
+}
+
+static BOOLEAN
+PhysicalMemoryReadPhysical64(
+    _In_ UINT64 Physical,
+    _Out_ UINT64* Value
+    )
+{
+    MM_COPY_ADDRESS source;
+    SIZE_T transferred = 0;
+
+    source.PhysicalAddress.QuadPart = (LONGLONG)Physical;
+    *Value = 0;
+    return NT_SUCCESS(MmCopyMemory(Value, source, sizeof(*Value), MM_COPY_MEMORY_PHYSICAL,
+                                   &transferred)) &&
+           transferred == sizeof(*Value);
+}
+
+// 沿当前内核页表找到保留窗口的 PTE 虚拟地址。窗口在第一次映射后才有页表。
+static volatile UINT64*
+PhysicalMemoryFindPte(
+    _In_ PVOID Window
+    )
+{
+    UINT64 virtualAddress = (UINT64)(ULONG_PTR)Window;
+    UINT64 table = __readcr3() & PHYSICAL_PTE_FRAME;
+    UINT32 shift = 39;
+
+    if ((__readcr4() & PHYSICAL_CR4_LA57) != 0)
+    {
+        shift = 48;
+    }
+
+    for (; shift > 12; shift -= 9)
+    {
+        UINT64 entry = 0;
+        UINT64 index = (virtualAddress >> shift) & 0x1ffull;
+
+        if (PhysicalMemoryReadPhysical64(table + (index * sizeof(UINT64)), &entry) == FALSE ||
+            (entry & PHYSICAL_PTE_PRESENT) == 0 ||
+            (entry & PHYSICAL_PTE_LARGE) != 0)
+        {
+            return NULL;
+        }
+
+        table = entry & PHYSICAL_PTE_FRAME;
+    }
+
+    {
+        PHYSICAL_ADDRESS page;
+        PVOID mapped;
+        UINT64 index = (virtualAddress >> 12) & 0x1ffull;
+
+        page.QuadPart = (LONGLONG)table;
+        mapped = MmGetVirtualForPhysical(page);
+        if (mapped == NULL)
+        {
+            return NULL;
+        }
+
+        return (volatile UINT64*)mapped + index;
+    }
+}
+
+static BOOLEAN
+PhysicalMemoryArmSlot(
+    _Inout_ PHYSICAL_MAP_SLOT* Slot,
+    _In_ PVOID Scratch
+    )
+{
+    PHYSICAL_ADDRESS scratchPhysical;
+    PPFN_NUMBER pfns;
+    PVOID mapped;
+    ULONG_PTR window = (ULONG_PTR)Slot->Window;
+
+    if ((window & (PAGE_SIZE - 1)) != 0)
+    {
+        return FALSE;
+    }
+
+    scratchPhysical = MmGetPhysicalAddress(Scratch);
+    if (scratchPhysical.QuadPart == 0)
+    {
+        return FALSE;
+    }
+
+    pfns = MmGetMdlPfnArray(Slot->Mdl);
+    pfns[0] = (PFN_NUMBER)((UINT64)scratchPhysical.QuadPart >> PAGE_SHIFT);
+    Slot->Mdl->Next = NULL;
+    Slot->Mdl->MdlFlags = MDL_PAGES_LOCKED;
+    Slot->Mdl->StartVa = Slot->Window;
+    Slot->Mdl->ByteOffset = 0;
+    Slot->Mdl->ByteCount = PAGE_SIZE;
+    Slot->Mdl->Process = NULL;
+    mapped = MmMapLockedPagesWithReservedMapping(Slot->Window, HACDBG_PHYSICAL_TAG, Slot->Mdl, MmCached);
+    if (mapped == NULL)
+    {
+        return FALSE;
+    }
+
+    Slot->Pte = PhysicalMemoryFindPte(Slot->Window);
+    MmUnmapReservedMapping(Slot->Window, HACDBG_PHYSICAL_TAG, Slot->Mdl);
+    return Slot->Pte != NULL && (*Slot->Pte & PHYSICAL_PTE_PRESENT) == 0;
+}
+
+// 每个逻辑处理器两份槽，覆盖同一次复制里同时映射源和目的。
+static NTSTATUS
+PhysicalMemoryPrepareSlots(
+    VOID
+    )
+{
+    ULONG processors = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
+    ULONG count;
+    ULONG index;
+    PVOID scratch;
+
+    if (processors == 0 || processors > 256)
+    {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    count = processors * 2;
+    g_MapSlots = (PHYSICAL_MAP_SLOT*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                     count * sizeof(*g_MapSlots),
+                                                     HACDBG_PHYSICAL_TAG);
+    if (g_MapSlots == NULL)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    g_MapSlotCount = count;
+    for (index = 0; index < count; index++)
+    {
+        PHYSICAL_MAP_SLOT* slot = &g_MapSlots[index];
+
+        slot->Mdl = IoAllocateMdl(NULL, PAGE_SIZE, FALSE, FALSE, NULL);
+        slot->Window = MmAllocateMappingAddress(PAGE_SIZE, HACDBG_PHYSICAL_TAG);
+        if (slot->Mdl == NULL || slot->Window == NULL)
+        {
+            HACDBG_LOG("HacDbg: Err, physical map slot allocation failed at %u.\n", index);
+            PhysicalMemoryFreeSlots();
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+    scratch = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, HACDBG_PHYSICAL_TAG);
+    if (scratch == NULL)
+    {
+        PhysicalMemoryFreeSlots();
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    for (index = 0; index < count; index++)
+    {
+        if (PhysicalMemoryArmSlot(&g_MapSlots[index], scratch) == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, physical map PTE lookup failed at %u.\n", index);
+            ExFreePoolWithTag(scratch, HACDBG_PHYSICAL_TAG);
+            PhysicalMemoryFreeSlots();
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
+    }
+
+    ExFreePoolWithTag(scratch, HACDBG_PHYSICAL_TAG);
+    return STATUS_SUCCESS;
 }
 
 // 释放 RAM 范围表。
@@ -190,6 +421,13 @@ PhysicalMemoryInitialize(
         return NT_SUCCESS(status) ? STATUS_NOT_FOUND : status;
     }
 
+    status = PhysicalMemoryPrepareSlots();
+    if (!NT_SUCCESS(status))
+    {
+        PhysicalMemoryFreeRanges();
+        return status;
+    }
+
     HACDBG_LOG("HacDbg: RAM map ready: %u ranges.\n", g_RangeCount);
     g_Initialized = TRUE;
     return STATUS_SUCCESS;
@@ -206,6 +444,7 @@ PhysicalMemoryCleanup(
         return;
     }
 
+    PhysicalMemoryFreeSlots();
     PhysicalMemoryFreeRanges();
     g_Initialized = FALSE;
 }
@@ -219,7 +458,8 @@ PhysicalMemorySetFiveLevelPaging(
     g_FiveLevelPaging = Enabled;
 }
 
-// 临时映射一段客户物理内存，优先 MmMapIoSpace，失败后退回 MmMapIoSpaceEx。
+// 临时映射一页客户 RAM。不用 MmMapIoSpace：那条路径在调试器连接时
+// 映射 PFN 数据库里的页会蓝屏 0x1A/0x1233。
 PVOID
 PhysicalMemoryMapTemporary(
     _In_ GUEST_PHYSICAL_ADDRESS Address,
@@ -227,12 +467,15 @@ PhysicalMemoryMapTemporary(
     _Out_ SIZE_T* MappedSize
     )
 {
-    PHYSICAL_ADDRESS physical;
-    PVOID mapped;
+    UINT64 page;
+    ULONG pageOffset;
+    SIZE_T bytesInPage;
+    ULONG index;
+    PHYSICAL_MAP_SLOT* slot = NULL;
 
     *MappedSize = 0;
 
-    if (Size == 0)
+    if (Size == 0 || g_MapSlots == NULL)
     {
         return NULL;
     }
@@ -258,40 +501,49 @@ PhysicalMemoryMapTemporary(
         return NULL;
     }
 
-    physical.QuadPart = Address.Value;
-    mapped = MmMapIoSpace(physical, Size, MmCached);
-    if (mapped == NULL)
+    page = Address.Value & ~(UINT64)(PAGE_SIZE - 1);
+    pageOffset = (ULONG)(Address.Value & (PAGE_SIZE - 1));
+    bytesInPage = PAGE_SIZE - pageOffset;
+    if (Size > bytesInPage)
     {
-        if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
-        {
-            HACDBG_LOG("HacDbg: Err, MmMapIoSpace cached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
-                     Address.Value, (UINT64)Size, KeGetCurrentIrql());
-        }
+        Size = bytesInPage;
+    }
 
-        mapped = MmMapIoSpaceEx(physical, Size, PAGE_READWRITE);
-        if (mapped == NULL)
+    for (index = 0; index < g_MapSlotCount; index++)
+    {
+        if (InterlockedCompareExchange(&g_MapSlots[index].Busy, 1, 0) == 0)
         {
-            if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
-            {
-                HACDBG_LOG("HacDbg: Err, MmMapIoSpaceEx cached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
-                         Address.Value, (UINT64)Size, KeGetCurrentIrql());
-            }
-
-            mapped = MmMapIoSpaceEx(physical, Size, PAGE_READWRITE | PAGE_NOCACHE);
-            if (mapped == NULL)
-            {
-                if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
-                {
-                    HACDBG_LOG("HacDbg: Err, MmMapIoSpaceEx noncached failed pa=0x%I64x size=0x%I64x irql=%u.\n",
-                             Address.Value, (UINT64)Size, KeGetCurrentIrql());
-                }
-                return NULL;
-            }
+            slot = &g_MapSlots[index];
+            break;
         }
     }
 
+    if (slot == NULL)
+    {
+        if (PhysicalMemoryShouldLogFailure(&g_PhysicalFailureLogCount) != FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, physical map slots are busy pa=0x%I64x.\n", Address.Value);
+        }
+        return NULL;
+    }
+
+    if (slot->Pte == NULL)
+    {
+        InterlockedExchange(&slot->Busy, 0);
+        return NULL;
+    }
+
+    //
+    // INVARIANT: Pte is the host page-table entry of this slot's reserved
+    // window. The window is not used by any other processor. Writing it and
+    // invalidating it locally does not send a TLB-shootdown IPI.
+    //
+    *slot->Pte = (page & PHYSICAL_PTE_FRAME) | PHYSICAL_PTE_PRESENT | PHYSICAL_PTE_WRITE |
+                 PHYSICAL_PTE_ACCESSED | PHYSICAL_PTE_DIRTY | PHYSICAL_PTE_NX;
+    __invlpg(slot->Window);
+    slot->MappedBase = slot->Window;
     *MappedSize = Size;
-    return mapped;
+    return (PUCHAR)slot->Window + pageOffset;
 }
 
 // 解除临时映射。
@@ -301,9 +553,39 @@ PhysicalMemoryUnmapTemporary(
     _In_ SIZE_T Size
     )
 {
-    if (Base != NULL && Size != 0)
+    ULONG_PTR address;
+    ULONG index;
+
+    if (Base == NULL || Size == 0 || g_MapSlots == NULL)
     {
-        MmUnmapIoSpace(Base, Size);
+        return;
+    }
+
+    address = (ULONG_PTR)Base;
+    for (index = 0; index < g_MapSlotCount; index++)
+    {
+        PHYSICAL_MAP_SLOT* slot = &g_MapSlots[index];
+        ULONG_PTR start;
+
+        if (slot->MappedBase == NULL)
+        {
+            continue;
+        }
+
+        start = (ULONG_PTR)slot->MappedBase;
+        if (address < start || address >= start + PAGE_SIZE)
+        {
+            continue;
+        }
+
+        if (slot->Pte != NULL)
+        {
+            *slot->Pte = 0;
+            __invlpg(slot->Window);
+        }
+        slot->MappedBase = NULL;
+        InterlockedExchange(&slot->Busy, 0);
+        return;
     }
 }
 

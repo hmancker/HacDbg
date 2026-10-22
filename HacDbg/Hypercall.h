@@ -29,16 +29,14 @@ HypercallHandleCpuid(
     _Inout_ HACDBG_GUEST_VIEW* View
     );
 
-NTSTATUS
+VOID
 /**
- * @brief Executes one hypercall request received through the control device.
+ * @brief Records a kernel page-table root for later read_guest_cr3 calls.
  *
- * @param Request Call description and result storage.
- *
- * @return STATUS_SUCCESS when the request was dispatched; otherwise an
- * NTSTATUS error.
+ * @param Cr3 Guest CR3 observed while the guest was in kernel mode, or the
+ * CR3 of the processor about to enter the guest from kernel context.
  */
-HypercallHandleIoctl(
-    _Inout_ HACDBG_HYPERCALL_REQUEST* Request
+HypercallNoteKernelCr3(
+    _In_ UINT64 Cr3
     );
 

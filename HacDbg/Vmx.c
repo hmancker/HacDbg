@@ -29,7 +29,28 @@
 #define VMX_MSR_BITMAP_READ_LOW   0u
 #define VMX_MSR_BITMAP_WRITE_LOW  2048u
 #define VMX_CPUID_VMX_BIT         (1u << 5)
+#define VMX_CPUID_HYPERVISOR_PRESENT (1u << 31)
 #define VMX_ACCESS_UNUSABLE       (1u << 16)
+#define VMX_CR0_NW                (1ull << 29)
+#define VMX_CR0_CD                (1ull << 30)
+#define VMX_CR4_PCIDE             (1ull << 17)
+
+//
+// MSR indexes 40000000H-400001FFH sit outside both MSR-bitmap windows,
+// so RDMSR/WRMSR of them always VM-exits. A hypervisor guest uses this
+// range for synthetic MSRs. CPUID.1 ECX[31] is the only check; leaf
+// 40000000H is not queried here because that CPUID runs before the VMX
+// capability MSRs are read.
+//
+#define VMX_MSR_SYNTHETIC_FIRST   0x40000000u
+#define VMX_MSR_SYNTHETIC_LAST    0x400001FFu
+#define VMX_MSR_HV_VP_RUNTIME     0x40000010u
+#define VMX_MSR_HV_TIME_REF_COUNT 0x40000020u
+#define VMX_MSR_HV_REFERENCE_TSC  0x40000021u
+#define VMX_MSR_HV_TSC_FREQUENCY  0x40000022u
+#define VMX_MSR_HV_APIC_FREQUENCY 0x40000023u
+#define VMX_MSR_HV_GUEST_IDLE     0x400000F0u
+#define VMX_HV_100NS_PER_SECOND   10000000ull
 
 C_ASSERT(sizeof(HACDBG_GUEST_REGISTERS) == 0x80);
 C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, Registers) == 0x00);
@@ -62,6 +83,15 @@ static UINT32 g_ExitControls;
 static UINT32 g_EntryControls;
 static UINT64 g_InveptType;
 static BOOLEAN g_ControlsReady;
+static volatile LONG g_SyntheticMsrPassthrough;
+static volatile LONG g_UnexpectedMsrLogs;
+static volatile LONG g_GuestIdleIgnored;
+static volatile LONG g_HvTimeReady;
+static UINT64 g_HvRefTsc;
+static UINT64 g_HvRefTime;
+static UINT64 g_HvTscFrequency;
+static UINT64 g_HvApicFrequency;
+static volatile UINT64 g_HvReferenceTscMsr;
 
 static BOOLEAN
 VmxWrite(
@@ -423,6 +453,214 @@ VmxHandleCrAccess(
 }
 
 static BOOLEAN
+VmxAccessMsr(
+    _In_ UINT32 Msr,
+    _In_ BOOLEAN Write,
+    _Inout_ UINT64* Value
+    )
+{
+    __try
+    {
+        if (Write != FALSE)
+        {
+            //
+            // INVARIANT: Msr is outside both MSR-bitmap windows. Passthrough
+            // is enabled only when an outer hypervisor implements this
+            // synthetic range. The instruction runs in VMX root and does not
+            // modify this processor's VMCS.
+            //
+            __writemsr(Msr, *Value);
+        }
+        else
+        {
+            //
+            // INVARIANT: Same as the WRMSR above. A #GP here means the outer
+            // hypervisor rejected the index; it must not leave VMX.
+            //
+            *Value = __readmsr(Msr);
+        }
+
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
+static BOOLEAN
+VmxReadSyntheticMsr(
+    _In_ UINT32 Msr,
+    _Out_ UINT64* Value
+    )
+{
+    __try
+    {
+        //
+        // INVARIANT: Called before VMXON, while this processor still uses
+        // the outer hypervisor's guest time domain.
+        //
+        *Value = __readmsr(Msr);
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
+static BOOLEAN
+VmxSnapshotGuestClock(
+    VOID
+    )
+{
+    UINT64 tsc;
+    UINT64 refTime;
+    UINT64 frequency;
+    UINT64 apicFrequency;
+    UINT64 referenceTsc;
+
+    //
+    // INVARIANT: VMX capability MSRs are already cached. These synthetic
+    // indexes are read before VMXON, so the values belong to the guest
+    // clock rather than the outer host clock.
+    //
+    tsc = __rdtsc();
+    if (VmxReadSyntheticMsr(VMX_MSR_HV_TIME_REF_COUNT, &refTime) == FALSE ||
+        VmxReadSyntheticMsr(VMX_MSR_HV_TSC_FREQUENCY, &frequency) == FALSE ||
+        VmxReadSyntheticMsr(VMX_MSR_HV_APIC_FREQUENCY, &apicFrequency) == FALSE ||
+        VmxReadSyntheticMsr(VMX_MSR_HV_REFERENCE_TSC, &referenceTsc) == FALSE ||
+        frequency == 0)
+    {
+        return FALSE;
+    }
+
+    g_HvRefTsc = tsc;
+    g_HvRefTime = refTime;
+    g_HvTscFrequency = frequency;
+    g_HvApicFrequency = apicFrequency;
+    g_HvReferenceTscMsr = referenceTsc;
+    InterlockedExchange(&g_HvTimeReady, 1);
+    HACDBG_LOG("HacDbg: Synthetic time MSRs use the guest clock.\n");
+    return TRUE;
+}
+
+static UINT64
+VmxCyclesSinceTimeSnapshot(
+    _In_ const VMX_PROCESSOR_CONTEXT* ProcessorContext
+    )
+{
+    UINT64 rootNow = __rdtsc();
+
+    //
+    // TscAfterVmxon and rootNow are both read in VMX root. TscBeforeVmxon
+    // and g_HvRefTsc were both read before VMXON. Adding the two deltas
+    // keeps the result on the pre-VMXON guest TSC even when root RDTSC
+    // uses a different offset.
+    //
+    return (rootNow - ProcessorContext->TscAfterVmxon) +
+           (ProcessorContext->TscBeforeVmxon - g_HvRefTsc);
+}
+
+static UINT64
+VmxCyclesToHundredNs(
+    _In_ UINT64 Cycles
+    )
+{
+    UINT64 frequency = g_HvTscFrequency;
+    UINT64 whole;
+    UINT64 part;
+
+    if (frequency == 0)
+    {
+        return 0;
+    }
+
+    whole = Cycles / frequency;
+    part = Cycles % frequency;
+    return whole * VMX_HV_100NS_PER_SECOND + (part * VMX_HV_100NS_PER_SECOND) / frequency;
+}
+
+static BOOLEAN
+VmxFinishMsrRead(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext,
+    _In_ UINT64 Value
+    )
+{
+    ProcessorContext->Registers.Rax = (UINT32)Value;
+    ProcessorContext->Registers.Rdx = Value >> 32;
+    return VmxAdvanceRip();
+}
+
+static BOOLEAN
+VmxHandleSyntheticTime(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext,
+    _In_ UINT32 Msr,
+    _In_ BOOLEAN Write,
+    _Out_ BOOLEAN* Handled
+    )
+{
+    UINT64 value;
+    UINT64 elapsed;
+
+    *Handled = FALSE;
+    if (g_HvTimeReady == 0 ||
+        (Msr != VMX_MSR_HV_VP_RUNTIME && Msr != VMX_MSR_HV_TIME_REF_COUNT &&
+         Msr != VMX_MSR_HV_REFERENCE_TSC && Msr != VMX_MSR_HV_TSC_FREQUENCY &&
+         Msr != VMX_MSR_HV_APIC_FREQUENCY))
+    {
+        return TRUE;
+    }
+
+    *Handled = TRUE;
+    if (Msr == VMX_MSR_HV_REFERENCE_TSC)
+    {
+        if (Write != FALSE)
+        {
+            //
+            // Executing this WRMSR in VMX root makes the outer hypervisor
+            // rebuild the reference-TSC page from its own clock. Windows
+            // then adds that delta to the interrupt time. Keep the page
+            // that was programmed before VMXON and only remember the value
+            // the guest stored.
+            //
+            value = (ProcessorContext->Registers.Rdx << 32) |
+                    (UINT32)ProcessorContext->Registers.Rax;
+            InterlockedExchange64((volatile LONG64*)&g_HvReferenceTscMsr, (LONG64)value);
+            return VmxAdvanceRip();
+        }
+
+        return VmxFinishMsrRead(ProcessorContext, g_HvReferenceTscMsr);
+    }
+
+    if (Write != FALSE)
+    {
+        VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
+        return TRUE;
+    }
+
+    elapsed = VmxCyclesToHundredNs(VmxCyclesSinceTimeSnapshot(ProcessorContext));
+    if (Msr == VMX_MSR_HV_VP_RUNTIME)
+    {
+        value = ProcessorContext->VpRuntime + elapsed;
+    }
+    else if (Msr == VMX_MSR_HV_TIME_REF_COUNT)
+    {
+        value = g_HvRefTime + elapsed;
+    }
+    else if (Msr == VMX_MSR_HV_TSC_FREQUENCY)
+    {
+        value = g_HvTscFrequency;
+    }
+    else
+    {
+        value = g_HvApicFrequency;
+    }
+
+    return VmxFinishMsrRead(ProcessorContext, value);
+}
+
+static BOOLEAN
 VmxHandleMsr(
     _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext,
     _In_ BOOLEAN Write
@@ -430,6 +668,7 @@ VmxHandleMsr(
 {
     UINT32 msr = (UINT32)ProcessorContext->Registers.Rcx;
     UINT64 value;
+    BOOLEAN timeHandled = FALSE;
 
     if (msr == VMX_MSR_FEATURE_CONTROL)
     {
@@ -454,8 +693,88 @@ VmxHandleMsr(
         return TRUE;
     }
 
-    HACDBG_LOG("HacDbg: Err, unhandled MSR exit msr=0x%x write=%u.\n", msr, Write);
-    return FALSE;
+    if (g_SyntheticMsrPassthrough != 0 &&
+        msr >= VMX_MSR_SYNTHETIC_FIRST &&
+        msr <= VMX_MSR_SYNTHETIC_LAST)
+    {
+        if (msr == VMX_MSR_HV_GUEST_IDLE)
+        {
+            UINT64 rflags;
+            UINT64 interruptibility;
+
+            //
+            // nt!PpmIdleGuestExecute reads MSR 400000F0H instead of HLT.
+            // The read must not complete until an interrupt is deliverable.
+            // Executing it from VMX root waits where the guest interrupt is
+            // not delivered. Returning immediately makes the idle loop exit
+            // on every iteration. Enter the guest in the HLT activity state
+            // with RFLAGS.IF set, which is the same sequence as
+            // nt!HalProcessorIdle.
+            //
+            if (Write == FALSE)
+            {
+                ProcessorContext->Registers.Rax = 0;
+                ProcessorContext->Registers.Rdx = 0;
+            }
+
+            if (VmxAdvanceRip() == FALSE ||
+                VmxRead(VMCS_GUEST_RFLAGS, &rflags) == FALSE ||
+                VmxRead(VMCS_GUEST_INTERRUPTIBILITY, &interruptibility) == FALSE)
+            {
+                return FALSE;
+            }
+
+            rflags |= (1ull << 9);
+            interruptibility &= ~3ull;
+            if (VmxWrite(VMCS_GUEST_RFLAGS, rflags) == FALSE ||
+                VmxWrite(VMCS_GUEST_INTERRUPTIBILITY, interruptibility) == FALSE ||
+                VmxWrite(VMCS_GUEST_ACTIVITY_STATE, 1) == FALSE)
+            {
+                return FALSE;
+            }
+
+            if (InterlockedCompareExchange(&g_GuestIdleIgnored, 1, 0) == 0)
+            {
+                HACDBG_LOG("HacDbg: Synthetic guest-idle MSR resumes as HLT.\n");
+            }
+
+            return TRUE;
+        }
+
+        if (VmxHandleSyntheticTime(ProcessorContext, msr, Write, &timeHandled) == FALSE)
+        {
+            return FALSE;
+        }
+
+        if (timeHandled != FALSE)
+        {
+            return TRUE;
+        }
+
+        value = (ProcessorContext->Registers.Rdx << 32) |
+                (UINT32)ProcessorContext->Registers.Rax;
+        if (VmxAccessMsr(msr, Write, &value) == FALSE)
+        {
+            VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
+            return TRUE;
+        }
+
+        if (Write == FALSE)
+        {
+            ProcessorContext->Registers.Rax = (UINT32)value;
+            ProcessorContext->Registers.Rdx = value >> 32;
+        }
+
+        return VmxAdvanceRip();
+    }
+
+    if (InterlockedIncrement(&g_UnexpectedMsrLogs) <= 8)
+    {
+        HACDBG_LOG("HacDbg: Err, MSR exit injected #GP msr=0x%x write=%u.\n", msr, Write);
+    }
+
+    VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
+    return TRUE;
 }
 
 static BOOLEAN
@@ -593,12 +912,10 @@ VmxHandleVmExit(
     )
 {
     UINT64 reasonFull;
-    UINT64 start;
     UINT32 reason;
     BOOLEAN stopGuest;
     BOOLEAN entryFailure;
 
-    start = __rdtsc();
     VmxWrite(VMCS_CTRL_VMENTRY_INTERRUPTION, 0);
 
     if (VmxRead(VMCS_GUEST_RSP, &ProcessorContext->Registers.Rsp) == FALSE ||
@@ -612,12 +929,40 @@ VmxHandleVmExit(
     VmxRead(VMCS_GUEST_RIP, &ProcessorContext->GuestRip);
     VmxRead(VMCS_GUEST_CR3, &ProcessorContext->GuestCr3);
 
+    if (entryFailure == FALSE)
+    {
+        UINT64 rights = 0;
+
+        if (VmxRead(VMCS_GUEST_CS_ACCESS, &rights) != FALSE && ((rights >> 5) & 3u) == 0)
+        {
+            HypercallNoteKernelCr3(ProcessorContext->GuestCr3);
+        }
+    }
+
     if (entryFailure != FALSE)
     {
-        UINT64 error = 0;
+        UINT64 qualification = 0;
+        UINT64 cr0 = 0;
+        UINT64 cr4 = 0;
+        UINT64 debugCtl = 0;
+        UINT64 efer = 0;
+        UINT64 cs = 0;
+        UINT64 rflags = 0;
+        UINT64 entry = 0;
 
-        VmxRead(VMCS_VM_INSTRUCTION_ERROR, &error);
-        HACDBG_LOG("HacDbg: Err, VM-entry failed reason=%u error=%u.\n", reason, (UINT32)error);
+        VmxRead(VMCS_EXIT_QUALIFICATION, &qualification);
+        VmxRead(VMCS_GUEST_CR0, &cr0);
+        VmxRead(VMCS_GUEST_CR4, &cr4);
+        VmxRead(VMCS_GUEST_DEBUGCTL, &debugCtl);
+        VmxRead(VMCS_GUEST_EFER, &efer);
+        VmxRead(VMCS_GUEST_CS_ACCESS, &cs);
+        VmxRead(VMCS_GUEST_RFLAGS, &rflags);
+        VmxRead(VMCS_CTRL_VMENTRY, &entry);
+        HACDBG_LOG("HacDbg: Err, VM-entry failed reason=%u qual=0x%I64x cr0=0x%I64x cr3=0x%I64x "
+                   "cr4=0x%I64x efer=0x%I64x dbg=0x%I64x cs=0x%I64x rflags=0x%I64x rip=0x%I64x "
+                   "entry=0x%I64x.\n",
+                   reason, qualification, cr0, ProcessorContext->GuestCr3, cr4, efer, debugCtl, cs,
+                   rflags, ProcessorContext->GuestRip, entry);
         stopGuest = VmxLeaveVmx(ProcessorContext);
     }
     else
@@ -627,11 +972,6 @@ VmxHandleVmExit(
 
     if (stopGuest == FALSE)
     {
-        UINT64 spent = __rdtsc() - start;
-
-        ProcessorContext->TscOffset -= (INT64)spent;
-        VmxWrite(VMCS_CTRL_TSC_OFFSET, (UINT64)ProcessorContext->TscOffset);
-
         if (InterlockedExchange(&ProcessorContext->InveptRequested, 0) != 0)
         {
             VmxInvalidateEpt(ProcessorContext);
@@ -729,9 +1069,7 @@ VmxLoadControls(
     g_Cr4Fixed1 = __readmsr(VMX_MSR_CR4_FIXED1);
 
     g_PinControls = VmxAdjust(0, pinMsr);
-    g_ProcControls = VmxAdjust(VMX_PROC_USE_TSC_OFFSETTING | VMX_PROC_USE_MSR_BITMAPS |
-                               VMX_PROC_ACTIVATE_SECONDARY,
-                               procMsr);
+    g_ProcControls = VmxAdjust(VMX_PROC_USE_MSR_BITMAPS | VMX_PROC_ACTIVATE_SECONDARY, procMsr);
     desired2 = VMX_PROC2_CONCEAL_VMX_FROM_PT | VMX_PROC2_ENABLE_EPT;
     __cpuidex(cpuInfo, 0x80000001, 0);
     if ((cpuInfo[3] & (1 << 27)) != 0)
@@ -780,9 +1118,8 @@ VmxLoadControls(
                            VMX_PROC_RDTSC_EXITING | VMX_PROC_CR3_LOAD_EXITING |
                            VMX_PROC_CR3_STORE_EXITING | VMX_PROC_IO_EXITING |
                            VMX_PROC_USE_IO_BITMAPS | VMX_PROC_MONITOR_TRAP_FLAG)) != 0 ||
-        (g_ProcControls & (VMX_PROC_USE_TSC_OFFSETTING | VMX_PROC_USE_MSR_BITMAPS |
-                           VMX_PROC_ACTIVATE_SECONDARY)) !=
-            (VMX_PROC_USE_TSC_OFFSETTING | VMX_PROC_USE_MSR_BITMAPS | VMX_PROC_ACTIVATE_SECONDARY) ||
+        (g_ProcControls & (VMX_PROC_USE_MSR_BITMAPS | VMX_PROC_ACTIVATE_SECONDARY)) !=
+            (VMX_PROC_USE_MSR_BITMAPS | VMX_PROC_ACTIVATE_SECONDARY) ||
         (g_ExitControls & VMX_EXIT_LOAD_CET) != 0 ||
         (g_EntryControls & VMX_ENTRY_LOAD_CET) != 0 ||
         (g_ExitControls & VMX_EXIT_HOST_ADDR_SPACE_SIZE) == 0 ||
@@ -844,6 +1181,13 @@ VmxCheckSupport(
         return STATUS_NOT_SUPPORTED;
     }
 
+    if ((cpuInfo[2] & VMX_CPUID_HYPERVISOR_PRESENT) != 0)
+    {
+        InterlockedExchange(&g_SyntheticMsrPassthrough, 1);
+        HACDBG_LOG("HacDbg: Synthetic MSRs 0x%x-0x%x are passed through.\n",
+                   VMX_MSR_SYNTHETIC_FIRST, VMX_MSR_SYNTHETIC_LAST);
+    }
+
     featureControl = __readmsr(VMX_MSR_FEATURE_CONTROL);
     if ((featureControl & VMX_FEATURE_CONTROL_LOCK) == 0 ||
         (featureControl & VMX_FEATURE_CONTROL_OUTSIDE_SMX) == 0)
@@ -856,6 +1200,11 @@ VmxCheckSupport(
     if (VmxLoadControls() == FALSE)
     {
         return STATUS_NOT_SUPPORTED;
+    }
+
+    if (g_SyntheticMsrPassthrough != 0 && VmxSnapshotGuestClock() == FALSE)
+    {
+        HACDBG_LOG("HacDbg: Err, synthetic time MSR snapshot failed.\n");
     }
 
     return STATUS_SUCCESS;
@@ -876,6 +1225,10 @@ VmxCleanupShared(
     )
 {
     g_ControlsReady = FALSE;
+    InterlockedExchange(&g_SyntheticMsrPassthrough, 0);
+    InterlockedExchange(&g_UnexpectedMsrLogs, 0);
+    InterlockedExchange(&g_GuestIdleIgnored, 0);
+    InterlockedExchange(&g_HvTimeReady, 0);
 }
 
 ULONG
@@ -977,8 +1330,35 @@ VmxFillVmcs(
     UINT16 tr = VmxReadTr();
     UINT16 ldtr = VmxReadLdtr();
     UINT64 cr0 = (__readcr0() | g_Cr0Fixed0) & g_Cr0Fixed1;
+    UINT64 cr3 = __readcr3();
     UINT64 cr4 = (__readcr4() | g_Cr4Fixed0) & g_Cr4Fixed1;
-    UINT64 guestCr4 = cr4 | VMX_CR4_VMXE;
+    UINT64 guestCr4 = cr4;
+
+    //
+    // VM-entry rejects CR0.NW set while CR0.CD is clear, and rejects CR3
+    // bits 11:0 when CR4.PCIDE is 0. CR4.VMXE may be set only when
+    // IA32_VMX_CR4_FIXED1 allows it.
+    //
+    if ((cr0 & VMX_CR0_CD) == 0)
+    {
+        cr0 &= ~VMX_CR0_NW;
+    }
+
+    if ((g_Cr4Fixed1 & VMX_CR4_VMXE) != 0)
+    {
+        guestCr4 |= VMX_CR4_VMXE;
+    }
+
+    if ((guestCr4 & VMX_CR4_PCIDE) == 0)
+    {
+        cr3 &= ~0xFFFull;
+    }
+    else
+    {
+        cr3 &= ~(1ull << 63);
+    }
+
+    HypercallNoteKernelCr3(cr3);
     UINT64 efer = __readmsr(HACDBG_MSR_EFER);
     UINT64 pat = __readmsr(HACDBG_MSR_PAT);
     UINT16 hostCs = (UINT16)(Context->SegCs & 0xF8u);
@@ -987,6 +1367,14 @@ VmxFillVmcs(
     __sidt(&idtr);
     cr4 |= VMX_CR4_VMXE;
     __writecr0(cr0);
+    if ((cr4 & VMX_CR4_PCIDE) == 0)
+    {
+        //
+        // INVARIANT: CR3 is the current kernel page-table root. Clearing
+        // CR4.PCIDE while bits 11:0 of CR3 are nonzero raises #GP.
+        //
+        __writecr3(__readcr3() & ~0xFFFull);
+    }
     __writecr4(cr4);
 
     if (VmxWrite(VMCS_GUEST_VMCS_LINK_POINTER, ~0ull) == FALSE ||
@@ -1001,7 +1389,6 @@ VmxFillVmcs(
         VmxWrite(VMCS_CTRL_VMENTRY_MSR_LOAD_COUNT, 0) == FALSE ||
         VmxWrite(VMCS_CTRL_VMENTRY_INTERRUPTION, 0) == FALSE ||
         VmxWrite(VMCS_CTRL_MSR_BITMAP, ProcessorContext->MsrBitmapPa) == FALSE ||
-        VmxWrite(VMCS_CTRL_TSC_OFFSET, 0) == FALSE ||
         VmxWrite(VMCS_CTRL_CR0_MASK, 0) == FALSE ||
         VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, cr0) == FALSE ||
         VmxWrite(VMCS_CTRL_CR4_MASK, VMX_CR4_VMXE) == FALSE ||
@@ -1081,7 +1468,7 @@ VmxFillVmcs(
            VmxWrite(VMCS_GUEST_SYSENTER_ESP, __readmsr(HACDBG_MSR_SYSENTER_ESP)) &&
            VmxWrite(VMCS_GUEST_SYSENTER_EIP, __readmsr(HACDBG_MSR_SYSENTER_EIP)) &&
            VmxWrite(VMCS_GUEST_CR0, cr0) &&
-           VmxWrite(VMCS_GUEST_CR3, __readcr3()) &&
+           VmxWrite(VMCS_GUEST_CR3, cr3) &&
            VmxWrite(VMCS_GUEST_CR4, guestCr4) &&
            VmxWrite(VMCS_GUEST_RSP, Context->Rsp) &&
            VmxWrite(VMCS_GUEST_RIP, Context->Rip) &&
@@ -1115,6 +1502,8 @@ VmxVirtualizeProcessor(
 {
     CONTEXT context;
     UINT8 status;
+    UINT64 tscBefore;
+    UINT64 vpRuntime;
 
     RtlCaptureContext(&context);
 
@@ -1125,7 +1514,20 @@ VmxVirtualizeProcessor(
 
     ProcessorContext->StopRequested = FALSE;
     ProcessorContext->Virtualized = TRUE;
-    ProcessorContext->TscOffset = 0;
+    vpRuntime = 0;
+    if (g_SyntheticMsrPassthrough != 0)
+    {
+        //
+        // INVARIANT: Still before VMXON, so this per-processor runtime is
+        // the outer guest's value.
+        //
+        if (VmxReadSyntheticMsr(VMX_MSR_HV_VP_RUNTIME, &vpRuntime) == FALSE)
+        {
+            vpRuntime = 0;
+        }
+    }
+
+    ProcessorContext->VpRuntime = vpRuntime;
     _disable();
 
     if (VmxLoadControls() == FALSE)
@@ -1140,8 +1542,13 @@ VmxVirtualizeProcessor(
     //
     // INVARIANT: VmxonPa is the 4 KiB-aligned VMXON region for this processor.
     // It is not mapped executable into the guest when EPT is enabled.
+    // TscBeforeVmxon is the guest TSC. TscAfterVmxon is the first RDTSC after
+    // VMXON and may use a different offset in VMX root.
     //
+    tscBefore = __rdtsc();
     status = HacDbgVmxOn(&ProcessorContext->VmxonPa);
+    ProcessorContext->TscBeforeVmxon = tscBefore;
+    ProcessorContext->TscAfterVmxon = __rdtsc();
     if (status != 0 ||
         VmxClear(&ProcessorContext->VmcsPa) != 0 ||
         VmxPtrld(&ProcessorContext->VmcsPa) != 0 ||
@@ -1395,28 +1802,6 @@ VmxFreeAllProcessors(
     }
 
     g_ProcessorCount = 0;
-}
-
-VOID
-VmxRequestTlbFlushOnCurrentProcessor(
-    VOID
-    )
-{
-    PROCESSOR_NUMBER processorNumber;
-    ULONG index;
-    int registers[4];
-
-    KeGetCurrentProcessorNumberEx(&processorNumber);
-    index = KeGetProcessorIndexFromNumber(&processorNumber);
-
-    HacDbgSpinLockAcquire(&g_ProcessorLock);
-    if (index < HACDBG_MAX_PROCESSORS && g_Processors[index] != NULL)
-    {
-        InterlockedExchange(&g_Processors[index]->InveptRequested, 1);
-    }
-    HacDbgSpinLockRelease(&g_ProcessorLock);
-
-    __cpuidex(registers, HACDBG_FLUSH_CPUID_LEAF, HACDBG_FLUSH_CPUID_SUBLEAF);
 }
 
 VOID

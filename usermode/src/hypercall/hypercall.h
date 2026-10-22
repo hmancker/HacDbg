@@ -21,6 +21,7 @@ namespace hypercall
 	std::uint64_t translate_guest_virtual_address(std::uint64_t guest_virtual_address, std::uint64_t guest_cr3);
 
 	std::uint64_t read_guest_cr3();
+	std::uint64_t log_current_state();
 
 	std::uint8_t query_driver_version(std::uint32_t& major, std::uint32_t& minor, std::uint32_t& patch,
 	                                  std::uint32_t& hypercall_abi_version, std::string& version);

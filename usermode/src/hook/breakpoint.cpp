@@ -383,7 +383,7 @@ namespace
 		std::memset(table_page, 0, page_size);
 
 		const std::uint64_t table_page_physical = hypercall::translate_guest_virtual_address(
-			reinterpret_cast<std::uint64_t>(table_page), sys::current_cr3);
+			reinterpret_cast<std::uint64_t>(table_page), sys::directory_for_local_memory());
 
 		if (table_page_physical == 0)
 		{
@@ -522,7 +522,7 @@ namespace
 
 			std::memset(user_trampoline_page, 0xCC, page_size);
 			user_trampoline_physical = hypercall::translate_guest_virtual_address(
-				reinterpret_cast<std::uint64_t>(user_trampoline_page), sys::current_cr3);
+				reinterpret_cast<std::uint64_t>(user_trampoline_page), sys::directory_for_local_memory());
 
 			if (user_trampoline_physical == 0)
 			{
@@ -626,7 +626,7 @@ namespace
 		}
 
 		page_out.shadow_physical = hypercall::translate_guest_virtual_address(
-			reinterpret_cast<std::uint64_t>(page_out.shadow), sys::current_cr3);
+			reinterpret_cast<std::uint64_t>(page_out.shadow), sys::directory_for_local_memory());
 
 		if (page_out.shadow_physical == 0)
 		{
@@ -1361,6 +1361,11 @@ namespace
 
 			breakpoint_page_t* const shadow = ensure_shadow(page_base_of(physical));
 
+			if (shadow == nullptr)
+			{
+				return 0;
+			}
+
 			if (commit_slot(shadow, page_base_of(physical), piece.address, *piece.bytes, slot_out) == 0)
 			{
 				LOG_ERR("user breakpoint cave crosses a page");
@@ -1726,6 +1731,11 @@ namespace
 			}
 
 			breakpoint_page_t* const shadow = ensure_shadow(page_base_of(physical));
+
+			if (shadow == nullptr)
+			{
+				return 0;
+			}
 
 			if (commit_slot(shadow, page_base_of(physical), piece.address, *piece.bytes, slot_out) == 0)
 			{
@@ -2502,6 +2512,11 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 			}
 
 			breakpoint_page_t* const shadow = ensure_shadow(page_base_of(physical));
+
+			if (shadow == nullptr)
+			{
+				return 0;
+			}
 
 			if (commit_slot(shadow, page_base_of(physical), piece.address, *piece.bytes, slot_out) == 0)
 			{

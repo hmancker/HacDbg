@@ -202,33 +202,43 @@ EptAllocateSplitPage(
     )
 {
     UINT64 index;
-    UINT64 pageCount;
-    UINT64 slotStart;
 
     *PhysicalAddress = 0;
 
-    if (g_SplitPagesUsed >= HACDBG_EPT_SPLIT_PAGES ||
-        KeGetCurrentIrql() > DISPATCH_LEVEL)
-    {
-        return NULL;
-    }
-
     if (g_SplitPagesUsed >= g_SplitPagesCarved)
     {
-        pageCount = min(HACDBG_EPT_SPLIT_CHUNK_PAGES,
-                        HACDBG_EPT_SPLIT_PAGES - g_SplitPagesCarved);
-        slotStart = HACDBG_EPT_FIXED_PAGES + g_SplitPagesCarved;
-        if (EptCarveChunk(slotStart, pageCount) == FALSE)
-        {
-            return NULL;
-        }
-        g_SplitPagesCarved += pageCount;
+        return NULL;
     }
 
     index = HACDBG_EPT_FIXED_PAGES + g_SplitPagesUsed;
     *PhysicalAddress = g_PagePhysical[index];
     g_SplitPagesUsed++;
     return g_PageVirtual[index];
+}
+
+//
+// 钩子安装发生在 CPUID 退出里，不能再调用池分配。拆分页在进入客户前切完。
+//
+static BOOLEAN
+EptPreallocateSplitPages(
+    VOID
+    )
+{
+    while (g_SplitPagesCarved < HACDBG_EPT_SPLIT_PAGES)
+    {
+        UINT64 pageCount = min(HACDBG_EPT_SPLIT_CHUNK_PAGES,
+                               HACDBG_EPT_SPLIT_PAGES - g_SplitPagesCarved);
+        UINT64 slotStart = HACDBG_EPT_FIXED_PAGES + g_SplitPagesCarved;
+
+        if (EptCarveChunk(slotStart, pageCount) == FALSE)
+        {
+            return FALSE;
+        }
+
+        g_SplitPagesCarved += pageCount;
+    }
+
+    return TRUE;
 }
 
 static UINT8
@@ -864,6 +874,11 @@ EptInitialize(
         }
 
         g_DummyPagePa = dummyPa;
+    }
+
+    if (EptPreallocateSplitPages() == FALSE)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     g_MainEptp = (mainPa & EPT_ADDRESS_MASK) | EPT_POINTER_FLAGS;

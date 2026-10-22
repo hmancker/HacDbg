@@ -147,7 +147,7 @@ NptAllocatePage(
     return g_PageVirtual[index];
 }
 
-// 按需分配一张 4 KiB 拆分表页。
+// 从加载时切好的拆分页池取一页。
 _Success_(return != NULL)
 static VOID*
 NptAllocateSplitPage(
@@ -155,33 +155,43 @@ NptAllocateSplitPage(
     )
 {
     UINT64 index;
-    UINT64 pageCount;
-    UINT64 slotStart;
 
     *PhysicalAddress = 0;
 
-    if (g_SplitPagesUsed >= HACDBG_NPT_SPLIT_PAGES ||
-        KeGetCurrentIrql() > DISPATCH_LEVEL)
-    {
-        return NULL;
-    }
-
     if (g_SplitPagesUsed >= g_SplitPagesCarved)
     {
-        pageCount = min(HACDBG_NPT_SPLIT_CHUNK_PAGES,
-                        HACDBG_NPT_SPLIT_PAGES - g_SplitPagesCarved);
-        slotStart = HACDBG_NPT_FIXED_PAGES + g_SplitPagesCarved;
-        if (NptCarveChunk(slotStart, pageCount) == FALSE)
-        {
-            return NULL;
-        }
-        g_SplitPagesCarved += pageCount;
+        return NULL;
     }
 
     index = HACDBG_NPT_FIXED_PAGES + g_SplitPagesUsed;
     *PhysicalAddress = g_PagePhysical[index];
     g_SplitPagesUsed++;
     return g_PageVirtual[index];
+}
+
+//
+// 钩子安装发生在 CPUID 退出里，不能再调用池分配。拆分页在进入客户前切完。
+//
+static BOOLEAN
+NptPreallocateSplitPages(
+    VOID
+    )
+{
+    while (g_SplitPagesCarved < HACDBG_NPT_SPLIT_PAGES)
+    {
+        UINT64 pageCount = min(HACDBG_NPT_SPLIT_CHUNK_PAGES,
+                               HACDBG_NPT_SPLIT_PAGES - g_SplitPagesCarved);
+        UINT64 slotStart = HACDBG_NPT_FIXED_PAGES + g_SplitPagesCarved;
+
+        if (NptCarveChunk(slotStart, pageCount) == FALSE)
+        {
+            return FALSE;
+        }
+
+        g_SplitPagesCarved += pageCount;
+    }
+
+    return TRUE;
 }
 
 // 物理地址查回宿主虚拟地址，只扫描已切出的页。
@@ -480,6 +490,11 @@ NptInitialize(
             return STATUS_INSUFFICIENT_RESOURCES;
         }
         g_DummyPagePa = dummyPa;
+    }
+
+    if (NptPreallocateSplitPages() == FALSE)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
     g_Initialized = TRUE;
