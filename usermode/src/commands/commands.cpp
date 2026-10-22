@@ -9,6 +9,7 @@
 #include <Windows.h>
 #include "../hypercall/hypercall.h"
 #include "../system/system.h"
+#include "../system/nt_offsets.h"
 #include "../logs/logs.h"
 
 #include <version.h>
@@ -3965,15 +3966,40 @@ static std::uint8_t same_directory(const std::uint64_t left, const std::uint64_t
 	return static_cast<std::uint8_t>(left != 0 && right != 0 && (left & cr3_mask) == (right & cr3_mask));
 }
 
+static const nt_offsets_t* guest_nt()
+{
+	const nt_offsets_t* const row = nt_offsets_current();
+
+	if (row == nullptr)
+	{
+		LOG_ERR("windows build offsets are not selected");
+	}
+
+	return row;
+}
+
+static std::uint64_t guest_user_directory(const std::uint64_t eprocess, const nt_offsets_t& row, const std::uint64_t directory)
+{
+	std::uint64_t user_directory = 0;
+
+	if (row.eprocess_user_directory_table_base == 0 ||
+		hypercall::read_guest_virtual_memory(&user_directory, eprocess + row.eprocess_user_directory_table_base, sys::current_cr3,
+		                                     sizeof(user_directory)) != sizeof(user_directory) ||
+		user_directory == 0)
+	{
+		return directory;
+	}
+
+	return user_directory;
+}
+
 static std::uint64_t eprocess_for_cr3(const std::uint64_t cr3)
 {
-	constexpr std::uint64_t directory_table_base = 0x28;
-	constexpr std::uint64_t user_directory_table_base = 0x158;
-	constexpr std::uint64_t active_process_links = 0x1d8;
+	const nt_offsets_t* const nt = guest_nt();
 	const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
 	const auto system_process = aliases.find("ntoskrnl.exe!PsInitialSystemProcess");
 
-	if (system_process == aliases.end() || sys::current_cr3 == 0)
+	if (nt == nullptr || system_process == aliases.end() || sys::current_cr3 == 0)
 	{
 		return 0;
 	}
@@ -3991,10 +4017,8 @@ static std::uint64_t eprocess_for_cr3(const std::uint64_t cr3)
 	for (std::uint64_t count = 0; count < 4096 && eprocess != 0; count++)
 	{
 		std::uint64_t directory = 0;
-		std::uint64_t user_directory = 0;
-		hypercall::read_guest_virtual_memory(&directory, eprocess + directory_table_base, sys::current_cr3, sizeof(directory));
-		hypercall::read_guest_virtual_memory(&user_directory, eprocess + user_directory_table_base, sys::current_cr3,
-		                                     sizeof(user_directory));
+		hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3, sizeof(directory));
+		const std::uint64_t user_directory = guest_user_directory(eprocess, *nt, directory);
 
 		if (same_directory(directory, cr3) == 1 || same_directory(user_directory, cr3) == 1)
 		{
@@ -4003,13 +4027,13 @@ static std::uint64_t eprocess_for_cr3(const std::uint64_t cr3)
 
 		std::uint64_t flink = 0;
 
-		if (hypercall::read_guest_virtual_memory(&flink, eprocess + active_process_links, sys::current_cr3, sizeof(flink)) !=
+		if (hypercall::read_guest_virtual_memory(&flink, eprocess + nt->eprocess_active_process_links, sys::current_cr3, sizeof(flink)) !=
 				sizeof(flink) || flink == 0)
 		{
 			break;
 		}
 
-		eprocess = flink - active_process_links;
+		eprocess = flink - nt->eprocess_active_process_links;
 
 		if (eprocess == first)
 		{
@@ -4022,7 +4046,7 @@ static std::uint64_t eprocess_for_cr3(const std::uint64_t cr3)
 
 static std::uint8_t collect_user_modules(const std::uint64_t cr3, std::vector<reload_module_t>& modules_out)
 {
-	constexpr std::uint64_t eprocess_peb = 0x2e0;
+	const nt_offsets_t* const nt = guest_nt();
 	constexpr std::uint64_t peb_ldr = 0x18;
 	constexpr std::uint64_t ldr_in_load_order = 0x10;
 	constexpr std::uint64_t entry_dll_base = 0x30;
@@ -4031,14 +4055,14 @@ static std::uint8_t collect_user_modules(const std::uint64_t cr3, std::vector<re
 	constexpr std::uint64_t entry_base_dll_name = 0x58;
 	const std::uint64_t eprocess = eprocess_for_cr3(cr3);
 
-	if (eprocess == 0)
+	if (nt == nullptr || eprocess == 0)
 	{
 		return 0;
 	}
 
 	std::uint64_t peb = 0;
 
-	if (hypercall::read_guest_virtual_memory(&peb, eprocess + eprocess_peb, sys::current_cr3, sizeof(peb)) != sizeof(peb) ||
+	if (hypercall::read_guest_virtual_memory(&peb, eprocess + nt->eprocess_peb, sys::current_cr3, sizeof(peb)) != sizeof(peb) ||
 		peb == 0)
 	{
 		return 0;
@@ -4135,20 +4159,17 @@ static std::uint8_t read_kernel_qword(const std::uint64_t address, std::uint64_t
 
 static std::uint64_t cr3_for_user_modules(const std::uint64_t eprocess)
 {
-	constexpr std::uint64_t directory_table_base = 0x28;
-	constexpr std::uint64_t user_directory_table_base = 0x158;
-	std::uint64_t user_directory = 0;
+	const nt_offsets_t* const nt = guest_nt();
 	std::uint64_t directory = 0;
 
-	read_kernel_qword(eprocess + user_directory_table_base, user_directory);
-	read_kernel_qword(eprocess + directory_table_base, directory);
-
-	if (user_directory != 0)
+	if (nt == nullptr)
 	{
-		return user_directory;
+		return 0;
 	}
 
-	return directory;
+	read_kernel_qword(eprocess + nt->eprocess_directory_table_base, directory);
+
+	return guest_user_directory(eprocess, *nt, directory);
 }
 
 static std::uint64_t processor_block_address()
@@ -4197,15 +4218,10 @@ static std::uint64_t processor_block_address()
 
 static std::uint8_t read_live_context(live_context_t& context_out)
 {
-	constexpr std::uint64_t prcb_current_thread = 0x8;
-	constexpr std::uint64_t thread_trap_frame = 0x90;
-	constexpr std::uint64_t thread_process = 0x220;
-	constexpr std::uint64_t eprocess_peb = 0x2e0;
-	constexpr std::uint64_t trap_rip = 0x168;
-	constexpr std::uint64_t trap_seg_cs = 0x170;
+	const nt_offsets_t* const nt = guest_nt();
 	const std::uint64_t processor_block = processor_block_address();
 
-	if (processor_block == 0)
+	if (nt == nullptr || processor_block == 0)
 	{
 		return 0;
 	}
@@ -4221,21 +4237,21 @@ static std::uint8_t read_live_context(live_context_t& context_out)
 
 		std::uint64_t thread = 0;
 
-		if (read_kernel_qword(prcb + prcb_current_thread, thread) == 0 || thread == 0)
+		if (read_kernel_qword(prcb + nt->prcb_current_thread, thread) == 0 || thread == 0)
 		{
 			continue;
 		}
 
 		std::uint64_t process = 0;
 		std::uint64_t trap = 0;
-		read_kernel_qword(thread + thread_process, process);
-		read_kernel_qword(thread + thread_trap_frame, trap);
+		read_kernel_qword(thread + nt->kthread_process, process);
+		read_kernel_qword(thread + nt->kthread_trap_frame, trap);
 
 		std::uint64_t peb = 0;
 
 		if (process != 0)
 		{
-			read_kernel_qword(process + eprocess_peb, peb);
+			read_kernel_qword(process + nt->eprocess_peb, peb);
 		}
 
 		if (context_out.user_cr3 == 0 && peb != 0)
@@ -4258,8 +4274,8 @@ static std::uint8_t read_live_context(live_context_t& context_out)
 
 		std::uint64_t rip = 0;
 		std::uint16_t cs = 0;
-		read_kernel_qword(trap + trap_rip, rip);
-		hypercall::read_guest_virtual_memory(&cs, trap + trap_seg_cs, sys::current_cr3, sizeof(cs));
+		read_kernel_qword(trap + nt->ktrap_rip, rip);
+		hypercall::read_guest_virtual_memory(&cs, trap + nt->ktrap_seg_cs, sys::current_cr3, sizeof(cs));
 
 		if (rip == 0)
 		{
@@ -4315,14 +4331,11 @@ static std::uint8_t current_instruction(std::uint64_t& address_out, std::uint64_
 
 static std::uint64_t user_cr3_for_pid(const std::uint64_t process_id)
 {
-	constexpr std::uint64_t directory_table_base = 0x28;
-	constexpr std::uint64_t user_directory_table_base = 0x158;
-	constexpr std::uint64_t unique_process_id = 0x1d0;
-	constexpr std::uint64_t active_process_links = 0x1d8;
+	const nt_offsets_t* const nt = guest_nt();
 	const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
 	const auto system_process = aliases.find("ntoskrnl.exe!PsInitialSystemProcess");
 
-	if (process_id == 0 || system_process == aliases.end() || sys::current_cr3 == 0)
+	if (nt == nullptr || process_id == 0 || system_process == aliases.end() || sys::current_cr3 == 0)
 	{
 		return 0;
 	}
@@ -4341,27 +4354,24 @@ static std::uint64_t user_cr3_for_pid(const std::uint64_t process_id)
 	{
 		std::uint64_t pid = 0;
 
-		if (hypercall::read_guest_virtual_memory(&pid, eprocess + unique_process_id, sys::current_cr3, sizeof(pid)) ==
+		if (hypercall::read_guest_virtual_memory(&pid, eprocess + nt->eprocess_unique_process_id, sys::current_cr3, sizeof(pid)) ==
 				sizeof(pid) && pid == process_id)
 		{
-			std::uint64_t user_directory = 0;
 			std::uint64_t directory = 0;
-			hypercall::read_guest_virtual_memory(&user_directory, eprocess + user_directory_table_base, sys::current_cr3,
-			                                     sizeof(user_directory));
-			hypercall::read_guest_virtual_memory(&directory, eprocess + directory_table_base, sys::current_cr3, sizeof(directory));
+			hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3, sizeof(directory));
 
-			return user_directory != 0 ? user_directory : directory;
+			return guest_user_directory(eprocess, *nt, directory);
 		}
 
 		std::uint64_t flink = 0;
 
-		if (hypercall::read_guest_virtual_memory(&flink, eprocess + active_process_links, sys::current_cr3, sizeof(flink)) !=
+		if (hypercall::read_guest_virtual_memory(&flink, eprocess + nt->eprocess_active_process_links, sys::current_cr3, sizeof(flink)) !=
 				sizeof(flink) || flink == 0)
 		{
 			break;
 		}
 
-		eprocess = flink - active_process_links;
+		eprocess = flink - nt->eprocess_active_process_links;
 
 		if (eprocess == first)
 		{
@@ -4394,37 +4404,26 @@ static implicit_process_t implicit_process = {};
 
 static std::uint8_t read_guest_process(const std::uint64_t eprocess, guest_process_t& process_out)
 {
-	constexpr std::uint64_t directory_table_base = 0x28;
-	constexpr std::uint64_t user_directory_table_base = 0x158;
-	constexpr std::uint64_t unique_process_id = 0x1d0;
-	constexpr std::uint64_t inherited_from = 0x2d0;
-	constexpr std::uint64_t peb_offset = 0x2e0;
-	constexpr std::uint64_t image_file_name = 0x338;
+	const nt_offsets_t* const nt = guest_nt();
 
-	if (eprocess == 0 || sys::current_cr3 == 0)
+	if (nt == nullptr || eprocess == 0 || sys::current_cr3 == 0)
 	{
 		return 0;
 	}
 
 	process_out = {};
 	process_out.eprocess = eprocess;
-	hypercall::read_guest_virtual_memory(&process_out.pid, eprocess + unique_process_id, sys::current_cr3, sizeof(process_out.pid));
-	hypercall::read_guest_virtual_memory(&process_out.parent_pid, eprocess + inherited_from, sys::current_cr3,
+	hypercall::read_guest_virtual_memory(&process_out.pid, eprocess + nt->eprocess_unique_process_id, sys::current_cr3, sizeof(process_out.pid));
+	hypercall::read_guest_virtual_memory(&process_out.parent_pid, eprocess + nt->eprocess_inherited_from_unique_process_id, sys::current_cr3,
 	                                     sizeof(process_out.parent_pid));
-	hypercall::read_guest_virtual_memory(&process_out.peb, eprocess + peb_offset, sys::current_cr3, sizeof(process_out.peb));
-	hypercall::read_guest_virtual_memory(&process_out.directory, eprocess + directory_table_base, sys::current_cr3,
+	hypercall::read_guest_virtual_memory(&process_out.peb, eprocess + nt->eprocess_peb, sys::current_cr3, sizeof(process_out.peb));
+	hypercall::read_guest_virtual_memory(&process_out.directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3,
 	                                     sizeof(process_out.directory));
-	hypercall::read_guest_virtual_memory(&process_out.user_cr3, eprocess + user_directory_table_base, sys::current_cr3,
-	                                     sizeof(process_out.user_cr3));
-
-	if (process_out.user_cr3 == 0)
-	{
-		process_out.user_cr3 = process_out.directory;
-	}
+	process_out.user_cr3 = guest_user_directory(eprocess, *nt, process_out.directory);
 
 	char image[16] = {};
 
-	if (hypercall::read_guest_virtual_memory(image, eprocess + image_file_name, sys::current_cr3, 15) == 15)
+	if (hypercall::read_guest_virtual_memory(image, eprocess + nt->eprocess_image_file_name, sys::current_cr3, 15) == 15)
 	{
 		image[15] = '\0';
 		process_out.image = image;
@@ -4435,12 +4434,12 @@ static std::uint8_t read_guest_process(const std::uint64_t eprocess, guest_proce
 
 static std::vector<guest_process_t> list_guest_processes()
 {
-	constexpr std::uint64_t active_process_links = 0x1d8;
+	const nt_offsets_t* const nt = guest_nt();
 	std::vector<guest_process_t> processes = {};
 	const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
 	const auto system_process = aliases.find("ntoskrnl.exe!PsInitialSystemProcess");
 
-	if (system_process == aliases.end() || sys::current_cr3 == 0)
+	if (nt == nullptr || system_process == aliases.end() || sys::current_cr3 == 0)
 	{
 		return processes;
 	}
@@ -4466,13 +4465,13 @@ static std::vector<guest_process_t> list_guest_processes()
 
 		std::uint64_t flink = 0;
 
-		if (hypercall::read_guest_virtual_memory(&flink, eprocess + active_process_links, sys::current_cr3, sizeof(flink)) !=
+		if (hypercall::read_guest_virtual_memory(&flink, eprocess + nt->eprocess_active_process_links, sys::current_cr3, sizeof(flink)) !=
 				sizeof(flink) || flink == 0)
 		{
 			break;
 		}
 
-		eprocess = flink - active_process_links;
+		eprocess = flink - nt->eprocess_active_process_links;
 
 		if (eprocess == first)
 		{
@@ -4541,10 +4540,8 @@ static LONG process_suspend_call(const std::uint64_t pid, const std::uint8_t res
 
 static std::uint8_t process_has_suspend_count(const std::uint64_t eprocess)
 {
-	constexpr std::uint64_t thread_list_head = 0x370;
-	constexpr std::uint64_t thread_list_entry = 0x578;
-	constexpr std::uint64_t suspend_count = 0x284;
-	const std::uint64_t head = eprocess + thread_list_head;
+	const nt_offsets_t* const nt = guest_nt();
+	const std::uint64_t head = nt == nullptr ? 0 : eprocess + nt->eprocess_thread_list_head;
 	std::uint64_t link = 0;
 
 	if (eprocess == 0 || read_kernel_memory(head, &link, sizeof(link)) == 0 || link == 0)
@@ -4556,7 +4553,8 @@ static std::uint8_t process_has_suspend_count(const std::uint64_t eprocess)
 	{
 		std::uint8_t suspended = 0;
 
-		if (read_kernel_memory(link - thread_list_entry + suspend_count, &suspended, sizeof(suspended)) == 1 && suspended != 0)
+		if (read_kernel_memory(link - nt->ethread_thread_list_entry + nt->kthread_suspend_count, &suspended, sizeof(suspended)) == 1 &&
+			suspended != 0)
 		{
 			return 1;
 		}
@@ -5602,13 +5600,8 @@ struct user_thread_t
 
 static void collect_user_threads(const std::uint64_t eprocess, std::vector<user_thread_t>& threads_out)
 {
-	constexpr std::uint64_t thread_list_head = 0x370;
-	constexpr std::uint64_t thread_list_entry = 0x578;
-	constexpr std::uint64_t ethread_cid = 0x508;
-	constexpr std::uint64_t trap_frame = 0x90;
-	constexpr std::uint64_t trap_rip = 0x168;
-	constexpr std::uint64_t trap_seg_cs = 0x170;
-	const std::uint64_t head = eprocess + thread_list_head;
+	const nt_offsets_t* const nt = guest_nt();
+	const std::uint64_t head = nt == nullptr ? 0 : eprocess + nt->eprocess_thread_list_head;
 	std::uint64_t link = 0;
 
 	threads_out.clear();
@@ -5620,21 +5613,21 @@ static void collect_user_threads(const std::uint64_t eprocess, std::vector<user_
 
 	for (std::uint64_t count = 0; count < 4096 && link != head && threads_out.size() < 32; count++)
 	{
-		const std::uint64_t ethread = link - thread_list_entry;
+		const std::uint64_t ethread = link - nt->ethread_thread_list_entry;
 		std::uint64_t trap = 0;
 
-		if (read_kernel_memory(ethread + trap_frame, &trap, sizeof(trap)) == 1 && trap != 0)
+		if (read_kernel_memory(ethread + nt->kthread_trap_frame, &trap, sizeof(trap)) == 1 && trap != 0)
 		{
 			std::uint64_t rip = 0;
 			std::uint16_t seg_cs = 0;
 
-			if (read_kernel_memory(trap + trap_rip, &rip, sizeof(rip)) == 1 &&
-				read_kernel_memory(trap + trap_seg_cs, &seg_cs, sizeof(seg_cs)) == 1 && (seg_cs & 0xFF) == 0x33 && rip != 0 &&
+			if (read_kernel_memory(trap + nt->ktrap_rip, &rip, sizeof(rip)) == 1 &&
+				read_kernel_memory(trap + nt->ktrap_seg_cs, &seg_cs, sizeof(seg_cs)) == 1 && (seg_cs & 0xFF) == 0x33 && rip != 0 &&
 				rip <= 0x00007FFFFFFFFFFFull)
 			{
 				std::uint64_t tid = 0;
 
-				if (read_kernel_memory(ethread + ethread_cid + sizeof(std::uint64_t), &tid, sizeof(tid)) == 1 && tid != 0 &&
+				if (read_kernel_memory(ethread + nt->ethread_cid + sizeof(std::uint64_t), &tid, sizeof(tid)) == 1 && tid != 0 &&
 					tid <= 0xFFFFFFFFull)
 				{
 					threads_out.push_back({ethread, trap, rip, tid});
@@ -5651,16 +5644,10 @@ static void collect_user_threads(const std::uint64_t eprocess, std::vector<user_
 
 static void collect_kernel_threads(const std::uint64_t eprocess, std::vector<user_thread_t>& threads_out)
 {
-	constexpr std::uint64_t thread_list_head = 0x370;
-	constexpr std::uint64_t thread_list_entry = 0x578;
-	constexpr std::uint64_t ethread_cid = 0x508;
-	constexpr std::uint64_t trap_frame = 0x90;
-	constexpr std::uint64_t thread_state = 0x184;
-	constexpr std::uint64_t trap_rip = 0x168;
-	constexpr std::uint64_t trap_seg_cs = 0x170;
+	const nt_offsets_t* const nt = guest_nt();
 	constexpr std::uint8_t running_state = 2;
 	constexpr std::uint8_t terminated_state = 4;
-	const std::uint64_t head = eprocess + thread_list_head;
+	const std::uint64_t head = nt == nullptr ? 0 : eprocess + nt->eprocess_thread_list_head;
 	std::uint64_t link = 0;
 
 	threads_out.clear();
@@ -5672,23 +5659,23 @@ static void collect_kernel_threads(const std::uint64_t eprocess, std::vector<use
 
 	for (std::uint64_t count = 0; count < 4096 && link != head && threads_out.size() < 64; count++)
 	{
-		const std::uint64_t ethread = link - thread_list_entry;
+		const std::uint64_t ethread = link - nt->ethread_thread_list_entry;
 		std::uint8_t state = 0;
 		std::uint64_t trap = 0;
 
-		if (read_kernel_memory(ethread + thread_state, &state, sizeof(state)) == 1 && state != running_state &&
-			state != terminated_state && read_kernel_memory(ethread + trap_frame, &trap, sizeof(trap)) == 1 && trap != 0)
+		if (read_kernel_memory(ethread + nt->kthread_state, &state, sizeof(state)) == 1 && state != running_state &&
+			state != terminated_state && read_kernel_memory(ethread + nt->kthread_trap_frame, &trap, sizeof(trap)) == 1 && trap != 0)
 		{
 			std::uint64_t rip = 0;
 			std::uint16_t seg_cs = 0;
 
-			if (read_kernel_memory(trap + trap_rip, &rip, sizeof(rip)) == 1 &&
-				read_kernel_memory(trap + trap_seg_cs, &seg_cs, sizeof(seg_cs)) == 1 && (seg_cs & 0xFF) == 0x10 &&
+			if (read_kernel_memory(trap + nt->ktrap_rip, &rip, sizeof(rip)) == 1 &&
+				read_kernel_memory(trap + nt->ktrap_seg_cs, &seg_cs, sizeof(seg_cs)) == 1 && (seg_cs & 0xFF) == 0x10 &&
 				rip > 0x00007FFFFFFFFFFFull)
 			{
 				std::uint64_t tid = 0;
 
-				if (read_kernel_memory(ethread + ethread_cid + sizeof(std::uint64_t), &tid, sizeof(tid)) == 1 && tid != 0 &&
+				if (read_kernel_memory(ethread + nt->ethread_cid + sizeof(std::uint64_t), &tid, sizeof(tid)) == 1 && tid != 0 &&
 					tid <= 0xFFFFFFFFull)
 				{
 					threads_out.push_back({ethread, trap, rip, tid});
@@ -5705,11 +5692,8 @@ static void collect_kernel_threads(const std::uint64_t eprocess, std::vector<use
 
 static void collect_process_threads(const std::uint64_t eprocess, std::vector<user_thread_t>& threads_out)
 {
-	constexpr std::uint64_t thread_list_head = 0x370;
-	constexpr std::uint64_t thread_list_entry = 0x578;
-	constexpr std::uint64_t ethread_cid = 0x508;
-	constexpr std::uint64_t trap_frame = 0x90;
-	const std::uint64_t head = eprocess + thread_list_head;
+	const nt_offsets_t* const nt = guest_nt();
+	const std::uint64_t head = nt == nullptr ? 0 : eprocess + nt->eprocess_thread_list_head;
 	std::uint64_t link = 0;
 
 	threads_out.clear();
@@ -5721,13 +5705,13 @@ static void collect_process_threads(const std::uint64_t eprocess, std::vector<us
 
 	for (std::uint64_t count = 0; count < 4096 && link != head && threads_out.size() < 64; count++)
 	{
-		const std::uint64_t ethread = link - thread_list_entry;
+		const std::uint64_t ethread = link - nt->ethread_thread_list_entry;
 		std::uint64_t trap = 0;
 		std::uint64_t tid = 0;
 
-		read_kernel_memory(ethread + trap_frame, &trap, sizeof(trap));
+		read_kernel_memory(ethread + nt->kthread_trap_frame, &trap, sizeof(trap));
 
-		if (read_kernel_memory(ethread + ethread_cid + sizeof(tid), &tid, sizeof(tid)) == 1 && tid != 0 && tid <= 0xFFFFFFFFull)
+		if (read_kernel_memory(ethread + nt->ethread_cid + sizeof(tid), &tid, sizeof(tid)) == 1 && tid != 0 && tid <= 0xFFFFFFFFull)
 		{
 			threads_out.push_back({ethread, trap, 0, tid});
 		}
@@ -5767,9 +5751,9 @@ static std::uint8_t write_thread_rip(const HANDLE thread, const std::uint64_t tr
 		}
 	}
 
-	constexpr std::uint64_t trap_rip = 0x168;
+	const nt_offsets_t* const nt = guest_nt();
 
-	if (trap != 0 && write_kernel_memory(trap + trap_rip, &rip, sizeof(rip)) == 1)
+	if (nt != nullptr && trap != 0 && write_kernel_memory(trap + nt->ktrap_rip, &rip, sizeof(rip)) == 1)
 	{
 		wrote = 1;
 	}
@@ -6010,7 +5994,10 @@ static std::uint8_t trap_is_user_return(const std::uint64_t trap, std::uint64_t&
 
 	rip_out = 0;
 
-	if (trap == 0 || read_kernel_memory(trap + 0x168, &rip, sizeof(rip)) == 0 || read_kernel_memory(trap + 0x170, &cs, sizeof(cs)) == 0)
+	const nt_offsets_t* const nt = guest_nt();
+
+	if (nt == nullptr || trap == 0 || read_kernel_memory(trap + nt->ktrap_rip, &rip, sizeof(rip)) == 0 ||
+		read_kernel_memory(trap + nt->ktrap_seg_cs, &cs, sizeof(cs)) == 0)
 	{
 		return 0;
 	}
@@ -6132,10 +6119,11 @@ static std::uint8_t hook_next_and_run(const user_thread_t& thread, const guest_p
 		return 0;
 	}
 
+	const nt_offsets_t* const nt = guest_nt();
 	std::uint64_t entry = 0;
 	std::uint64_t breakpoint_id = 0;
 
-	if (breakpoint::arm_direct_pause(rip, process.user_cr3, cave_hint, entry, breakpoint_id) == 0)
+	if (nt == nullptr || breakpoint::arm_direct_pause(rip, process.user_cr3, cave_hint, entry, breakpoint_id) == 0)
 	{
 		CloseHandle(handle);
 
@@ -6146,7 +6134,7 @@ static std::uint8_t hook_next_and_run(const user_thread_t& thread, const guest_p
 	std::fflush(stdout);
 
 	// Point only this frame at the stub. KiSwapContext is left unchanged.
-	if (write_kernel_memory(trap + 0x168, &entry, sizeof(entry)) == 0)
+	if (write_kernel_memory(trap + nt->ktrap_rip, &entry, sizeof(entry)) == 0)
 	{
 		breakpoint::remove(breakpoint_id);
 		CloseHandle(handle);
@@ -6158,7 +6146,7 @@ static std::uint8_t hook_next_and_run(const user_thread_t& thread, const guest_p
 	// count, but the scheduler still will not run it until NtResumeProcess.
 	if (release_process_freeze() == 0)
 	{
-		write_kernel_memory(trap + 0x168, &rip, sizeof(rip));
+		write_kernel_memory(trap + nt->ktrap_rip, &rip, sizeof(rip));
 		breakpoint::remove(breakpoint_id);
 		CloseHandle(handle);
 
@@ -6169,7 +6157,7 @@ static std::uint8_t hook_next_and_run(const user_thread_t& thread, const guest_p
 
 	if (resume_until_running(handle, resumes) == 0)
 	{
-		write_kernel_memory(trap + 0x168, &rip, sizeof(rip));
+		write_kernel_memory(trap + nt->ktrap_rip, &rip, sizeof(rip));
 		freeze_process_again();
 		breakpoint::remove(breakpoint_id);
 		CloseHandle(handle);
@@ -6188,7 +6176,7 @@ static std::uint8_t hook_next_and_run(const user_thread_t& thread, const guest_p
 		return 1;
 	}
 
-	write_kernel_memory(trap + 0x168, &rip, sizeof(rip));
+	write_kernel_memory(trap + nt->ktrap_rip, &rip, sizeof(rip));
 	freeze_process_again();
 	breakpoint::remove(breakpoint_id);
 	CloseHandle(handle);
@@ -6206,10 +6194,11 @@ static std::uint8_t hijack_kernel_thread(const user_thread_t& kernel_thread, con
 		return 0;
 	}
 
+	const nt_offsets_t* const nt = guest_nt();
 	std::uint64_t entry = 0;
 	std::uint64_t breakpoint_id = 0;
 
-	if (breakpoint::arm_kernel_pause(kernel_thread.rip, kernel_cr3, entry, breakpoint_id) == 0)
+	if (nt == nullptr || breakpoint::arm_kernel_pause(kernel_thread.rip, kernel_cr3, entry, breakpoint_id) == 0)
 	{
 		CloseHandle(thread);
 
@@ -6219,9 +6208,7 @@ static std::uint8_t hijack_kernel_thread(const user_thread_t& kernel_thread, con
 	fmt::print("\nkernel thread {:x} ", kernel_thread.tid);
 	std::fflush(stdout);
 
-	constexpr std::uint64_t trap_rip = 0x168;
-
-	if (write_kernel_memory(kernel_thread.trap + trap_rip, &entry, sizeof(entry)) == 0)
+	if (write_kernel_memory(kernel_thread.trap + nt->ktrap_rip, &entry, sizeof(entry)) == 0)
 	{
 		breakpoint::remove(breakpoint_id);
 		CloseHandle(thread);
@@ -6233,7 +6220,7 @@ static std::uint8_t hijack_kernel_thread(const user_thread_t& kernel_thread, con
 	// run into the kernel pause stub. The other threads stay suspended.
 	if (ResumeThread(thread) == static_cast<DWORD>(-1))
 	{
-		write_kernel_memory(kernel_thread.trap + trap_rip, &kernel_thread.rip, sizeof(kernel_thread.rip));
+		write_kernel_memory(kernel_thread.trap + nt->ktrap_rip, &kernel_thread.rip, sizeof(kernel_thread.rip));
 		breakpoint::remove(breakpoint_id);
 		CloseHandle(thread);
 
@@ -6257,7 +6244,7 @@ static std::uint8_t hijack_kernel_thread(const user_thread_t& kernel_thread, con
 		return 1;
 	}
 
-	write_kernel_memory(kernel_thread.trap + trap_rip, &kernel_thread.rip, sizeof(kernel_thread.rip));
+	write_kernel_memory(kernel_thread.trap + nt->ktrap_rip, &kernel_thread.rip, sizeof(kernel_thread.rip));
 	breakpoint::remove(breakpoint_id);
 	CloseHandle(thread);
 
@@ -6789,7 +6776,14 @@ static std::uint8_t read_trap_registers(const std::uint64_t trap, breakpoint::re
 	registers_out.rdi = qword(0x148);
 	registers_out.rsi = qword(0x150);
 	registers_out.rbp = qword(0x158);
-	registers_out.rip = qword(0x168);
+	const nt_offsets_t* const nt = guest_nt();
+
+	if (nt == nullptr)
+	{
+		return 0;
+	}
+
+	registers_out.rip = qword(nt->ktrap_rip);
 	registers_out.rflags = qword(0x178) & 0xFFFFFFFFull;
 	registers_out.rflags_known = 1;
 	registers_out.rsp = qword(0x180);
@@ -6822,8 +6816,15 @@ static std::uint8_t stack_trap_matches(const std::uint8_t* const frame, const st
 	std::uint64_t flags = 0;
 	std::uint16_t cs = 0;
 
-	std::memcpy(&rip, frame + 0x168, sizeof(rip));
-	std::memcpy(&cs, frame + 0x170, sizeof(cs));
+	const nt_offsets_t* const nt = guest_nt();
+
+	if (nt == nullptr)
+	{
+		return 0;
+	}
+
+	std::memcpy(&rip, frame + nt->ktrap_rip, sizeof(rip));
+	std::memcpy(&cs, frame + nt->ktrap_seg_cs, sizeof(cs));
 	std::memcpy(&flags, frame + 0x178, sizeof(flags));
 	std::memcpy(&rsp, frame + 0x180, sizeof(rsp));
 
@@ -7004,29 +7005,12 @@ static std::uint8_t recover_saved_thread_context(guest_thread_t& thread)
 
 static std::uint8_t read_guest_thread(const std::uint64_t ethread, guest_thread_t& thread_out)
 {
-	constexpr std::uint64_t initial_stack = 0x28;
-	constexpr std::uint64_t stack_limit = 0x30;
-	constexpr std::uint64_t stack_base = 0x38;
-	constexpr std::uint64_t kernel_stack = 0x58;
-	constexpr std::uint64_t misc_flags = 0x74;
-	constexpr std::uint64_t trap_frame = 0x90;
-	constexpr std::uint64_t priority = 0xc3;
-	constexpr std::uint64_t teb = 0xf0;
-	constexpr std::uint64_t context_switches = 0x154;
-	constexpr std::uint64_t state = 0x184;
-	constexpr std::uint64_t wait_mode = 0x187;
-	constexpr std::uint64_t wait_time = 0x1b4;
-	constexpr std::uint64_t win32_thread = 0x1c8;
-	constexpr std::uint64_t thread_process = 0x220;
-	constexpr std::uint64_t wait_reason = 0x283;
-	constexpr std::uint64_t suspend_count = 0x284;
-	constexpr std::uint64_t cid = 0x508;
-	constexpr std::uint64_t win32_start = 0x560;
+	const nt_offsets_t* const nt = guest_nt();
 
 	thread_out = {};
 	thread_out.ethread = ethread;
 
-	if (ethread < 0xFFFF000000000000ull)
+	if (nt == nullptr || ethread < 0xFFFF000000000000ull)
 	{
 		return 0;
 	}
@@ -7034,8 +7018,8 @@ static std::uint8_t read_guest_thread(const std::uint64_t ethread, guest_thread_
 	std::uint64_t unique_process = 0;
 	std::uint64_t unique_thread = 0;
 
-	if (read_kernel_memory(ethread + cid, &unique_process, sizeof(unique_process)) == 0 ||
-		read_kernel_memory(ethread + cid + sizeof(unique_thread), &unique_thread, sizeof(unique_thread)) == 0 || unique_thread == 0 ||
+	if (read_kernel_memory(ethread + nt->ethread_cid, &unique_process, sizeof(unique_process)) == 0 ||
+		read_kernel_memory(ethread + nt->ethread_cid + sizeof(unique_thread), &unique_thread, sizeof(unique_thread)) == 0 || unique_thread == 0 ||
 		unique_thread > 0xFFFFFFFFull)
 	{
 		return 0;
@@ -7043,15 +7027,15 @@ static std::uint8_t read_guest_thread(const std::uint64_t ethread, guest_thread_
 
 	thread_out.pid = unique_process;
 	thread_out.tid = unique_thread;
-	read_kernel_qword(ethread + thread_process, thread_out.eprocess);
-	read_kernel_qword(ethread + teb, thread_out.teb);
-	read_kernel_qword(ethread + trap_frame, thread_out.trap);
-	read_kernel_qword(ethread + win32_thread, thread_out.win32_thread);
-	read_kernel_qword(ethread + win32_start, thread_out.win32_start);
-	read_kernel_qword(ethread + initial_stack, thread_out.initial_stack);
-	read_kernel_qword(ethread + stack_limit, thread_out.stack_limit);
-	read_kernel_qword(ethread + stack_base, thread_out.stack_base);
-	read_kernel_qword(ethread + kernel_stack, thread_out.kernel_stack);
+	read_kernel_qword(ethread + nt->kthread_process, thread_out.eprocess);
+	read_kernel_qword(ethread + nt->kthread_teb, thread_out.teb);
+	read_kernel_qword(ethread + nt->kthread_trap_frame, thread_out.trap);
+	read_kernel_qword(ethread + nt->kthread_win32_thread, thread_out.win32_thread);
+	read_kernel_qword(ethread + nt->ethread_win32_start_address, thread_out.win32_start);
+	read_kernel_qword(ethread + nt->kthread_initial_stack, thread_out.initial_stack);
+	read_kernel_qword(ethread + nt->kthread_stack_limit, thread_out.stack_limit);
+	read_kernel_qword(ethread + nt->kthread_stack_base, thread_out.stack_base);
+	read_kernel_qword(ethread + nt->kthread_kernel_stack, thread_out.kernel_stack);
 
 	std::uint32_t switches = 0;
 	std::uint32_t waited = 0;
@@ -7062,42 +7046,42 @@ static std::uint8_t read_guest_thread(const std::uint64_t ethread, guest_thread_
 	std::uint8_t priority_value = 0;
 	std::uint8_t suspended = 0;
 
-	if (read_kernel_memory(ethread + context_switches, &switches, sizeof(switches)) == 1)
+	if (read_kernel_memory(ethread + nt->kthread_context_switches, &switches, sizeof(switches)) == 1)
 	{
 		thread_out.context_switches = switches;
 	}
 
-	if (read_kernel_memory(ethread + wait_time, &waited, sizeof(waited)) == 1)
+	if (read_kernel_memory(ethread + nt->kthread_wait_time, &waited, sizeof(waited)) == 1)
 	{
 		thread_out.wait_time = waited;
 	}
 
-	if (read_kernel_memory(ethread + misc_flags, &flags, sizeof(flags)) == 1)
+	if (read_kernel_memory(ethread + nt->kthread_misc_flags, &flags, sizeof(flags)) == 1)
 	{
-		thread_out.system_thread = static_cast<std::uint8_t>((flags & (1u << 10)) != 0);
+		thread_out.system_thread = static_cast<std::uint8_t>((flags & (1u << nt->kthread_system_thread_bit)) != 0);
 	}
 
-	if (read_kernel_memory(ethread + state, &state_value, sizeof(state_value)) == 1)
+	if (read_kernel_memory(ethread + nt->kthread_state, &state_value, sizeof(state_value)) == 1)
 	{
 		thread_out.state = state_value;
 	}
 
-	if (read_kernel_memory(ethread + wait_reason, &reason, sizeof(reason)) == 1)
+	if (read_kernel_memory(ethread + nt->kthread_wait_reason, &reason, sizeof(reason)) == 1)
 	{
 		thread_out.wait_reason = reason;
 	}
 
-	if (read_kernel_memory(ethread + wait_mode, &mode, sizeof(mode)) == 1)
+	if (read_kernel_memory(ethread + nt->kthread_wait_mode, &mode, sizeof(mode)) == 1)
 	{
 		thread_out.wait_mode = mode;
 	}
 
-	if (read_kernel_memory(ethread + priority, &priority_value, sizeof(priority_value)) == 1)
+	if (read_kernel_memory(ethread + nt->kthread_priority, &priority_value, sizeof(priority_value)) == 1)
 	{
 		thread_out.priority = static_cast<std::int8_t>(priority_value);
 	}
 
-	if (read_kernel_memory(ethread + suspend_count, &suspended, sizeof(suspended)) == 1)
+	if (read_kernel_memory(ethread + nt->kthread_suspend_count, &suspended, sizeof(suspended)) == 1)
 	{
 		thread_out.suspend_count = static_cast<std::int8_t>(suspended);
 	}
@@ -7135,18 +7119,21 @@ static std::uint8_t read_guest_thread(const std::uint64_t ethread, guest_thread_
 
 static std::uint8_t find_guest_thread(const std::uint64_t selector, const std::uint8_t selector_is_tid, guest_thread_t& thread_out)
 {
-	constexpr std::uint64_t thread_list_head = 0x370;
-	constexpr std::uint64_t thread_list_entry = 0x578;
-	constexpr std::uint64_t ethread_cid = 0x508;
+	const nt_offsets_t* const nt = guest_nt();
 
 	if (selector_is_tid == 0)
 	{
 		return read_guest_thread(selector, thread_out);
 	}
 
+	if (nt == nullptr)
+	{
+		return 0;
+	}
+
 	for (const guest_process_t& process : list_guest_processes())
 	{
-		const std::uint64_t head = process.eprocess + thread_list_head;
+		const std::uint64_t head = process.eprocess + nt->eprocess_thread_list_head;
 		std::uint64_t link = 0;
 
 		if (read_kernel_memory(head, &link, sizeof(link)) == 0 || link == 0)
@@ -7156,10 +7143,10 @@ static std::uint8_t find_guest_thread(const std::uint64_t selector, const std::u
 
 		for (std::uint64_t count = 0; count < 4096 && link != head; count++)
 		{
-			const std::uint64_t ethread = link - thread_list_entry;
+			const std::uint64_t ethread = link - nt->ethread_thread_list_entry;
 			std::uint64_t tid = 0;
 
-			if (read_kernel_memory(ethread + ethread_cid + sizeof(tid), &tid, sizeof(tid)) == 1 && tid == selector)
+			if (read_kernel_memory(ethread + nt->ethread_cid + sizeof(tid), &tid, sizeof(tid)) == 1 && tid == selector)
 			{
 				return read_guest_thread(ethread, thread_out);
 			}
@@ -7176,13 +7163,13 @@ static std::uint8_t find_guest_thread(const std::uint64_t selector, const std::u
 
 static std::uint8_t processor_current_thread(guest_thread_t& thread_out)
 {
-	constexpr std::uint64_t prcb_current_thread = 0x8;
+	const nt_offsets_t* const nt = guest_nt();
 	const std::uint64_t processor_block = processor_block_address();
 	std::uint64_t prcb = 0;
 	std::uint64_t thread = 0;
 
-	if (processor_block == 0 || read_kernel_qword(processor_block, prcb) == 0 || prcb == 0 ||
-		read_kernel_qword(prcb + prcb_current_thread, thread) == 0 || thread == 0)
+	if (nt == nullptr || processor_block == 0 || read_kernel_qword(processor_block, prcb) == 0 || prcb == 0 ||
+		read_kernel_qword(prcb + nt->prcb_current_thread, thread) == 0 || thread == 0)
 	{
 		return 0;
 	}
@@ -7368,9 +7355,8 @@ static void use_thread_context(const guest_thread_t& thread, const std::uint8_t 
 
 static void print_process_threads(const guest_process_t& process)
 {
-	constexpr std::uint64_t thread_list_head = 0x370;
-	constexpr std::uint64_t thread_list_entry = 0x578;
-	const std::uint64_t head = process.eprocess + thread_list_head;
+	const nt_offsets_t* const nt = guest_nt();
+	const std::uint64_t head = nt == nullptr ? 0 : process.eprocess + nt->eprocess_thread_list_head;
 	std::uint64_t link = 0;
 	std::uint64_t shown = 0;
 
@@ -7385,7 +7371,7 @@ static void print_process_threads(const guest_process_t& process)
 
 	for (std::uint64_t count = 0; count < 4096 && link != head && shown < 128; count++)
 	{
-		const std::uint64_t ethread = link - thread_list_entry;
+		const std::uint64_t ethread = link - nt->ethread_thread_list_entry;
 		guest_thread_t thread = {};
 
 		if (read_guest_thread(ethread, thread) == 1)

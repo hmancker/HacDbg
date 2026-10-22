@@ -9,6 +9,7 @@
 #include "../hypercall/hypercall.h"
 #include "../logs/logs.h"
 #include "../system/system.h"
+#include "../system/nt_offsets.h"
 
 #include <Windows.h>
 #include <intrin.h>
@@ -317,9 +318,6 @@ namespace
 		return static_cast<std::uint8_t>(address <= 0x00007FFFFFFFFFFFull);
 	}
 
-	constexpr std::uint64_t eprocess_directory_table_base = 0x28;
-	constexpr std::uint64_t eprocess_unique_process_id = 0x1d0;
-	constexpr std::uint64_t eprocess_active_process_links = 0x1d8;
 	constexpr std::uint64_t page_table_entry_mask = 0x000FFFFFFFFFF000ull;
 
 	std::uint8_t* user_trampoline_page = nullptr;
@@ -462,10 +460,11 @@ namespace
 	std::vector<std::uint64_t> collect_process_cr3s()
 	{
 		std::vector<std::uint64_t> cr3s = {};
+		const nt_offsets_t* const nt = nt_offsets_current();
 		const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
 		const auto system_process = aliases.find("ntoskrnl.exe!PsInitialSystemProcess");
 
-		if (system_process == aliases.end())
+		if (nt == nullptr || system_process == aliases.end())
 		{
 			return cr3s;
 		}
@@ -484,7 +483,7 @@ namespace
 		{
 			std::uint64_t directory = 0;
 
-			if (hypercall::read_guest_virtual_memory(&directory, eprocess + eprocess_directory_table_base, sys::current_cr3,
+			if (hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3,
 			                                        sizeof(directory)) == sizeof(directory) && directory != 0)
 			{
 				cr3s.push_back(directory);
@@ -492,13 +491,13 @@ namespace
 
 			std::uint64_t flink = 0;
 
-			if (hypercall::read_guest_virtual_memory(&flink, eprocess + eprocess_active_process_links, sys::current_cr3,
+			if (hypercall::read_guest_virtual_memory(&flink, eprocess + nt->eprocess_active_process_links, sys::current_cr3,
 			                                        sizeof(flink)) != sizeof(flink) || flink == 0)
 			{
 				break;
 			}
 
-			eprocess = flink - eprocess_active_process_links;
+			eprocess = flink - nt->eprocess_active_process_links;
 
 			if (eprocess == first)
 			{
@@ -1926,10 +1925,11 @@ std::uint8_t breakpoint::arm_kernel_redirect(const std::uint64_t logical_rip, co
 
 std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 {
+	const nt_offsets_t* const nt = nt_offsets_current();
 	const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
 	const auto system_process = aliases.find("ntoskrnl.exe!PsInitialSystemProcess");
 
-	if (system_process == aliases.end())
+	if (nt == nullptr || system_process == aliases.end())
 	{
 		return 0;
 	}
@@ -1948,12 +1948,12 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 	{
 		std::uint64_t pid = 0;
 
-		if (hypercall::read_guest_virtual_memory(&pid, eprocess + eprocess_unique_process_id, sys::current_cr3, sizeof(pid)) ==
+		if (hypercall::read_guest_virtual_memory(&pid, eprocess + nt->eprocess_unique_process_id, sys::current_cr3, sizeof(pid)) ==
 				sizeof(pid) && pid == process_id)
 		{
 			std::uint64_t directory = 0;
 
-			if (hypercall::read_guest_virtual_memory(&directory, eprocess + eprocess_directory_table_base, sys::current_cr3,
+			if (hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3,
 			                                        sizeof(directory)) == sizeof(directory))
 			{
 				return directory;
@@ -1964,13 +1964,13 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 		std::uint64_t flink = 0;
 
-		if (hypercall::read_guest_virtual_memory(&flink, eprocess + eprocess_active_process_links, sys::current_cr3,
+		if (hypercall::read_guest_virtual_memory(&flink, eprocess + nt->eprocess_active_process_links, sys::current_cr3,
 		                                        sizeof(flink)) != sizeof(flink) || flink == 0)
 		{
 			break;
 		}
 
-		eprocess = flink - eprocess_active_process_links;
+		eprocess = flink - nt->eprocess_active_process_links;
 
 		if (eprocess == first)
 		{
@@ -1987,10 +1987,11 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 	std::uint64_t kernel_directory()
 	{
+		const nt_offsets_t* const nt = nt_offsets_current();
 		const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
 		const auto system_process = aliases.find("ntoskrnl.exe!PsInitialSystemProcess");
 
-		if (system_process == aliases.end())
+		if (nt == nullptr || system_process == aliases.end())
 		{
 			return 0;
 		}
@@ -2006,7 +2007,7 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 		std::uint64_t directory = 0;
 
-		if (hypercall::read_guest_virtual_memory(&directory, eprocess + eprocess_directory_table_base, sys::current_cr3,
+		if (hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3,
 		                                        sizeof(directory)) != sizeof(directory) ||
 			directory == 0)
 		{

@@ -27,6 +27,9 @@
     <ClCompile Include="src\system\system.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\system\nt_offsets.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\hook\breakpoint.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -86,6 +89,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\system\system.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\system\nt_offsets.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\system\system_def.h">

@@ -128,6 +128,7 @@
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\script\script.cpp" />
     <ClCompile Include="src\system\system.cpp" />
+    <ClCompile Include="src\system\nt_offsets.cpp" />
   </ItemGroup>
   <ItemGroup>
     <MASM Include="src\hypercall\vmexit.asm" />
@@ -154,6 +155,7 @@
     <ClInclude Include="src\logs\logs.h" />
     <ClInclude Include="src\script\script.h" />
     <ClInclude Include="src\system\system.h" />
+    <ClInclude Include="src\system\nt_offsets.h" />
     <ClInclude Include="src\system\system_def.h" />
   </ItemGroup>
   <ItemGroup>

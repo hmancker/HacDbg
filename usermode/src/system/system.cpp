@@ -1,4 +1,5 @@
 #include "system.h"
+#include "nt_offsets.h"
 
 #include <algorithm>
 #include <filesystem>
@@ -507,6 +508,13 @@ static std::uint8_t parse_ntoskrnl()
 	const auto* const ntoskrnl_image = reinterpret_cast<const portable_executable::image_t*>(ntoskrnl_dump.data());
 
 	add_module_to_list("ntoskrnl.exe", ntoskrnl_dump, ntoskrnl_info->base_address, ntoskrnl_info->size);
+
+	if (nt_offsets_select_from_image(ntoskrnl_dump) == 0)
+	{
+		LOG_ERR("unable to select windows kernel offsets");
+
+		return 0;
+	}
 
 	const std::uint64_t kernel_detour_holder_base = find_kernel_detour_holder_base_address(
 		ntoskrnl_image, ntoskrnl_info->base_address);
