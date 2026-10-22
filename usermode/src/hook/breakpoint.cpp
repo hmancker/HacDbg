@@ -2703,11 +2703,88 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 	}
 
 
+//
+// User execution on Intel uses EPROCESS.UserDirectoryTableBase while KVA
+// shadow is on. DirectoryTableBase is the kernel directory and does not match
+// the CR3 seen at the breakpoint. AMD leaves the user directory empty, so the
+// kernel directory stays in use.
+//
+static std::uint64_t user_execution_cr3(const std::uint64_t cr3, const std::uint64_t address)
+{
+	const nt_offsets_t* const nt = nt_offsets_current();
+	const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
+	const auto system_process = aliases.find("ntoskrnl.exe!PsInitialSystemProcess");
+
+	if (nt == nullptr || nt->eprocess_user_directory_table_base == 0 || system_process == aliases.end() ||
+		sys::current_cr3 == 0)
+	{
+		return cr3;
+	}
+
+	std::uint64_t eprocess = 0;
+
+	if (hypercall::read_guest_virtual_memory(&eprocess, system_process->second, sys::current_cr3, sizeof(eprocess)) !=
+			sizeof(eprocess) || eprocess == 0)
+	{
+		return cr3;
+	}
+
+	const std::uint64_t first = eprocess;
+
+	for (std::uint64_t count = 0; count < 4096 && eprocess != 0; count++)
+	{
+		std::uint64_t directory = 0;
+		std::uint64_t user_directory = 0;
+
+		const std::uint8_t have_directory = static_cast<std::uint8_t>(
+			hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3,
+			                                     sizeof(directory)) == sizeof(directory) &&
+			(directory & cr3_address_mask) != 0);
+		const std::uint8_t have_user = static_cast<std::uint8_t>(
+			hypercall::read_guest_virtual_memory(&user_directory, eprocess + nt->eprocess_user_directory_table_base,
+			                                     sys::current_cr3, sizeof(user_directory)) == sizeof(user_directory) &&
+			(user_directory & cr3_address_mask) != 0);
+		const std::uint8_t matches = static_cast<std::uint8_t>(
+			(have_directory == 1 && (directory & cr3_address_mask) == (cr3 & cr3_address_mask)) ||
+			(have_user == 1 && (user_directory & cr3_address_mask) == (cr3 & cr3_address_mask)));
+
+		if (matches == 1 && have_user == 1 &&
+			hypercall::translate_guest_virtual_address(address, user_directory) != 0)
+		{
+			return user_directory;
+		}
+
+		if (matches == 1)
+		{
+			return cr3;
+		}
+
+		std::uint64_t flink = 0;
+
+		if (hypercall::read_guest_virtual_memory(&flink, eprocess + nt->eprocess_active_process_links, sys::current_cr3,
+		                                        sizeof(flink)) != sizeof(flink) || flink == 0)
+		{
+			break;
+		}
+
+		eprocess = flink - nt->eprocess_active_process_links;
+
+		if (eprocess == first)
+		{
+			break;
+		}
+	}
+
+	return cr3;
+}
+
 std::uint8_t breakpoint::add(const std::uint64_t address, const std::uint64_t cr3, std::uint64_t& id_out)
 {
+	const std::uint64_t effective_cr3 = is_user_address(address) == 1 && cr3 != 0 ? user_execution_cr3(cr3, address) : cr3;
+
 	for (const breakpoint_t& breakpoint : breakpoints)
 	{
-		if (breakpoint.address == address && breakpoint.cr3 == cr3)
+		if (breakpoint.address == address && breakpoint.cr3 == effective_cr3)
 		{
 			LOG_ERR("breakpoint already exists");
 
@@ -2720,7 +2797,7 @@ std::uint8_t breakpoint::add(const std::uint64_t address, const std::uint64_t cr
 		return install_kernel_pause(address, cr3, id_out);
 	}
 
-	const std::uint64_t translate_cr3 = cr3 == 0 ? sys::current_cr3 : cr3;
+	const std::uint64_t translate_cr3 = effective_cr3 == 0 ? sys::current_cr3 : effective_cr3;
 
 	if (translate_cr3 == 0)
 	{
@@ -2811,7 +2888,7 @@ std::uint8_t breakpoint::add(const std::uint64_t address, const std::uint64_t cr
 		page = &new_page;
 	}
 
-	return install_user_pause(address, cr3, translate_cr3, page_physical, page_offset, page, created_page, new_page,
+	return install_user_pause(address, effective_cr3, translate_cr3, page_physical, page_offset, page, created_page, new_page,
 	                          aligned_bytes.first, aligned_bytes.second, jump_size, id_out);
 }
 
