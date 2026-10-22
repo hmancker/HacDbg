@@ -3984,8 +3984,18 @@ static std::uint64_t guest_user_directory(const std::uint64_t eprocess, const nt
 
 	if (row.eprocess_user_directory_table_base == 0 ||
 		hypercall::read_guest_virtual_memory(&user_directory, eprocess + row.eprocess_user_directory_table_base, sys::current_cr3,
-		                                     sizeof(user_directory)) != sizeof(user_directory) ||
-		user_directory == 0)
+		                                     sizeof(user_directory)) != sizeof(user_directory))
+	{
+		return directory;
+	}
+
+	//
+	// A zero page frame is not a page table. The field is 0 when this build
+	// has no user directory, and it is 1 after the KVA shadow page is
+	// released while PCID flush is enabled. The low 12 bits of a live
+	// directory are PCID flags.
+	//
+	if ((user_directory & ~0xFFFull) == 0)
 	{
 		return directory;
 	}
