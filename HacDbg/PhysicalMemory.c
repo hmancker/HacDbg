@@ -12,6 +12,7 @@
 
 #define HACDBG_PHYSICAL_TAG        'PcaH'
 #define HACDBG_PHYSICAL_MAP_CHUNK  0x200000ull
+#define HACDBG_KERNEL_DIRECTORY_SLOTS 16
 #define PHYSICAL_PTE_FRAME         0x000FFFFFFFFFF000ull
 #define PHYSICAL_PTE_PRESENT       0x1ull
 #define PHYSICAL_PTE_WRITE         0x2ull
@@ -19,7 +20,11 @@
 #define PHYSICAL_PTE_ACCESSED      0x20ull
 #define PHYSICAL_PTE_DIRTY         0x40ull
 #define PHYSICAL_PTE_NX            (1ull << 63)
+#define PHYSICAL_PTE_PROTOTYPE     (1ull << 10)
+#define PHYSICAL_PTE_TRANSITION    (1ull << 11)
+#define PHYSICAL_TRANSITION_PFN    0xFFFFFFFFFull
 #define PHYSICAL_CR4_LA57          (1ull << 12)
+#define PHYSICAL_REGION_SHIFT      30
 
 typedef struct _PHYSICAL_RANGE
 {
@@ -44,6 +49,25 @@ static volatile LONG g_PhysicalFailureLogCount;
 static volatile LONG g_TranslationFailureLogCount;
 static PHYSICAL_MAP_SLOT* g_MapSlots;
 static ULONG g_MapSlotCount;
+static volatile LONG g_GuestRunning;
+static volatile LONG64 g_KernelDirectories[HACDBG_KERNEL_DIRECTORY_SLOTS];
+static volatile LONG64 g_DirectoryForPml4[512];
+
+typedef enum _PHYSICAL_WALK_STATUS
+{
+    PHYSICAL_WALK_MAPPED = 0,
+    PHYSICAL_WALK_MISSING_REGION,
+    PHYSICAL_WALK_NOT_PRESENT,
+    PHYSICAL_WALK_NOT_RESIDENT,
+    PHYSICAL_WALK_READ_FAILED
+} PHYSICAL_WALK_STATUS;
+
+typedef enum _SOFTWARE_PTE_RESULT
+{
+    SOFTWARE_PTE_MAPPED = 0,
+    SOFTWARE_PTE_NOT_RESIDENT,
+    SOFTWARE_PTE_FAILED
+} SOFTWARE_PTE_RESULT;
 
 // 每条失败路径最多打印 64 次，避免刷屏。
 static BOOLEAN
@@ -458,6 +482,69 @@ PhysicalMemorySetFiveLevelPaging(
     g_FiveLevelPaging = Enabled;
 }
 
+// 客户全部离开后，丢掉会话目录。这些物理页在下一次启动后可能被复用。
+static VOID
+PhysicalMemoryForgetKernelDirectories(
+    VOID
+    )
+{
+    ULONG index;
+
+    for (index = 0; index < HACDBG_KERNEL_DIRECTORY_SLOTS; index++)
+    {
+        InterlockedExchange64(&g_KernelDirectories[index], 0);
+    }
+
+    for (index = 0; index < 512; index++)
+    {
+        InterlockedExchange64(&g_DirectoryForPml4[index], 0);
+    }
+}
+
+// 客户还在跑时，物理读不能走会发 IPI 的复制。
+VOID
+PhysicalMemorySetGuestRunning(
+    _In_ BOOLEAN Active
+    )
+{
+    InterlockedExchange(&g_GuestRunning, Active != FALSE ? 1 : 0);
+    if (Active == FALSE)
+    {
+        PhysicalMemoryForgetKernelDirectories();
+    }
+}
+
+// 记下一份 CPL 0 的内核页表根。表满后不再替换，避免把早期的会话目录挤掉。
+VOID
+PhysicalMemoryRememberKernelDirectory(
+    _In_ UINT64 Cr3
+    )
+{
+    UINT64 directory = Cr3 & PHYSICAL_PTE_FRAME;
+    ULONG index;
+
+    if (directory == 0)
+    {
+        return;
+    }
+
+    for (index = 0; index < HACDBG_KERNEL_DIRECTORY_SLOTS; index++)
+    {
+        LONG64 current = g_KernelDirectories[index];
+
+        if ((UINT64)current == directory)
+        {
+            return;
+        }
+
+        if (current == 0 &&
+            InterlockedCompareExchange64(&g_KernelDirectories[index], (LONG64)directory, 0) == 0)
+        {
+            return;
+        }
+    }
+}
+
 // 临时映射一页客户 RAM。不用 MmMapIoSpace：那条路径在调试器连接时
 // 映射 PFN 数据库里的页会蓝屏 0x1A/0x1233。
 PVOID
@@ -589,7 +676,13 @@ PhysicalMemoryUnmapTemporary(
     }
 }
 
-// 按页跨页复制；读优先 MmCopyMemory，写使用临时映射。
+//
+// 按页跨页复制。客户还在跑时，读也走临时映射。
+// MmCopyMemory 在 Windows 10 上会通过 hyperspace 发 TLB 刷新 IPI。
+// 其它处理器若仍在客户里，这条 IPI 会被客户的 KiIpiProcessRequests 接走。
+// 刷新描述符在宿主栈上，而宿主栈已被 NPT/EPT 换成零页，客户读到空指针后
+// 以 IRQL_NOT_LESS_OR_EQUAL（0xA）停机。
+//
 static SIZE_T
 PhysicalMemoryCopy(
     _In_ GUEST_PHYSICAL_ADDRESS Address,
@@ -612,7 +705,9 @@ PhysicalMemoryCopy(
             break;
         }
 
-        if (ToGuest == FALSE && KeGetCurrentIrql() <= APC_LEVEL)
+        if (ToGuest == FALSE &&
+            InterlockedCompareExchange(&g_GuestRunning, 0, 0) == 0 &&
+            KeGetCurrentIrql() <= APC_LEVEL)
         {
             MM_COPY_ADDRESS copyAddress = { 0 };
             SIZE_T transferred = 0;
@@ -697,16 +792,103 @@ PhysicalMemoryWrite(
     return PhysicalMemoryCopy(Address, (PVOID)Buffer, Size, TRUE);
 }
 
-// 按 CR3 遍历四/五级页表，支持 4 KiB、2 MiB 和 1 GiB 页。
-BOOLEAN
-_Success_(return != FALSE)
-GuestVirtualToPhysical(
+static PHYSICAL_WALK_STATUS
+PhysicalMemoryWalk(
+    _In_ UINT64 Cr3,
+    _In_ GUEST_VIRTUAL_ADDRESS VirtualAddress,
+    _Out_ GUEST_PHYSICAL_ADDRESS* PhysicalAddress
+    );
+
+// 把软件 PTE 里的原型地址按当前分页宽度做符号扩展。
+static UINT64
+PhysicalMemoryCanonicalAddress(
+    _In_ UINT64 Value
+    )
+{
+    UINT64 sign = g_FiveLevelPaging != FALSE ? (1ull << 56) : (1ull << 47);
+
+    if ((Value & sign) != 0)
+    {
+        Value |= ~(sign - 1);
+    }
+
+    return Value;
+}
+
+//
+// Windows 软件 PTE。bit 11 优先于 bit 10：置位时页仍在内存里，PFN 在
+// bits 47:12。bit 11 为 0 且 bit 10 置位时，bits 63:16 是原型 PTE 的
+// 虚拟地址，符号扩展后按同一份 CR3 再读。页文件上的页没有 PFN。
+//
+static SOFTWARE_PTE_RESULT
+PhysicalMemoryResolveSoftwarePte(
+    _In_ UINT64 Cr3,
+    _In_ UINT64 Entry,
+    _In_ GUEST_VIRTUAL_ADDRESS VirtualAddress,
+    _Out_ GUEST_PHYSICAL_ADDRESS* PhysicalAddress,
+    _In_ ULONG Depth
+    )
+{
+    UINT64 pageOffset = VirtualAddress.Value & (PAGE_SIZE - 1);
+
+    if ((Entry & PHYSICAL_PTE_PRESENT) != 0)
+    {
+        PhysicalAddress->Value = (Entry & PHYSICAL_PTE_FRAME) + pageOffset;
+        return SOFTWARE_PTE_MAPPED;
+    }
+
+    if ((Entry & PHYSICAL_PTE_TRANSITION) != 0)
+    {
+        UINT64 frame = (Entry >> PAGE_SHIFT) & PHYSICAL_TRANSITION_PFN;
+
+        if (frame == 0)
+        {
+            return SOFTWARE_PTE_NOT_RESIDENT;
+        }
+
+        PhysicalAddress->Value = (frame << PAGE_SHIFT) + pageOffset;
+        return SOFTWARE_PTE_MAPPED;
+    }
+
+    //
+    // 0xA0 这类项没有 PFN。页还在映像文件里，没有调入内存。
+    //
+    if ((Entry & PHYSICAL_PTE_PROTOTYPE) == 0 || Depth >= 3)
+    {
+        return (Entry & PHYSICAL_PTE_PROTOTYPE) == 0 ? SOFTWARE_PTE_NOT_RESIDENT : SOFTWARE_PTE_FAILED;
+    }
+
+    {
+        GUEST_VIRTUAL_ADDRESS prototype = HacDbgGuestVirtualAddress(
+            PhysicalMemoryCanonicalAddress(Entry >> 16));
+        GUEST_PHYSICAL_ADDRESS prototypePhysical;
+        UINT64 prototypeEntry = 0;
+
+        if (PhysicalMemoryWalk(Cr3, prototype, &prototypePhysical) != PHYSICAL_WALK_MAPPED)
+        {
+            return SOFTWARE_PTE_FAILED;
+        }
+
+        if (PhysicalMemoryRead(prototypePhysical, &prototypeEntry, sizeof(prototypeEntry)) !=
+            sizeof(prototypeEntry))
+        {
+            return SOFTWARE_PTE_FAILED;
+        }
+
+        return PhysicalMemoryResolveSoftwarePte(Cr3, prototypeEntry, VirtualAddress, PhysicalAddress,
+                                                Depth + 1);
+    }
+}
+
+// 按一份 CR3 遍历四/五级页表，支持 4 KiB、2 MiB 和 1 GiB 页。不打印。
+static PHYSICAL_WALK_STATUS
+PhysicalMemoryWalk(
     _In_ UINT64 Cr3,
     _In_ GUEST_VIRTUAL_ADDRESS VirtualAddress,
     _Out_ GUEST_PHYSICAL_ADDRESS* PhysicalAddress
     )
 {
-    UINT64 table = Cr3 & 0x000FFFFFFFFFF000ull;
+    UINT64 table = Cr3 & PHYSICAL_PTE_FRAME;
     UINT64 offset;
     UINT64 entry = 0;
     UINT8 level;
@@ -723,47 +905,231 @@ GuestVirtualToPhysical(
 
         if (read != sizeof(entry))
         {
-            if (PhysicalMemoryShouldLogFailure(&g_TranslationFailureLogCount) != FALSE)
-            {
-                HACDBG_LOG("HacDbg: Err, VA walk read failed level=%u cr3=0x%I64x va=0x%I64x "
-                         "entry_pa=0x%I64x read=%I64x.\n",
-                         level, Cr3, VirtualAddress.Value, entryAddress.Value, (UINT64)read);
-            }
-            return FALSE;
+            return PHYSICAL_WALK_READ_FAILED;
         }
 
-        if ((entry & 1ull) == 0)
+        if ((entry & PHYSICAL_PTE_PRESENT) == 0)
         {
-            if (PhysicalMemoryShouldLogFailure(&g_TranslationFailureLogCount) != FALSE)
+            //
+            // 4 KiB 叶子上的软件 PTE 仍可能指向内存里的页。PML4 或 PDPT
+            // 缺失是整段区域不在这份目录里，会话空间在系统进程目录上就是
+            // 这种情况，不能当成过渡页。
+            //
+            if (shift == 12)
             {
-                HACDBG_LOG("HacDbg: Err, VA walk not present level=%u cr3=0x%I64x va=0x%I64x "
-                         "entry_pa=0x%I64x entry=0x%I64x.\n",
-                         level, Cr3, VirtualAddress.Value, entryAddress.Value, entry);
+                SOFTWARE_PTE_RESULT software = PhysicalMemoryResolveSoftwarePte(
+                    Cr3, entry, VirtualAddress, PhysicalAddress, 0);
+
+                if (software == SOFTWARE_PTE_MAPPED)
+                {
+                    return PHYSICAL_WALK_MAPPED;
+                }
+
+                PhysicalAddress->Value = 0;
+
+                if (software == SOFTWARE_PTE_NOT_RESIDENT)
+                {
+                    return PHYSICAL_WALK_NOT_RESIDENT;
+                }
             }
-            return FALSE;
+
+            PhysicalAddress->Value = 0;
+
+            if (shift >= PHYSICAL_REGION_SHIFT)
+            {
+                return PHYSICAL_WALK_MISSING_REGION;
+            }
+
+            return PHYSICAL_WALK_NOT_PRESENT;
         }
 
-        if (shift == 30 && (entry & (1ull << 7)) != 0)
+        if (shift == 30 && (entry & PHYSICAL_PTE_LARGE) != 0)
         {
             offset = VirtualAddress.Value & 0x3fffffffull;
             PhysicalAddress->Value = (entry & 0x000FFFFFC0000000ull) + offset;
-            return TRUE;
+            return PHYSICAL_WALK_MAPPED;
         }
 
-        if (shift == 21 && (entry & (1ull << 7)) != 0)
+        if (shift == 21 && (entry & PHYSICAL_PTE_LARGE) != 0)
         {
             offset = VirtualAddress.Value & 0x1fffffull;
             PhysicalAddress->Value = (entry & 0x000FFFFFFFE00000ull) + offset;
-            return TRUE;
+            return PHYSICAL_WALK_MAPPED;
         }
 
-        table = entry & 0x000FFFFFFFFFF000ull;
+        table = entry & PHYSICAL_PTE_FRAME;
     }
 
     offset = VirtualAddress.Value & 0xfffull;
-    PhysicalAddress->Value = (entry & 0x000FFFFFFFFFF000ull) + offset;
+    PhysicalAddress->Value = (entry & PHYSICAL_PTE_FRAME) + offset;
+    return PHYSICAL_WALK_MAPPED;
+}
 
-    return TRUE;
+static BOOLEAN
+PhysicalMemoryIsKernelAddress(
+    _In_ UINT64 VirtualAddress
+    )
+{
+    UINT64 signBit = g_FiveLevelPaging != FALSE ? (1ull << 56) : (1ull << 47);
+
+    return (VirtualAddress & signBit) != 0;
+}
+
+static BOOLEAN
+PhysicalMemoryKernelDirectoryKnown(
+    _In_ UINT64 Cr3
+    )
+{
+    UINT64 directory = Cr3 & PHYSICAL_PTE_FRAME;
+    ULONG index;
+
+    for (index = 0; index < HACDBG_KERNEL_DIRECTORY_SLOTS; index++)
+    {
+        if ((UINT64)g_KernelDirectories[index] == directory)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static VOID
+PhysicalMemoryLogWalkFailure(
+    _In_ UINT64 Cr3,
+    _In_ GUEST_VIRTUAL_ADDRESS VirtualAddress
+    )
+{
+    UINT64 table = Cr3 & PHYSICAL_PTE_FRAME;
+    UINT64 entry = 0;
+    UINT8 level;
+    UINT8 levels = g_FiveLevelPaging != FALSE ? 5 : 4;
+    UINT64 shift = g_FiveLevelPaging != FALSE ? 48 : 39;
+
+    if (PhysicalMemoryShouldLogFailure(&g_TranslationFailureLogCount) == FALSE)
+    {
+        return;
+    }
+
+    for (level = 0; level < levels; level++, shift -= 9)
+    {
+        UINT64 index = (VirtualAddress.Value >> shift) & 0x1ffull;
+        GUEST_PHYSICAL_ADDRESS entryAddress = HacDbgGuestPhysicalAddress(table + (index * sizeof(UINT64)));
+        SIZE_T read = PhysicalMemoryRead(entryAddress, &entry, sizeof(entry));
+
+        if (read != sizeof(entry))
+        {
+            HACDBG_LOG("HacDbg: Err, VA walk read failed level=%u cr3=0x%I64x va=0x%I64x "
+                     "entry_pa=0x%I64x read=%I64x.\n",
+                     level, Cr3, VirtualAddress.Value, entryAddress.Value, (UINT64)read);
+            return;
+        }
+
+        if ((entry & PHYSICAL_PTE_PRESENT) == 0)
+        {
+            HACDBG_LOG("HacDbg: Err, VA walk not present level=%u cr3=0x%I64x va=0x%I64x "
+                     "entry_pa=0x%I64x entry=0x%I64x.\n",
+                     level, Cr3, VirtualAddress.Value, entryAddress.Value, entry);
+            return;
+        }
+
+        if ((shift == 30 || shift == 21) && (entry & PHYSICAL_PTE_LARGE) != 0)
+        {
+            return;
+        }
+
+        table = entry & PHYSICAL_PTE_FRAME;
+    }
+}
+
+// 按 CR3 遍历四/五级页表。内核半区的 PML4/PDPT 缺失时，改用其它 CPL 0 目录。
+BOOLEAN
+_Success_(return != FALSE)
+GuestVirtualToPhysical(
+    _In_ UINT64 Cr3,
+    _In_ GUEST_VIRTUAL_ADDRESS VirtualAddress,
+    _Out_ GUEST_PHYSICAL_ADDRESS* PhysicalAddress,
+    _Out_opt_ BOOLEAN* NotResident
+    )
+{
+    PHYSICAL_WALK_STATUS status = PhysicalMemoryWalk(Cr3, VirtualAddress, PhysicalAddress);
+    UINT64 primary = Cr3 & PHYSICAL_PTE_FRAME;
+    ULONG pml4Index;
+    ULONG index;
+
+    if (NotResident != NULL)
+    {
+        *NotResident = FALSE;
+    }
+
+    if (status == PHYSICAL_WALK_MAPPED)
+    {
+        return TRUE;
+    }
+
+    if (status == PHYSICAL_WALK_NOT_RESIDENT)
+    {
+        if (NotResident != NULL)
+        {
+            *NotResident = TRUE;
+        }
+
+        return FALSE;
+    }
+
+    //
+    // 系统进程的内核目录没有会话空间。win32k 的 PML4E 在那里是 0。
+    // 只对已记下的内核目录、并且缺的是 1 GiB 以上的区域才改用其它目录。
+    // 用户地址和已经不在内存里的页不改目录，避免读到另一个进程的页。
+    //
+    if (status != PHYSICAL_WALK_MISSING_REGION ||
+        PhysicalMemoryIsKernelAddress(VirtualAddress.Value) == FALSE ||
+        PhysicalMemoryKernelDirectoryKnown(primary) == FALSE)
+    {
+        PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
+        return FALSE;
+    }
+
+    if (g_FiveLevelPaging == FALSE)
+    {
+        UINT64 preferred;
+
+        pml4Index = (ULONG)((VirtualAddress.Value >> 39) & 0x1ffull);
+        preferred = (UINT64)g_DirectoryForPml4[pml4Index];
+        if (preferred != 0 && preferred != primary)
+        {
+            if (PhysicalMemoryWalk(preferred, VirtualAddress, PhysicalAddress) == PHYSICAL_WALK_MAPPED)
+            {
+                return TRUE;
+            }
+
+            InterlockedCompareExchange64(&g_DirectoryForPml4[pml4Index], 0, (LONG64)preferred);
+        }
+    }
+
+    for (index = 0; index < HACDBG_KERNEL_DIRECTORY_SLOTS; index++)
+    {
+        UINT64 alternate = (UINT64)g_KernelDirectories[index];
+
+        if (alternate == 0 || alternate == primary)
+        {
+            continue;
+        }
+
+        if (PhysicalMemoryWalk(alternate, VirtualAddress, PhysicalAddress) == PHYSICAL_WALK_MAPPED)
+        {
+            if (g_FiveLevelPaging == FALSE)
+            {
+                pml4Index = (ULONG)((VirtualAddress.Value >> 39) & 0x1ffull);
+                InterlockedExchange64(&g_DirectoryForPml4[pml4Index], (LONG64)alternate);
+            }
+
+            return TRUE;
+        }
+    }
+
+    PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
+    return FALSE;
 }
 
 // 按页把客户虚拟地址复制到宿主缓冲区或写回客户。
@@ -791,11 +1157,17 @@ GuestVirtualCopy(
         SIZE_T chunk;
         SIZE_T actual;
 
-        if (GuestVirtualToPhysical(Cr3, current, &physical) == FALSE)
+        BOOLEAN notResident = FALSE;
+
+        if (GuestVirtualToPhysical(Cr3, current, &physical, &notResident) == FALSE)
         {
-            HACDBG_LOG("HacDbg: Err, guest virtual copy translation failed cr3=0x%I64x va=0x%I64x "
-                     "offset=0x%I64x.\n",
-                     Cr3, current.Value, (UINT64)copied);
+            if (notResident == FALSE)
+            {
+                HACDBG_LOG("HacDbg: Err, guest virtual copy translation failed cr3=0x%I64x va=0x%I64x "
+                         "offset=0x%I64x.\n",
+                         Cr3, current.Value, (UINT64)copied);
+            }
+
             break;
         }
 

@@ -11,6 +11,7 @@
 #include "Debug.h"
 #include "Ept.h"
 #include "Hypercall.h"
+#include "PhysicalMemory.h"
 #include "Svm.h"
 
 #include <intrin.h>
@@ -2195,6 +2196,11 @@ VmxVirtualizeProcessor(
         }
     }
 #endif
+    //
+    // Leave MmCopyMemory disabled before the first VM-entry. A TLB-shootdown
+    // IPI from that API is delivered to processors that are still guests.
+    //
+    PhysicalMemorySetGuestRunning(TRUE);
     VmxLaunchVm(ProcessorContext, ProcessorContext->HostRsp);
     VmxExitVmxRoot(ProcessorContext);
     ProcessorContext->Virtualized = FALSE;
@@ -2362,6 +2368,16 @@ VmxStopAllProcessors(
         VmxStopProcessor(g_Processors[index]);
         KeRevertToUserGroupAffinityThread(&previous);
     }
+
+    for (index = 0; index < g_ProcessorCount; index++)
+    {
+        if (g_Processors[index] != NULL && g_Processors[index]->Virtualized != FALSE)
+        {
+            return;
+        }
+    }
+
+    PhysicalMemorySetGuestRunning(FALSE);
 }
 
 NTSTATUS

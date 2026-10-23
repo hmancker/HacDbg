@@ -55,7 +55,8 @@ static UINT64 g_KernelCr3;
 
 //
 // 记录内核页表根。三环 CPUID 退出时的客户 CR3 在 KPTI 下是用户目录，
-// 不能用来翻译内核地址。
+// 不能用来翻译内核地址。系统进程目录也没有会话空间，所以每个不同的
+// CPL 0 目录都留一份，供 win32k 这类地址改用。
 //
 VOID
 HypercallNoteKernelCr3(
@@ -67,6 +68,7 @@ HypercallNoteKernelCr3(
     if (directory != 0)
     {
         g_KernelCr3 = directory;
+        PhysicalMemoryRememberKernelDirectory(directory);
     }
 }
 
@@ -263,10 +265,16 @@ HypercallCopyPhysical(
         GUEST_VIRTUAL_ADDRESS guestVirtual = HacDbgGuestVirtualAddress(GuestVirtual + copied);
         UINT64 chunk;
 
-        if (GuestVirtualToPhysical(CurrentCr3, guestVirtual, &bufferPhysical) == FALSE)
+        BOOLEAN bufferAbsent = FALSE;
+
+        if (GuestVirtualToPhysical(CurrentCr3, guestVirtual, &bufferPhysical, &bufferAbsent) == FALSE)
         {
-            HACDBG_LOG("HacDbg: Err, physical copy buffer translation failed cr3=0x%I64x va=0x%I64x\n",
-                     CurrentCr3, guestVirtual.Value);
+            if (bufferAbsent == FALSE)
+            {
+                HACDBG_LOG("HacDbg: Err, physical copy buffer translation failed cr3=0x%I64x va=0x%I64x\n",
+                         CurrentCr3, guestVirtual.Value);
+            }
+
             break;
         }
 
@@ -349,14 +357,21 @@ HypercallCopyVirtual(
         UINT64 virtualPageLeft;
         UINT64 chunk;
 
+        BOOLEAN destinationAbsent = FALSE;
+        BOOLEAN sourceAbsent = FALSE;
+
         if (GuestVirtualToPhysical(destinationCr3, HacDbgGuestVirtualAddress(destinationVa + copied),
-                                   &destinationPhysical) == FALSE ||
+                                   &destinationPhysical, &destinationAbsent) == FALSE ||
             GuestVirtualToPhysical(sourceCr3, HacDbgGuestVirtualAddress(sourceVa + copied),
-                                   &sourcePhysical) == FALSE)
+                                   &sourcePhysical, &sourceAbsent) == FALSE)
         {
-            HACDBG_LOG("HacDbg: Err, virtual copy translation failed dest_cr3=0x%I64x dest_va=0x%I64x "
-                     "src_cr3=0x%I64x src_va=0x%I64x\n",
-                     destinationCr3, destinationVa + copied, sourceCr3, sourceVa + copied);
+            if (destinationAbsent == FALSE && sourceAbsent == FALSE)
+            {
+                HACDBG_LOG("HacDbg: Err, virtual copy translation failed dest_cr3=0x%I64x dest_va=0x%I64x "
+                         "src_cr3=0x%I64x src_va=0x%I64x\n",
+                         destinationCr3, destinationVa + copied, sourceCr3, sourceVa + copied);
+            }
+
             break;
         }
 
@@ -430,7 +445,8 @@ HypercallExecute(
     case translate_guest_virtual_address:
     {
         GUEST_PHYSICAL_ADDRESS physical = { 0 };
-        if (GuestVirtualToPhysical(registers->R8, HacDbgGuestVirtualAddress(registers->Rdx), &physical) != FALSE)
+        if (GuestVirtualToPhysical(registers->R8, HacDbgGuestVirtualAddress(registers->Rdx), &physical,
+                                   NULL) != FALSE)
         {
             result = physical.Value;
         }

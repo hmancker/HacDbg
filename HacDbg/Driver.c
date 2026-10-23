@@ -186,6 +186,8 @@ SvmVirtualizeProcessor(
     __svm_clgi();
 
     // HostStack 是本处理器独占的 32 KiB 非分页栈。
+    // 进入客户前关掉 MmCopyMemory。它发出的 TLB IPI 会被仍在客户里的处理器接走。
+    PhysicalMemorySetGuestRunning(TRUE);
     SvmLaunchVm(ProcessorContext,
                 (PVOID)((ULONG_PTR)ProcessorContext->HostStack + 0x8000));
 }
@@ -365,6 +367,16 @@ SvmStopAllProcessors(
         SvmStopProcessor(g_Contexts[index]);
         KeRevertToUserGroupAffinityThread(&oldAffinity);
     }
+
+    for (index = 0; index < g_ProcessorCount; index++)
+    {
+        if (g_Contexts[index] != NULL && g_Contexts[index]->Virtualized != FALSE)
+        {
+            return;
+        }
+    }
+
+    PhysicalMemorySetGuestRunning(FALSE);
 }
 
 // 恢复 S0 后重新虚拟化所有处理器。

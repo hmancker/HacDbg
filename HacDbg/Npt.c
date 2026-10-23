@@ -415,7 +415,7 @@ NptGuestRipPage(
 {
     GUEST_PHYSICAL_ADDRESS physical = { 0 };
 
-    if (GuestVirtualToPhysical(GuestCr3, HacDbgGuestVirtualAddress(GuestRip), &physical) == FALSE)
+    if (GuestVirtualToPhysical(GuestCr3, HacDbgGuestVirtualAddress(GuestRip), &physical, NULL) == FALSE)
     {
         return ~0ull;
     }

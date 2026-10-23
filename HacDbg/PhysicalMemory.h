@@ -31,6 +31,37 @@ PhysicalMemorySetFiveLevelPaging(
 
 VOID
 /**
+ * @brief Records whether any logical processor may still be in the guest.
+ *
+ * @param Active TRUE before the first guest entry. FALSE only after every
+ * processor has left the guest.
+ *
+ * @details While this is TRUE, physical reads must not call MmCopyMemory.
+ * That API can send a TLB-shootdown IPI. Other processors are still in the
+ * guest, so the IPI is delivered to the guest. The flush descriptor sits on
+ * the host stack, which nested paging hides, and the guest reads zeros.
+ * FALSE also drops kernel directories recorded for session-space translation.
+ */
+PhysicalMemorySetGuestRunning(
+    _In_ BOOLEAN Active
+    );
+
+VOID
+/**
+ * @brief Records a kernel page-table root observed at CPL 0.
+ *
+ * @param Cr3 Guest CR3. PCID bits are ignored.
+ *
+ * @details The system process directory does not map session space. A later
+ * kernel-address walk that misses in the caller's directory tries the
+ * directories recorded here.
+ */
+PhysicalMemoryRememberKernelDirectory(
+    _In_ UINT64 Cr3
+    );
+
+VOID
+/**
  * @brief Releases the RAM range table.
  */
 PhysicalMemoryCleanup(
@@ -106,13 +137,16 @@ _Success_(return != FALSE)
  * @param Cr3 Guest page table root.
  * @param VirtualAddress Guest virtual address.
  * @param PhysicalAddress Receives the translated guest physical address.
+ * @param NotResident Receives TRUE when the leaf was read and has no PFN.
+ * A page that was never faulted in is not a driver fault.
  *
  * @return TRUE when a mapping exists; otherwise FALSE.
  */
 GuestVirtualToPhysical(
     _In_ UINT64 Cr3,
     _In_ GUEST_VIRTUAL_ADDRESS VirtualAddress,
-    _Out_ GUEST_PHYSICAL_ADDRESS* PhysicalAddress
+    _Out_ GUEST_PHYSICAL_ADDRESS* PhysicalAddress,
+    _Out_opt_ BOOLEAN* NotResident
     );
 
 SIZE_T
