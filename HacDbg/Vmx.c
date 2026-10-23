@@ -345,13 +345,45 @@ VmxGuestCpl(
     return (UINT32)((rights >> 5) & 3u);
 }
 
+static VOID
+VmxExitVmxRoot(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
+    )
+{
+    VMX_TABLE_REGISTER gdtr;
+    VMX_TABLE_REGISTER idtr;
+
+    //
+    // INVARIANT: This processor is in VMX root operation on its own VMCS.
+    // VMXOFF is not executed from SMM.
+    //
+    HacDbgVmxOff();
+    __writecr4(__readcr4() & ~VMX_CR4_VMXE);
+
+    if (ProcessorContext->DescriptorTablesSaved == FALSE)
+    {
+        return;
+    }
+
+    gdtr.Limit = ProcessorContext->SavedGdtrLimit;
+    gdtr.Base = ProcessorContext->SavedGdtrBase;
+    idtr.Limit = ProcessorContext->SavedIdtrLimit;
+    idtr.Base = ProcessorContext->SavedIdtrBase;
+
+    //
+    // INVARIANT: Saved bases and limits were read with SGDT and SIDT before
+    // this processor's first VM-exit. VM-exit forces both limits to FFFFH
+    // and VMXOFF leaves them there. Both tables are the kernel tables.
+    //
+    VmxWriteGdtr(&gdtr);
+    VmxWriteIdtr(&idtr);
+}
+
 static BOOLEAN
 VmxLeaveVmx(
     _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
     )
 {
-    UINT64 cr4;
-
     if (VmxRead(VMCS_GUEST_RIP, &ProcessorContext->GuestRip) == FALSE ||
         VmxRead(VMCS_GUEST_RSP, &ProcessorContext->GuestRsp) == FALSE ||
         VmxRead(VMCS_GUEST_RFLAGS, &ProcessorContext->GuestRflags) == FALSE ||
@@ -363,13 +395,7 @@ VmxLeaveVmx(
         ProcessorContext->GuestCr3 = __readcr3();
     }
 
-    //
-    // INVARIANT: This processor is in VMX root operation on its own VMCS.
-    // VMXOFF is not executed from SMM.
-    //
-    HacDbgVmxOff();
-    cr4 = __readcr4();
-    __writecr4(cr4 & ~VMX_CR4_VMXE);
+    VmxExitVmxRoot(ProcessorContext);
     ProcessorContext->Virtualized = FALSE;
     ProcessorContext->StopRequested = FALSE;
     ProcessorContext->LaunchCompleted = TRUE;
@@ -1899,6 +1925,11 @@ VmxFillVmcs(
 
     _sgdt(&gdtr);
     __sidt(&idtr);
+    ProcessorContext->SavedGdtrLimit = gdtr.Limit;
+    ProcessorContext->SavedGdtrBase = gdtr.Base;
+    ProcessorContext->SavedIdtrLimit = idtr.Limit;
+    ProcessorContext->SavedIdtrBase = idtr.Base;
+    ProcessorContext->DescriptorTablesSaved = TRUE;
     cr4 |= VMX_CR4_VMXE;
     __writecr0(cr0);
     if ((cr4 & VMX_CR4_PCIDE) == 0)
@@ -2125,8 +2156,14 @@ VmxVirtualizeProcessor(
 
         VmxRead(VMCS_VM_INSTRUCTION_ERROR, &error);
         HACDBG_LOG("HacDbg: Err, VMCS setup failed status=%u error=%u.\n", status, (UINT32)error);
-        HacDbgVmxOff();
-        __writecr4(__readcr4() & ~VMX_CR4_VMXE);
+        if (status == 0)
+        {
+            VmxExitVmxRoot(ProcessorContext);
+        }
+        else
+        {
+            __writecr4(__readcr4() & ~VMX_CR4_VMXE);
+        }
         ProcessorContext->Virtualized = FALSE;
         ProcessorContext->LaunchCompleted = TRUE;
         _enable();
@@ -2159,8 +2196,7 @@ VmxVirtualizeProcessor(
     }
 #endif
     VmxLaunchVm(ProcessorContext, ProcessorContext->HostRsp);
-    HacDbgVmxOff();
-    __writecr4(__readcr4() & ~VMX_CR4_VMXE);
+    VmxExitVmxRoot(ProcessorContext);
     ProcessorContext->Virtualized = FALSE;
     ProcessorContext->LaunchCompleted = TRUE;
     _enable();

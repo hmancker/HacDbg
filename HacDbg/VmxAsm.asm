@@ -203,4 +203,20 @@ VmxExitLeave:
         ret
 VmxExitEntry endp
 
+; RCX points at a packed 10-byte descriptor-table register: 16-bit limit, 64-bit base.
+; In 64-bit mode the processor reads 10 bytes. ml64 only accepts fword ptr here.
+VmxWriteGdtr proc
+        ; INVARIANT: RCX addresses a kernel GDTR image read before this
+        ; processor's first VM-exit. The GDT is still mapped.
+        lgdt    fword ptr [rcx]
+        ret
+VmxWriteGdtr endp
+
+VmxWriteIdtr proc
+        ; INVARIANT: RCX addresses a kernel IDTR image read before this
+        ; processor's first VM-exit. The IDT is still mapped.
+        lidt    fword ptr [rcx]
+        ret
+VmxWriteIdtr endp
+
 end

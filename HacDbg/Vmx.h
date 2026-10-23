@@ -291,6 +291,11 @@ typedef struct _VMX_PROCESSOR_CONTEXT
     UINT8 HostDeadlineValid;
     UINT64 GuestTscDeadline;
     UINT64 HostTscDeadline;
+    UINT16 SavedGdtrLimit;
+    UINT16 SavedIdtrLimit;
+    UINT64 SavedGdtrBase;
+    UINT64 SavedIdtrBase;
+    UINT8 DescriptorTablesSaved;
 } VMX_PROCESSOR_CONTEXT;
 
 NTSTATUS
@@ -440,6 +445,26 @@ VmxPtrld(
 EXTERN_C VOID
 HacDbgVmxOff(
     VOID
+    );
+
+EXTERN_C VOID
+/**
+ * @brief Loads a 10-byte GDTR image captured before the first VM-exit.
+ *
+ * @param TableRegister Pointer to a packed limit followed by a 64-bit base.
+ */
+VmxWriteGdtr(
+    _In_ const VOID* TableRegister
+    );
+
+EXTERN_C VOID
+/**
+ * @brief Loads a 10-byte IDTR image captured before the first VM-exit.
+ *
+ * @param TableRegister Pointer to a packed limit followed by a 64-bit base.
+ */
+VmxWriteIdtr(
+    _In_ const VOID* TableRegister
     );
 
 EXTERN_C UINT8
