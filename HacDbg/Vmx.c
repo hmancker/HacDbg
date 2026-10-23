@@ -58,6 +58,9 @@ C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, GuestCr3) == 0x80);
 C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, GuestRip) == 0x88);
 C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, GuestRsp) == 0x90);
 C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, GuestRflags) == 0x98);
+C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, TscAtExit) == 0x128);
+C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, TscOffset) == 0x130);
+C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, TscOffsetting) == 0x178);
 
 
 
@@ -87,6 +90,24 @@ static volatile LONG g_SyntheticMsrPassthrough;
 static volatile LONG g_UnexpectedMsrLogs;
 static volatile LONG g_GuestIdleIgnored;
 static volatile LONG g_HvTimeReady;
+static BOOLEAN g_PmcFreeze;
+#if HACDBG_HIDE_VIRTUALIZATION
+static BOOLEAN g_AperfPresent;
+static BOOLEAN g_TscAdjustPresent;
+static BOOLEAN g_TscDeadlinePresent;
+#endif
+
+#define HACDBG_TSC_SAMPLE_COUNT 32
+#define VMX_CPUID_APERF_MPERF   (1u << 0)
+#define VMX_CPUID_TSC_ADJUST    (1u << 1)
+#define VMX_CPUID_TSC_DEADLINE  (1u << 24)
+
+#if HACDBG_HIDE_VIRTUALIZATION
+static UINT64
+VmxGuestTsc(
+    _In_ const VMX_PROCESSOR_CONTEXT* ProcessorContext
+    );
+#endif
 static UINT64 g_HvRefTsc;
 static UINT64 g_HvRefTime;
 static UINT64 g_HvTscFrequency;
@@ -676,6 +697,126 @@ VmxHandleSyntheticTime(
     return VmxFinishMsrRead(ProcessorContext, value);
 }
 
+#if HACDBG_HIDE_VIRTUALIZATION
+static BOOLEAN
+VmxMsrPresent(
+    _In_ ULONG Index
+    )
+{
+    __try
+    {
+        (void)__readmsr(Index);
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
+//
+// Writes the same deadline just read. A failed probe means this processor
+// cannot publish IA32_TSC_DEADLINE, so TSC offsetting must not be paired
+// with a guest that programs the APIC timer from RDTSC.
+//
+static BOOLEAN
+VmxProbeTscDeadline(
+    VOID
+    )
+{
+    UINT64 current;
+
+    __try
+    {
+        current = __readmsr(VMX_MSR_TSC_DEADLINE);
+        //
+        // INVARIANT: Still before VMXON. The value just read is the OS deadline.
+        // Writing it back does not select a new target.
+        //
+        __writemsr(VMX_MSR_TSC_DEADLINE, current);
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
+static BOOLEAN
+VmxWriteTscDeadline(
+    _In_ UINT64 HostDeadline
+    )
+{
+    __try
+    {
+        //
+        // INVARIANT: This processor is in VMX root, or still before VMXON.
+        // HostDeadline is an absolute TSC in the same domain as RDTSC here,
+        // which is not the guest-visible TSC while TSC offsetting is on.
+        //
+        __writemsr(VMX_MSR_TSC_DEADLINE, HostDeadline);
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
+//
+// SDM 13.5.4.1: the local APIC fires when the time-stamp counter itself
+// reaches IA32_TSC_DEADLINE. RDTSC in non-root returns that counter plus
+// the TSC offset, and root software has to keep the MSR in the same domain.
+//
+static VOID
+VmxSyncTscDeadline(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
+    )
+{
+    UINT64 now;
+    UINT64 guestNow;
+    UINT64 hostDeadline;
+
+    if (ProcessorContext->TscDeadlineArmed == FALSE)
+    {
+        return;
+    }
+
+    now = __rdtsc();
+    guestNow = now + ProcessorContext->TscOffset;
+    if (guestNow >= ProcessorContext->GuestTscDeadline)
+    {
+        if (ProcessorContext->HostDeadlineValid == FALSE)
+        {
+            (void)VmxWriteTscDeadline(now);
+        }
+
+        ProcessorContext->TscDeadlineArmed = FALSE;
+        ProcessorContext->HostDeadlineValid = FALSE;
+        ProcessorContext->GuestTscDeadline = 0;
+        ProcessorContext->HostTscDeadline = 0;
+        return;
+    }
+
+    hostDeadline = ProcessorContext->GuestTscDeadline - ProcessorContext->TscOffset;
+    if (ProcessorContext->HostDeadlineValid != FALSE &&
+        hostDeadline == ProcessorContext->HostTscDeadline)
+    {
+        return;
+    }
+
+    if (VmxWriteTscDeadline(hostDeadline) == FALSE)
+    {
+        ProcessorContext->TscDeadlineArmed = FALSE;
+        ProcessorContext->HostDeadlineValid = FALSE;
+        return;
+    }
+
+    ProcessorContext->HostTscDeadline = hostDeadline;
+    ProcessorContext->HostDeadlineValid = TRUE;
+}
+#endif
+
 static BOOLEAN
 VmxHandleMsr(
     _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext,
@@ -687,6 +828,150 @@ VmxHandleMsr(
     BOOLEAN timeHandled = FALSE;
 
 #if HACDBG_HIDE_VIRTUALIZATION
+    if (g_TscDeadlinePresent != FALSE && msr == (UINT32)VMX_MSR_TSC_DEADLINE)
+    {
+        UINT64 deadline;
+
+        if (VmxGuestCpl() != 0)
+        {
+            VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
+            return TRUE;
+        }
+
+        if (Write != FALSE)
+        {
+            deadline = (ProcessorContext->Registers.Rdx << 32) |
+                       (UINT32)ProcessorContext->Registers.Rax;
+            if (deadline == 0)
+            {
+                (void)VmxWriteTscDeadline(0);
+                ProcessorContext->TscDeadlineArmed = FALSE;
+                ProcessorContext->HostDeadlineValid = FALSE;
+                ProcessorContext->GuestTscDeadline = 0;
+                ProcessorContext->HostTscDeadline = 0;
+            }
+            else
+            {
+                ProcessorContext->GuestTscDeadline = deadline;
+                ProcessorContext->TscDeadlineArmed = TRUE;
+                ProcessorContext->HostDeadlineValid = FALSE;
+                ProcessorContext->HostTscDeadline = 0;
+            }
+        }
+        else
+        {
+            deadline = 0;
+            if (ProcessorContext->TscDeadlineArmed != FALSE &&
+                __rdtsc() + ProcessorContext->TscOffset < ProcessorContext->GuestTscDeadline)
+            {
+                deadline = ProcessorContext->GuestTscDeadline;
+            }
+            else
+            {
+                ProcessorContext->TscDeadlineArmed = FALSE;
+                ProcessorContext->HostDeadlineValid = FALSE;
+                ProcessorContext->GuestTscDeadline = 0;
+                ProcessorContext->HostTscDeadline = 0;
+            }
+
+            ProcessorContext->Registers.Rax = (UINT32)deadline;
+            ProcessorContext->Registers.Rdx = deadline >> 32;
+        }
+
+        return VmxAdvanceRip();
+    }
+
+    if (msr == (UINT32)VMX_MSR_TIME_STAMP_COUNTER)
+    {
+        UINT64 now;
+        UINT64 desired;
+
+        if (Write == FALSE || VmxGuestCpl() != 0)
+        {
+            VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
+            return TRUE;
+        }
+
+        desired = (ProcessorContext->Registers.Rdx << 32) |
+                  (UINT32)ProcessorContext->Registers.Rax;
+        now = __rdtsc();
+        ProcessorContext->TscOffset = desired - now;
+        ProcessorContext->LastGuestTsc = desired;
+        return VmxAdvanceRip();
+    }
+
+    if (g_TscAdjustPresent != FALSE && msr == (UINT32)VMX_MSR_TSC_ADJUST)
+    {
+        UINT64 adjust;
+
+        if (VmxGuestCpl() != 0)
+        {
+            VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
+            return TRUE;
+        }
+
+        if (Write != FALSE)
+        {
+            UINT64 delta;
+
+            adjust = (ProcessorContext->Registers.Rdx << 32) |
+                     (UINT32)ProcessorContext->Registers.Rax;
+            delta = adjust - ProcessorContext->GuestTscAdjust;
+            ProcessorContext->GuestTscAdjust = adjust;
+            ProcessorContext->TscOffset += delta;
+            ProcessorContext->LastGuestTsc += delta;
+        }
+        else
+        {
+            adjust = ProcessorContext->GuestTscAdjust;
+            ProcessorContext->Registers.Rax = (UINT32)adjust;
+            ProcessorContext->Registers.Rdx = adjust >> 32;
+        }
+
+        return VmxAdvanceRip();
+    }
+
+    if (g_AperfPresent != FALSE &&
+        (msr == (UINT32)VMX_MSR_MPERF || msr == (UINT32)VMX_MSR_APERF))
+    {
+        UINT64 guestTsc;
+        UINT64* base;
+        UINT64* tscBase;
+
+        if (VmxGuestCpl() != 0)
+        {
+            VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
+            return TRUE;
+        }
+
+        guestTsc = VmxGuestTsc(ProcessorContext);
+        if (msr == (UINT32)VMX_MSR_MPERF)
+        {
+            base = &ProcessorContext->MperfBase;
+            tscBase = &ProcessorContext->MperfTscBase;
+        }
+        else
+        {
+            base = &ProcessorContext->AperfBase;
+            tscBase = &ProcessorContext->AperfTscBase;
+        }
+
+        if (Write != FALSE)
+        {
+            *base = 0;
+            *tscBase = guestTsc;
+        }
+        else
+        {
+            UINT64 reading = *base + (guestTsc - *tscBase);
+
+            ProcessorContext->Registers.Rax = (UINT32)reading;
+            ProcessorContext->Registers.Rdx = reading >> 32;
+        }
+
+        return VmxAdvanceRip();
+    }
+
     if (msr == VMX_MSR_FEATURE_CONTROL)
     {
         if (Write != FALSE)
@@ -930,6 +1215,101 @@ VmxDispatch(
     }
 }
 
+#if HACDBG_HIDE_VIRTUALIZATION
+static UINT64
+VmxMedianCpuidCost(
+    VOID
+    )
+{
+    UINT64 samples[HACDBG_TSC_SAMPLE_COUNT];
+    UINT32 index;
+    UINT32 cursor;
+
+    for (index = 0; index < HACDBG_TSC_SAMPLE_COUNT; index++)
+    {
+        int registers[4];
+        UINT64 start;
+        UINT64 end;
+
+        _mm_lfence();
+        start = __rdtsc();
+        __cpuid(registers, 0);
+        end = __rdtsc();
+        _mm_lfence();
+        samples[index] = end - start;
+    }
+
+    for (index = 1; index < HACDBG_TSC_SAMPLE_COUNT; index++)
+    {
+        UINT64 value = samples[index];
+
+        cursor = index;
+        while (cursor > 0 && samples[cursor - 1] > value)
+        {
+            samples[cursor] = samples[cursor - 1];
+            cursor--;
+        }
+
+        samples[cursor] = value;
+    }
+
+    return samples[HACDBG_TSC_SAMPLE_COUNT / 2];
+}
+
+static UINT64
+VmxGuestTsc(
+    _In_ const VMX_PROCESSOR_CONTEXT* ProcessorContext
+    )
+{
+    return __rdtsc() + ProcessorContext->TscOffset;
+}
+#endif
+
+static VOID
+VmxAccountExit(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext,
+    _In_ UINT32 Reason
+    )
+{
+    UINT64 now;
+    UINT64 software;
+    UINT64 charge;
+    UINT64 guest;
+
+    if (ProcessorContext->TscOffsetting == FALSE)
+    {
+        return;
+    }
+
+    now = __rdtsc();
+    software = now - ProcessorContext->TscAtExit;
+    charge = software + ProcessorContext->HardwareTransition;
+    if (Reason == VMX_EXIT_CPUID)
+    {
+        if (charge > ProcessorContext->NativeCpuidCost)
+        {
+            charge -= ProcessorContext->NativeCpuidCost;
+        }
+        else
+        {
+            charge = 0;
+        }
+    }
+
+    ProcessorContext->TscOffset -= charge;
+    guest = now + ProcessorContext->TscOffset;
+    if (guest < ProcessorContext->LastGuestTsc)
+    {
+        ProcessorContext->TscOffset = ProcessorContext->LastGuestTsc - now;
+        guest = ProcessorContext->LastGuestTsc;
+    }
+
+    ProcessorContext->LastGuestTsc = guest;
+#if HACDBG_HIDE_VIRTUALIZATION
+    VmxSyncTscDeadline(ProcessorContext);
+#endif
+}
+
 BOOLEAN
 VmxHandleVmExit(
     _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
@@ -1000,6 +1380,8 @@ VmxHandleVmExit(
         {
             VmxInvalidateEpt(ProcessorContext);
         }
+
+        VmxAccountExit(ProcessorContext, reason);
     }
 
     return stopGuest;
@@ -1093,10 +1475,52 @@ VmxLoadControls(
     g_Cr4Fixed1 = __readmsr(VMX_MSR_CR4_FIXED1);
 
     g_PinControls = VmxAdjust(0, pinMsr);
-    g_ProcControls = VmxAdjust(VMX_PROC_USE_MSR_BITMAPS | VMX_PROC_ACTIVATE_SECONDARY, procMsr);
+    {
+        UINT32 desiredProc = VMX_PROC_USE_MSR_BITMAPS | VMX_PROC_ACTIVATE_SECONDARY;
+
+#if HACDBG_HIDE_VIRTUALIZATION
+        //
+        // An outer hypervisor already owns the TSC domain used by the guest
+        // APIC timer. Subtracting exit cost from that domain makes every
+        // TSC-deadline interrupt fire immediately.
+        //
+        if (g_SyntheticMsrPassthrough == 0)
+        {
+            desiredProc |= VMX_PROC_USE_TSC_OFFSETTING;
+        }
+#endif
+        g_ProcControls = VmxAdjust(desiredProc, procMsr);
+    }
+#if HACDBG_HIDE_VIRTUALIZATION
+    if (g_SyntheticMsrPassthrough == 0 &&
+        (g_ProcControls & VMX_PROC_USE_TSC_OFFSETTING) == 0)
+    {
+        HACDBG_LOG("HacDbg: Err, TSC offsetting cannot be enabled.\n");
+        return FALSE;
+    }
+
+    if (g_SyntheticMsrPassthrough == 0)
+    {
+        int leaf1[4];
+
+        __cpuidex(cpuInfo, 6, 0);
+        g_AperfPresent = ((UINT32)cpuInfo[2] & VMX_CPUID_APERF_MPERF) != 0 &&
+                         VmxMsrPresent((ULONG)VMX_MSR_APERF) != FALSE &&
+                         VmxMsrPresent((ULONG)VMX_MSR_MPERF) != FALSE;
+        __cpuidex(cpuInfo, 7, 0);
+        g_TscAdjustPresent = ((UINT32)cpuInfo[1] & VMX_CPUID_TSC_ADJUST) != 0 &&
+                             VmxMsrPresent((ULONG)VMX_MSR_TSC_ADJUST) != FALSE;
+        __cpuid(leaf1, 1);
+        g_TscDeadlinePresent = ((UINT32)leaf1[2] & VMX_CPUID_TSC_DEADLINE) != 0 &&
+                               VmxProbeTscDeadline() != FALSE;
+    }
+#endif
     desired2 = VMX_PROC2_ENABLE_EPT;
 #if HACDBG_HIDE_VIRTUALIZATION
-    desired2 |= VMX_PROC2_CONCEAL_VMX_FROM_PT;
+    if (g_SyntheticMsrPassthrough == 0)
+    {
+        desired2 |= VMX_PROC2_CONCEAL_VMX_FROM_PT;
+    }
 #endif
     __cpuidex(cpuInfo, 0x80000001, 0);
     if ((cpuInfo[3] & (1 << 27)) != 0)
@@ -1138,11 +1562,43 @@ VmxLoadControls(
         UINT32 entryRequested = VMX_ENTRY_IA32E_MODE_GUEST | VMX_ENTRY_LOAD_DEBUG;
 
 #if HACDBG_HIDE_VIRTUALIZATION
-        exitRequested |= VMX_EXIT_CONCEAL_VMX_FROM_PT;
-        entryRequested |= VMX_ENTRY_CONCEAL_VMX_FROM_PT;
-#endif
+        if (g_SyntheticMsrPassthrough == 0)
+        {
+            UINT32 exitWithPmc;
+            UINT32 entryWithPmc;
+
+            exitRequested |= VMX_EXIT_CONCEAL_VMX_FROM_PT;
+            entryRequested |= VMX_ENTRY_CONCEAL_VMX_FROM_PT;
+            exitWithPmc = exitRequested | VMX_EXIT_LOAD_PERF_GLOBAL | VMX_EXIT_SAVE_PERF_GLOBAL;
+            entryWithPmc = entryRequested | VMX_ENTRY_LOAD_PERF_GLOBAL;
+            g_ExitControls = VmxAdjust(exitWithPmc, exitMsr);
+            g_EntryControls = VmxAdjust(entryWithPmc, entryMsr);
+            g_PmcFreeze = (g_ExitControls & (VMX_EXIT_LOAD_PERF_GLOBAL | VMX_EXIT_SAVE_PERF_GLOBAL)) ==
+                              (VMX_EXIT_LOAD_PERF_GLOBAL | VMX_EXIT_SAVE_PERF_GLOBAL) &&
+                          (g_EntryControls & VMX_ENTRY_LOAD_PERF_GLOBAL) != 0;
+            if (g_PmcFreeze == FALSE)
+            {
+                g_ExitControls = VmxAdjust(exitRequested, exitMsr);
+                g_EntryControls = VmxAdjust(entryRequested, entryMsr);
+                if ((g_ExitControls & VMX_EXIT_LOAD_PERF_GLOBAL) != 0 ||
+                    (g_EntryControls & VMX_ENTRY_LOAD_PERF_GLOBAL) != 0)
+                {
+                    HACDBG_LOG("HacDbg: Err, IA32_PERF_GLOBAL_CTRL controls cannot be paired.\n");
+                    return FALSE;
+                }
+            }
+        }
+        else
+        {
+            g_PmcFreeze = FALSE;
+            g_ExitControls = VmxAdjust(exitRequested, exitMsr);
+            g_EntryControls = VmxAdjust(entryRequested, entryMsr);
+        }
+#else
+        g_PmcFreeze = FALSE;
         g_ExitControls = VmxAdjust(exitRequested, exitMsr);
         g_EntryControls = VmxAdjust(entryRequested, entryMsr);
+#endif
     }
 
     if ((g_PinControls & (VMX_PIN_EXTERNAL_INT_EXITING | VMX_PIN_NMI_EXITING)) != 0 ||
@@ -1218,6 +1674,9 @@ VmxCheckSupport(
         InterlockedExchange(&g_SyntheticMsrPassthrough, 1);
         HACDBG_LOG("HacDbg: Synthetic MSRs 0x%x-0x%x are passed through.\n",
                    VMX_MSR_SYNTHETIC_FIRST, VMX_MSR_SYNTHETIC_LAST);
+#if HACDBG_HIDE_VIRTUALIZATION
+        HACDBG_LOG("HacDbg: Outer hypervisor present. TSC offsetting stays off.\n");
+#endif
     }
 
     featureControl = __readmsr(VMX_MSR_FEATURE_CONTROL);
@@ -1325,6 +1784,39 @@ VmxPrepareProcessor(
         {
             VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, msr, VMX_MSR_BITMAP_READ_LOW);
             VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, msr, VMX_MSR_BITMAP_WRITE_LOW);
+        }
+
+        if (g_SyntheticMsrPassthrough == 0)
+        {
+            VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_TIME_STAMP_COUNTER,
+                         VMX_MSR_BITMAP_WRITE_LOW);
+            if (g_TscAdjustPresent != FALSE)
+            {
+                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_TSC_ADJUST,
+                             VMX_MSR_BITMAP_READ_LOW);
+                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_TSC_ADJUST,
+                             VMX_MSR_BITMAP_WRITE_LOW);
+            }
+
+            if (g_AperfPresent != FALSE)
+            {
+                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_MPERF,
+                             VMX_MSR_BITMAP_READ_LOW);
+                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_MPERF,
+                             VMX_MSR_BITMAP_WRITE_LOW);
+                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_APERF,
+                             VMX_MSR_BITMAP_READ_LOW);
+                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_APERF,
+                             VMX_MSR_BITMAP_WRITE_LOW);
+            }
+
+            if (g_TscDeadlinePresent != FALSE)
+            {
+                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_TSC_DEADLINE,
+                             VMX_MSR_BITMAP_READ_LOW);
+                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_TSC_DEADLINE,
+                             VMX_MSR_BITMAP_WRITE_LOW);
+            }
         }
     }
 #endif
@@ -1435,6 +1927,19 @@ VmxFillVmcs(
         VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, cr0) == FALSE ||
         VmxWrite(VMCS_CTRL_CR4_MASK, VMX_CR4_VMXE) == FALSE ||
         VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, VmxCr4ReadShadow(guestCr4)) == FALSE)
+    {
+        return FALSE;
+    }
+
+    if ((g_ProcControls & VMX_PROC_USE_TSC_OFFSETTING) != 0 &&
+        VmxWrite(VMCS_CTRL_TSC_OFFSET, ProcessorContext->TscOffset) == FALSE)
+    {
+        return FALSE;
+    }
+
+    if (g_PmcFreeze != FALSE &&
+        (VmxWrite(VMCS_GUEST_PERF_GLOBAL_CTRL, __readmsr(VMX_MSR_PERF_GLOBAL_CTRL)) == FALSE ||
+         VmxWrite(VMCS_HOST_PERF_GLOBAL_CTRL, 0) == FALSE))
     {
         return FALSE;
     }
@@ -1570,6 +2075,26 @@ VmxVirtualizeProcessor(
     }
 
     ProcessorContext->VpRuntime = vpRuntime;
+#if HACDBG_HIDE_VIRTUALIZATION
+    if (g_SyntheticMsrPassthrough == 0)
+    {
+        ProcessorContext->NativeCpuidCost = VmxMedianCpuidCost();
+        ProcessorContext->HardwareTransition = 0;
+        ProcessorContext->TscOffset = 0;
+        ProcessorContext->TscOffsetting = TRUE;
+        if (g_TscAdjustPresent != FALSE)
+        {
+            __try
+            {
+                ProcessorContext->GuestTscAdjust = __readmsr(VMX_MSR_TSC_ADJUST);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                ProcessorContext->GuestTscAdjust = 0;
+            }
+        }
+    }
+#endif
     _disable();
 
     if (VmxLoadControls() == FALSE)
@@ -1612,6 +2137,27 @@ VmxVirtualizeProcessor(
     // INVARIANT: This processor is in VMX operation, its VMCS is current, and
     // it is not already in VMX non-root operation.
     //
+#if HACDBG_HIDE_VIRTUALIZATION
+    if (ProcessorContext->TscOffsetting != FALSE)
+    {
+        ProcessorContext->LastGuestTsc = __rdtsc();
+        ProcessorContext->AperfTscBase = ProcessorContext->LastGuestTsc;
+        ProcessorContext->MperfTscBase = ProcessorContext->LastGuestTsc;
+        if (g_AperfPresent != FALSE)
+        {
+            __try
+            {
+                ProcessorContext->AperfBase = __readmsr(VMX_MSR_APERF);
+                ProcessorContext->MperfBase = __readmsr(VMX_MSR_MPERF);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                ProcessorContext->AperfBase = 0;
+                ProcessorContext->MperfBase = 0;
+            }
+        }
+    }
+#endif
     VmxLaunchVm(ProcessorContext, ProcessorContext->HostRsp);
     HacDbgVmxOff();
     __writecr4(__readcr4() & ~VMX_CR4_VMXE);

@@ -76,6 +76,14 @@ SvmLaunchLoop:
         pop     r11
         mov     [r10+0B0h], r11
 
+        ; Guest RAX/RDX/R11 are already stored. rdtsc may clobber RAX and RDX.
+        cmp     byte ptr [r10+130h], 0
+        je      SvmExitNoTsc
+        rdtsc
+        shl     rdx, 32
+        or      rax, rdx
+        mov     [r10+0E0h], rax
+SvmExitNoTsc:
         mov     rax, [r10]
         mov     [rsp+0D0h], rax
         lea     rax, [r10+58h]

@@ -37,11 +37,16 @@
 
 //
 // 客户是否看到虚拟化能力。
-//   1 - 隐藏（默认）。Intel 清掉 CPUID.1 ECX[5]，CR4 读影子不带 VMXE，
-//       IA32_FEATURE_CONTROL 显示为已锁定且不允许 VMX，0x480-0x4FF 注入 #GP，
-//       并对 Processor Trace 隐藏 VMX。AMD 的 EFER 读结果不带 SVME。
-//   0 - 不隐藏。上述位按真实状态返回。
-// 两种取值都不把 VMCS、VMCB 和 MSR 位图映射进客户，也不模拟嵌套 VMX。
+//   1 - 隐藏。Intel 清掉 CPUID.1 ECX[5]，CR4 读影子不带 VMXE，
+//       IA32_FEATURE_CONTROL 显示为已锁定且不允许 VMX，0x480-0x4FF 注入 #GP。
+//       AMD 清掉 CPUID Fn8000_0001 ECX[2]，Fn8000_000A 返回全 0，EFER 读结果
+//       不带 SVME，VM_CR 与 VM_HSAVE_PA 注入 #GP，SVM 指令注入 #UD。
+//       没有外层 hypervisor 时，两边用 TSC offset 补偿退出开销，不拦截 RDTSC，
+//       并拦截 IA32_TSC_DEADLINE，把客户写入的虚拟 TSC 换算成主机 TSC。
+//       CPUID.1 ECX[31] 已置位时不做这项补偿，也不打开 PERF_GLOBAL_CTRL
+//       保存/加载和对 Processor Trace 隐藏 VMX。
+//   0 - 不隐藏。上述位按真实状态返回。AMD 上 VMRUN 仍被拦截，该退出停止当前处理器。
+// 两种取值都不把 VMCS、VMCB、MSR 位图和宿主栈映射进客户，也不模拟嵌套虚拟化。
 // VMX 指令仍然注入 #UD。
 //
 #ifndef HACDBG_HIDE_VIRTUALIZATION

@@ -28,6 +28,12 @@
 #define VMX_MSR_TRUE_EXIT_CTLS           0x48Full
 #define VMX_MSR_TRUE_ENTRY_CTLS          0x490ull
 #define VMX_MSR_FEATURE_CONTROL          0x3Aull
+#define VMX_MSR_TIME_STAMP_COUNTER       0x10ull
+#define VMX_MSR_TSC_ADJUST               0x3Bull
+#define VMX_MSR_MPERF                    0xE7ull
+#define VMX_MSR_APERF                    0xE8ull
+#define VMX_MSR_TSC_DEADLINE             0x6E0ull
+#define VMX_MSR_PERF_GLOBAL_CTRL         0x38Full
 
 #define VMX_BASIC_TRUE_CONTROLS          (1ull << 55)
 #define VMX_BASIC_MEMORY_TYPE_SHIFT      50
@@ -40,6 +46,18 @@
 // Primary processor-based VM-execution controls.
 //
 #define VMX_PROC_USE_TSC_OFFSETTING      (1u << 3)
+
+//
+// Primary VM-exit controls. Bit 12 loads IA32_PERF_GLOBAL_CTRL from the
+// host field. Bit 30 saves it into the guest field.
+//
+#define VMX_EXIT_LOAD_PERF_GLOBAL        (1u << 12)
+#define VMX_EXIT_SAVE_PERF_GLOBAL        (1u << 30)
+
+//
+// VM-entry control. Bit 13 loads IA32_PERF_GLOBAL_CTRL from the guest field.
+//
+#define VMX_ENTRY_LOAD_PERF_GLOBAL       (1u << 13)
 #define VMX_PROC_HLT_EXITING             (1u << 7)
 #define VMX_PROC_INVLPG_EXITING          (1u << 9)
 #define VMX_PROC_RDTSC_EXITING           (1u << 12)
@@ -98,6 +116,8 @@
 #define VMCS_HOST_TR_SELECTOR            0x00000C0Cull
 #define VMCS_CTRL_MSR_BITMAP             0x00002004ull
 #define VMCS_CTRL_TSC_OFFSET             0x00002010ull
+#define VMCS_GUEST_PERF_GLOBAL_CTRL      0x00002808ull
+#define VMCS_HOST_PERF_GLOBAL_CTRL       0x00002C04ull
 #define VMCS_CTRL_EPT_POINTER            0x0000201Aull
 #define VMCS_GUEST_VMCS_LINK_POINTER     0x00002800ull
 #define VMCS_GUEST_DEBUGCTL              0x00002802ull
@@ -256,6 +276,21 @@ typedef struct _VMX_PROCESSOR_CONTEXT
     UINT8 LaunchCompleted;
     UINT8 EptEnabled;
     UINT32 InstructionError;
+    UINT64 TscAtExit;
+    UINT64 TscOffset;
+    UINT64 LastGuestTsc;
+    UINT64 NativeCpuidCost;
+    UINT64 HardwareTransition;
+    UINT64 AperfBase;
+    UINT64 MperfBase;
+    UINT64 AperfTscBase;
+    UINT64 MperfTscBase;
+    UINT64 GuestTscAdjust;
+    UINT8 TscOffsetting;
+    UINT8 TscDeadlineArmed;
+    UINT8 HostDeadlineValid;
+    UINT64 GuestTscDeadline;
+    UINT64 HostTscDeadline;
 } VMX_PROCESSOR_CONTEXT;
 
 NTSTATUS

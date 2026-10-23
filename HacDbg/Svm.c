@@ -22,6 +22,14 @@
 #define HACDBG_EFER_LMA             (1ull << 10)
 #define HACDBG_EFER_NXE             (1ull << 11)
 #define HACDBG_EFER_SVME            (1ull << 12)
+#define HACDBG_TSC_SAMPLE_COUNT     32
+#define SVM_CPUID_APERF_MPERF       (1u << 0)
+#define SVM_CPUID_TSC_ADJUST        (1u << 1)
+#define SVM_CPUID_TSC_DEADLINE      (1u << 24)
+#define SVM_CPUID_HYPERVISOR        (1u << 31)
+#define SVM_CPUID_SVM               (1u << 2)
+#define SVM_CPUID_LEAF_FEATURES     0x80000001u
+#define SVM_CPUID_LEAF_SVM          0x8000000au
 
 #pragma pack(push, 1)
 typedef struct _DESCRIPTOR_TABLE_REGISTER
@@ -40,6 +48,12 @@ static PVOID g_MsrpmAllocation;
 static PVOID g_Msrpm;
 static UINT64 g_MsrpmPa;
 static ULONG g_SharedFailureDetail;
+#if HACDBG_HIDE_VIRTUALIZATION
+static BOOLEAN g_AperfPresent;
+static BOOLEAN g_TscAdjustPresent;
+static BOOLEAN g_TscDeadlinePresent;
+static BOOLEAN g_OuterHypervisor;
+#endif
 
 EXTERN_C VOID
 SvmLaunchVm(
@@ -74,7 +88,13 @@ C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, StopRequested) == 0x51);
 C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, LaunchCompleted) == 0x52);
 C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, Registers) == 0x58);
 C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, TlbFlushRequested) == 0xD8);
-C_ASSERT(sizeof(SVM_PROCESSOR_CONTEXT) == 0xE0);
+C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, TscAtExit) == 0xE0);
+C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, TscOffset) == 0xE8);
+C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, TscActive) == 0x130);
+C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, TscDeadlineArmed) == 0x131);
+C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, HostDeadlineValid) == 0x132);
+C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, GuestTscDeadline) == 0x138);
+C_ASSERT(sizeof(SVM_PROCESSOR_CONTEXT) == 0x148);
 
 // 分配非分页内存并返回 4 KiB 对齐的首地址，原指针写入 AllocationBase。
 static PVOID
@@ -142,6 +162,185 @@ SvmSegmentLimit(
 
     return limit;
 }
+
+// 在 MSRPM 的三个区域内给一个 MSR 置读位或写位。写位落在字节边界时进入下一字节。
+static BOOLEAN
+SvmMsrpmIntercept(
+    _In_ UINT32 Msr,
+    _In_ BOOLEAN Read,
+    _In_ BOOLEAN Write
+    )
+{
+    UINT32 base;
+    UINT32 region;
+    UINT32 index;
+    UINT32 bit;
+    UINT32 byteIndex;
+    UINT8* map = (UINT8*)g_Msrpm;
+
+    if (Msr <= 0x1FFFu)
+    {
+        base = 0;
+        region = 0;
+    }
+    else if (Msr >= 0xC0000000u && Msr <= 0xC0001FFFu)
+    {
+        base = 0xC0000000u;
+        region = 0x800;
+    }
+    else if (Msr >= 0xC0010000u && Msr <= 0xC0011FFFu)
+    {
+        base = 0xC0010000u;
+        region = 0x1000;
+    }
+    else
+    {
+        return FALSE;
+    }
+
+    index = Msr - base;
+    bit = index * 2;
+    if (Read != FALSE)
+    {
+        byteIndex = region + (bit / 8);
+        if (byteIndex >= 0x2000)
+        {
+            return FALSE;
+        }
+
+        map[byteIndex] |= (UINT8)(1u << (bit & 7));
+    }
+
+    if (Write != FALSE)
+    {
+        UINT32 writeBit = bit + 1;
+
+        byteIndex = region + (writeBit / 8);
+        if (byteIndex >= 0x2000)
+        {
+            return FALSE;
+        }
+
+        map[byteIndex] |= (UINT8)(1u << (writeBit & 7));
+    }
+
+    return TRUE;
+}
+
+#if HACDBG_HIDE_VIRTUALIZATION
+static BOOLEAN
+SvmMsrPresent(
+    _In_ UINT32 Index
+    )
+{
+    __try
+    {
+        (void)__readmsr(Index);
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
+static BOOLEAN
+SvmProbeTscDeadline(
+    VOID
+    )
+{
+    UINT64 current;
+
+    __try
+    {
+        current = __readmsr(SVM_MSR_TSC_DEADLINE);
+        //
+        // INVARIANT: SVM is not enabled yet. The value just read is the OS
+        // deadline. Writing it back does not select a new target.
+        //
+        __writemsr(SVM_MSR_TSC_DEADLINE, current);
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
+static BOOLEAN
+SvmWriteTscDeadline(
+    _In_ UINT64 HostDeadline
+    )
+{
+    __try
+    {
+        //
+        // INVARIANT: GIF is clear on a #VMEXIT, or SVM is not enabled yet.
+        // HostDeadline uses the TSC domain of RDTSC on this path. VMCB
+        // TSC_OFFSET is cleared on #VMEXIT, so that domain is not the guest
+        // read of the TSC.
+        //
+        __writemsr(SVM_MSR_TSC_DEADLINE, HostDeadline);
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
+//
+// VMCB.TSC_OFFSET is added when the guest reads the TSC and is cleared on
+// #VMEXIT. IA32_TSC_DEADLINE is compared with the TSC, so a deadline the
+// guest computed from RDTSC has to be converted before it is written.
+//
+static VOID
+SvmSyncTscDeadline(
+    _Inout_ SVM_PROCESSOR_CONTEXT* Processor
+    )
+{
+    UINT64 now;
+    UINT64 guestNow;
+    UINT64 hostDeadline;
+
+    if (Processor->TscDeadlineArmed == FALSE)
+    {
+        return;
+    }
+
+    now = __rdtsc();
+    guestNow = now + Processor->TscOffset;
+    if (guestNow >= Processor->GuestTscDeadline)
+    {
+        if (Processor->HostDeadlineValid == FALSE)
+        {
+            (void)SvmWriteTscDeadline(now);
+        }
+
+        Processor->TscDeadlineArmed = FALSE;
+        Processor->HostDeadlineValid = FALSE;
+        Processor->GuestTscDeadline = 0;
+        Processor->HostTscDeadline = 0;
+        return;
+    }
+
+    hostDeadline = Processor->GuestTscDeadline - Processor->TscOffset;
+    if (Processor->HostDeadlineValid != FALSE && hostDeadline == Processor->HostTscDeadline)
+    {
+        return;
+    }
+
+    if (SvmWriteTscDeadline(hostDeadline) == FALSE)
+    {
+        Processor->TscDeadlineArmed = FALSE;
+        Processor->HostDeadlineValid = FALSE;
+        return;
+    }
+
+    Processor->HostTscDeadline = hostDeadline;
+    Processor->HostDeadlineValid = TRUE;
+}
+#endif
 
 // 检查 CPUID 中的 SVM/NPT 支持位和 VM_CR.SVMDIS。
 NTSTATUS
@@ -217,7 +416,91 @@ SvmInitializeShared(
     // The second MSR permission region starts at byte 0x800. EFER is at
     // 0xC0000080, and each MSR has a read bit followed by a write bit.
     //
-    ((UINT8*)g_Msrpm)[0x800 + (((HACDBG_MSR_EFER - 0xc0000000ull) * 2ull) / 8ull)] = 0x03;
+    if (SvmMsrpmIntercept((UINT32)HACDBG_MSR_EFER, TRUE, TRUE) == FALSE)
+    {
+        g_SharedFailureDetail = 2;
+        SvmCleanupShared();
+        return STATUS_UNSUCCESSFUL;
+    }
+
+#if HACDBG_HIDE_VIRTUALIZATION
+    {
+        int cpuInfo[4];
+        UINT32 maxLeaf;
+
+        __cpuid(cpuInfo, 1);
+        g_OuterHypervisor = ((UINT32)cpuInfo[2] & SVM_CPUID_HYPERVISOR) != 0;
+        if (g_OuterHypervisor != FALSE)
+        {
+            HACDBG_LOG("HacDbg: Outer hypervisor present. TSC offset stays off.\n");
+        }
+
+        __cpuid(cpuInfo, 0);
+        maxLeaf = (UINT32)cpuInfo[0];
+        if (g_OuterHypervisor == FALSE && maxLeaf >= 6)
+        {
+            __cpuidex(cpuInfo, 6, 0);
+            g_AperfPresent = ((UINT32)cpuInfo[2] & SVM_CPUID_APERF_MPERF) != 0 &&
+                             SvmMsrPresent(SVM_MSR_APERF) != FALSE &&
+                             SvmMsrPresent(SVM_MSR_MPERF) != FALSE;
+        }
+
+        if (g_OuterHypervisor == FALSE && maxLeaf >= 7)
+        {
+            __cpuidex(cpuInfo, 7, 0);
+            g_TscAdjustPresent = ((UINT32)cpuInfo[1] & SVM_CPUID_TSC_ADJUST) != 0 &&
+                                 SvmMsrPresent(SVM_MSR_TSC_ADJUST) != FALSE;
+        }
+
+        if (g_OuterHypervisor == FALSE)
+        {
+            __cpuid(cpuInfo, 1);
+            g_TscDeadlinePresent = ((UINT32)cpuInfo[2] & SVM_CPUID_TSC_DEADLINE) != 0 &&
+                                   SvmProbeTscDeadline() != FALSE;
+        }
+
+        if (SvmMsrpmIntercept((UINT32)SVM_MSR_VM_CR, TRUE, TRUE) == FALSE ||
+            SvmMsrpmIntercept((UINT32)SVM_MSR_VM_HSAVE_PA, TRUE, TRUE) == FALSE)
+        {
+            g_SharedFailureDetail = 2;
+            SvmCleanupShared();
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        if (g_OuterHypervisor == FALSE &&
+            SvmMsrpmIntercept((UINT32)SVM_MSR_TIME_STAMP_COUNTER, FALSE, TRUE) == FALSE)
+        {
+            g_SharedFailureDetail = 2;
+            SvmCleanupShared();
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        if (g_TscAdjustPresent != FALSE &&
+            SvmMsrpmIntercept((UINT32)SVM_MSR_TSC_ADJUST, TRUE, TRUE) == FALSE)
+        {
+            g_SharedFailureDetail = 2;
+            SvmCleanupShared();
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        if (g_AperfPresent != FALSE &&
+            (SvmMsrpmIntercept((UINT32)SVM_MSR_MPERF, TRUE, TRUE) == FALSE ||
+             SvmMsrpmIntercept((UINT32)SVM_MSR_APERF, TRUE, TRUE) == FALSE))
+        {
+            g_SharedFailureDetail = 2;
+            SvmCleanupShared();
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        if (g_TscDeadlinePresent != FALSE &&
+            SvmMsrpmIntercept((UINT32)SVM_MSR_TSC_DEADLINE, TRUE, TRUE) == FALSE)
+        {
+            g_SharedFailureDetail = 2;
+            SvmCleanupShared();
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+#endif
 
     physical = MmGetPhysicalAddress(g_Msrpm);
     g_MsrpmPa = (UINT64)physical.QuadPart;
@@ -315,6 +598,28 @@ SvmRegisterProcessor(
     HacDbgSpinLockRelease(&g_ProcessorLock);
 }
 
+// 在 NPT 里隐藏本处理器的宿主栈。栈和 VMCB 一样不能被客户读到。
+static BOOLEAN
+SvmHideHostStack(
+    _In_ SVM_PROCESSOR_CONTEXT* ProcessorContext
+    )
+{
+    ULONG_PTR stack = (ULONG_PTR)ProcessorContext->HostStack;
+    SIZE_T offset;
+
+    for (offset = 0; offset < HACDBG_HOST_STACK_SIZE; offset += PAGE_SIZE)
+    {
+        PHYSICAL_ADDRESS physical = MmGetPhysicalAddress((PVOID)(stack + offset));
+
+        if (NptHidePage(HacDbgGuestPhysicalAddress((UINT64)physical.QuadPart)) == FALSE)
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
 // 分配本处理器的 VMCB、宿主保存区和宿主栈，并在 NPT 中隐藏它们。
 NTSTATUS
 SvmInitialize(
@@ -374,8 +679,12 @@ SvmInitialize(
 
         ProcessorContext->GuestVmcb->ControlArea.InterceptMisc1 =
             SVM_INTERCEPT_MISC1_CPUID | SVM_INTERCEPT_MISC1_MSR_PROT;
-        ProcessorContext->GuestVmcb->ControlArea.InterceptMisc2 =
-            SVM_INTERCEPT_MISC2_VMRUN;
+        ProcessorContext->GuestVmcb->ControlArea.InterceptMisc2 = SVM_INTERCEPT_MISC2_VMRUN;
+#if HACDBG_HIDE_VIRTUALIZATION
+        ProcessorContext->GuestVmcb->ControlArea.InterceptMisc2 |=
+            SVM_INTERCEPT_MISC2_VMLOAD | SVM_INTERCEPT_MISC2_VMSAVE |
+            SVM_INTERCEPT_MISC2_STGI | SVM_INTERCEPT_MISC2_CLGI | SVM_INTERCEPT_MISC2_SKINIT;
+#endif
         ProcessorContext->GuestVmcb->ControlArea.MsrpmBasePa = g_MsrpmPa;
         ProcessorContext->GuestVmcb->ControlArea.GuestAsid = (UINT32)GuestAsid;
         ProcessorContext->GuestVmcb->ControlArea.NpEnable = SVM_NP_ENABLE;
@@ -383,7 +692,8 @@ SvmInitialize(
 
         if (NptHidePage(HacDbgGuestPhysicalAddress(ProcessorContext->GuestVmcbPa)) == FALSE ||
             NptHidePage(HacDbgGuestPhysicalAddress(ProcessorContext->HostVmcbPa)) == FALSE ||
-            NptHidePage(HacDbgGuestPhysicalAddress(hostSaveAreaPa)) == FALSE)
+            NptHidePage(HacDbgGuestPhysicalAddress(hostSaveAreaPa)) == FALSE ||
+            SvmHideHostStack(ProcessorContext) == FALSE)
         {
             HACDBG_LOG("HacDbg: Err, hiding processor state failed: guest_vmcb=0x%I64x "
                      "host_vmcb=0x%I64x host_save=0x%I64x.\n",
@@ -398,6 +708,121 @@ SvmInitialize(
         SvmFlushAllProcessors();
         return STATUS_SUCCESS;
     }
+}
+
+#if HACDBG_HIDE_VIRTUALIZATION
+// 进入客户前采 32 次 CPUID，取中位数当作客户自己执行这条指令的开销。
+static UINT64
+SvmMedianCpuidCost(
+    VOID
+    )
+{
+    UINT64 samples[HACDBG_TSC_SAMPLE_COUNT];
+    UINT32 index;
+    UINT32 cursor;
+
+    for (index = 0; index < HACDBG_TSC_SAMPLE_COUNT; index++)
+    {
+        int registers[4];
+        UINT64 start;
+        UINT64 end;
+
+        _mm_lfence();
+        start = __rdtsc();
+        __cpuid(registers, 0);
+        end = __rdtsc();
+        _mm_lfence();
+        samples[index] = end - start;
+    }
+
+    for (index = 1; index < HACDBG_TSC_SAMPLE_COUNT; index++)
+    {
+        UINT64 value = samples[index];
+
+        cursor = index;
+        while (cursor > 0 && samples[cursor - 1] > value)
+        {
+            samples[cursor] = samples[cursor - 1];
+            cursor--;
+        }
+
+        samples[cursor] = value;
+    }
+
+    return samples[HACDBG_TSC_SAMPLE_COUNT / 2];
+}
+
+// 把异常写进 EVENTINJ。调用方不能同时前移 RIP，否则异常会落在下一条指令。
+static VOID
+SvmInjectEvent(
+    _Inout_ VMCB* Vmcb,
+    _In_ UINT32 Vector,
+    _In_ BOOLEAN DeliverError,
+    _In_ UINT32 ErrorCode
+    )
+{
+    UINT64 event = (UINT64)Vector | SVM_EVENT_TYPE_EXCEPTION | SVM_EVENT_VALID;
+
+    if (DeliverError != FALSE)
+    {
+        event |= SVM_EVENT_ERROR_VALID | ((UINT64)ErrorCode << 32);
+    }
+
+    Vmcb->ControlArea.EventInj = event;
+}
+#endif
+
+// 用本次退出里根模式消耗的 TSC 更新 VMCB.TSC_OFFSET。客户 TSC 不得倒退。
+static VOID
+SvmAccountExit(
+    _Inout_ SVM_GUEST_CONTEXT* GuestContext
+    )
+{
+    SVM_PROCESSOR_CONTEXT* processor = GuestContext->ProcessorContext;
+    VMCB* vmcb = GuestContext->Vmcb;
+    UINT64 now;
+    UINT64 software;
+    UINT64 charge;
+    UINT64 guest;
+
+    if (processor->TscActive == FALSE)
+    {
+        return;
+    }
+
+    now = __rdtsc();
+    software = now - processor->TscAtExit;
+    charge = software + processor->HardwareTransition;
+    if (vmcb->ControlArea.ExitCode == SVM_EXIT_CPUID)
+    {
+        if (charge > processor->NativeCpuidCost)
+        {
+            charge -= processor->NativeCpuidCost;
+        }
+        else
+        {
+            charge = 0;
+        }
+    }
+
+    processor->TscOffset -= charge;
+    guest = now + processor->TscOffset;
+    if (guest < processor->LastGuestTsc)
+    {
+        processor->TscOffset = processor->LastGuestTsc - now;
+        guest = processor->LastGuestTsc;
+    }
+
+    processor->LastGuestTsc = guest;
+    if (vmcb->ControlArea.TscOffset != processor->TscOffset)
+    {
+        vmcb->ControlArea.TscOffset = processor->TscOffset;
+        vmcb->ControlArea.VmcbClean &= ~SVM_VMCB_CLEAN_INTERCEPTS;
+    }
+
+#if HACDBG_HIDE_VIRTUALIZATION
+    SvmSyncTscDeadline(processor);
+#endif
 }
 
 // 用当前上下文填充客户 VMCB，并设置 VM_HSAVE_PA。
@@ -482,6 +907,45 @@ SvmPrepareLaunch(
     // reachable through the guest nested page tables.
     //
     __writemsr(SVM_MSR_VM_HSAVE_PA, (UINT64)hostSavePhysical.QuadPart);
+
+#if HACDBG_HIDE_VIRTUALIZATION
+    if (g_OuterHypervisor == FALSE)
+    {
+        ProcessorContext->NativeCpuidCost = SvmMedianCpuidCost();
+        ProcessorContext->HardwareTransition = 0;
+        ProcessorContext->TscOffset = 0;
+        ProcessorContext->TscActive = TRUE;
+        vmcb->ControlArea.TscOffset = 0;
+        if (g_TscAdjustPresent != FALSE)
+        {
+            __try
+            {
+                ProcessorContext->GuestTscAdjust = __readmsr(SVM_MSR_TSC_ADJUST);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                ProcessorContext->GuestTscAdjust = 0;
+            }
+        }
+
+        ProcessorContext->LastGuestTsc = __rdtsc();
+        ProcessorContext->AperfTscBase = ProcessorContext->LastGuestTsc;
+        ProcessorContext->MperfTscBase = ProcessorContext->LastGuestTsc;
+        if (g_AperfPresent != FALSE)
+        {
+            __try
+            {
+                ProcessorContext->AperfBase = __readmsr(SVM_MSR_APERF);
+                ProcessorContext->MperfBase = __readmsr(SVM_MSR_MPERF);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER)
+            {
+                ProcessorContext->AperfBase = 0;
+                ProcessorContext->MperfBase = 0;
+            }
+        }
+    }
+#endif
 }
 
 // 把宿主状态写回，关闭 SVM，恢复客户控制寄存器后退出 VMRUN 循环。
@@ -523,7 +987,23 @@ SvmStopCurrentProcessor(
 
 }
 
-// 处理 EFER 的 MSR 拦截，其余 MSR 透传。
+// 用 nRIP 前移客户 RIP。nRIP 为 0 时按两字节指令处理。
+static VOID
+SvmAdvanceRip(
+    _Inout_ VMCB* Vmcb
+    )
+{
+    if (Vmcb->ControlArea.NRip != 0)
+    {
+        Vmcb->StateSaveArea.Rip = Vmcb->ControlArea.NRip;
+    }
+    else
+    {
+        Vmcb->StateSaveArea.Rip += 2;
+    }
+}
+
+// 处理 EFER 和隐藏路径上的时间 MSR。注入异常时不前移 RIP。
 static VOID
 SvmHandleMsrAccess(
     _Inout_ SVM_GUEST_CONTEXT* GuestContext
@@ -534,6 +1014,153 @@ SvmHandleMsrAccess(
     UINT32 msr = (UINT32)registers->Rcx;
     BOOLEAN writeAccess = (vmcb->ControlArea.ExitInfo1 & 1ull) != 0;
     UINT64 value = ((UINT64)registers->Rdx << 32) | (UINT32)registers->Rax;
+
+#if HACDBG_HIDE_VIRTUALIZATION
+    SVM_PROCESSOR_CONTEXT* processor = GuestContext->ProcessorContext;
+
+    if (g_TscDeadlinePresent != FALSE && msr == (UINT32)SVM_MSR_TSC_DEADLINE)
+    {
+        if (vmcb->StateSaveArea.Cpl != 0)
+        {
+            SvmInjectEvent(vmcb, SVM_VECTOR_GP, TRUE, 0);
+            return;
+        }
+
+        if (writeAccess != FALSE)
+        {
+            if (value == 0)
+            {
+                (void)SvmWriteTscDeadline(0);
+                processor->TscDeadlineArmed = FALSE;
+                processor->HostDeadlineValid = FALSE;
+                processor->GuestTscDeadline = 0;
+                processor->HostTscDeadline = 0;
+            }
+            else
+            {
+                processor->GuestTscDeadline = value;
+                processor->TscDeadlineArmed = TRUE;
+                processor->HostDeadlineValid = FALSE;
+                processor->HostTscDeadline = 0;
+            }
+        }
+        else
+        {
+            UINT64 deadline = 0;
+
+            if (processor->TscDeadlineArmed != FALSE &&
+                __rdtsc() + processor->TscOffset < processor->GuestTscDeadline)
+            {
+                deadline = processor->GuestTscDeadline;
+            }
+            else
+            {
+                processor->TscDeadlineArmed = FALSE;
+                processor->HostDeadlineValid = FALSE;
+                processor->GuestTscDeadline = 0;
+                processor->HostTscDeadline = 0;
+            }
+
+            registers->Rax = (UINT32)deadline;
+            registers->Rdx = deadline >> 32;
+        }
+
+        SvmAdvanceRip(vmcb);
+        return;
+    }
+
+    if (msr == (UINT32)SVM_MSR_VM_CR || msr == (UINT32)SVM_MSR_VM_HSAVE_PA)
+    {
+        SvmInjectEvent(vmcb, SVM_VECTOR_GP, TRUE, 0);
+        return;
+    }
+
+    if (msr == (UINT32)SVM_MSR_TIME_STAMP_COUNTER)
+    {
+        if (writeAccess == FALSE || vmcb->StateSaveArea.Cpl != 0)
+        {
+            SvmInjectEvent(vmcb, SVM_VECTOR_GP, TRUE, 0);
+            return;
+        }
+
+        //
+        // WRMSR of the TSC is not scaled by TSC_OFFSET. Keep the host TSC
+        // and publish the guest value through the VMCB offset.
+        //
+        processor->TscOffset = value - __rdtsc();
+        processor->LastGuestTsc = value;
+        SvmAdvanceRip(vmcb);
+        return;
+    }
+
+    if (g_TscAdjustPresent != FALSE && msr == (UINT32)SVM_MSR_TSC_ADJUST)
+    {
+        if (vmcb->StateSaveArea.Cpl != 0)
+        {
+            SvmInjectEvent(vmcb, SVM_VECTOR_GP, TRUE, 0);
+            return;
+        }
+
+        if (writeAccess != FALSE)
+        {
+            UINT64 delta = value - processor->GuestTscAdjust;
+
+            processor->GuestTscAdjust = value;
+            processor->TscOffset += delta;
+            processor->LastGuestTsc += delta;
+        }
+        else
+        {
+            registers->Rax = (UINT32)processor->GuestTscAdjust;
+            registers->Rdx = processor->GuestTscAdjust >> 32;
+        }
+
+        SvmAdvanceRip(vmcb);
+        return;
+    }
+
+    if (g_AperfPresent != FALSE &&
+        (msr == (UINT32)SVM_MSR_MPERF || msr == (UINT32)SVM_MSR_APERF))
+    {
+        UINT64 guestTsc;
+        UINT64* base;
+        UINT64* tscBase;
+
+        if (vmcb->StateSaveArea.Cpl != 0)
+        {
+            SvmInjectEvent(vmcb, SVM_VECTOR_GP, TRUE, 0);
+            return;
+        }
+
+        guestTsc = __rdtsc() + processor->TscOffset;
+        if (msr == (UINT32)SVM_MSR_MPERF)
+        {
+            base = &processor->MperfBase;
+            tscBase = &processor->MperfTscBase;
+        }
+        else
+        {
+            base = &processor->AperfBase;
+            tscBase = &processor->AperfTscBase;
+        }
+
+        if (writeAccess != FALSE)
+        {
+            *base = 0;
+            *tscBase = guestTsc;
+        }
+        else
+        {
+            UINT64 reading = *base + (guestTsc - *tscBase);
+
+            registers->Rax = (UINT32)reading;
+            registers->Rdx = reading >> 32;
+        }
+
+        SvmAdvanceRip(vmcb);
+        return;
+    }
+#endif
 
     if (msr == HACDBG_MSR_EFER)
     {
@@ -570,14 +1197,7 @@ SvmHandleMsrAccess(
         registers->Rdx = value >> 32;
     }
 
-    if (vmcb->ControlArea.NRip != 0)
-    {
-        vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
-    }
-    else
-    {
-        vmcb->StateSaveArea.Rip += 2;
-    }
+    SvmAdvanceRip(vmcb);
 }
 
 // VMEXIT 总入口：恢复宿主状态，按退出码分派，返回 TRUE 表示离开 VMRUN。
@@ -629,6 +1249,7 @@ SvmHandleVmExit(
         }
 
         vmcb->StateSaveArea.Rax = GuestContext->Registers->Rax;
+        SvmAccountExit(GuestContext);
         return FALSE;
     }
 
@@ -672,6 +1293,21 @@ SvmHandleVmExit(
         SvmHandleMsrAccess(GuestContext);
         break;
 
+#if HACDBG_HIDE_VIRTUALIZATION
+    case SVM_EXIT_VMRUN:
+    case SVM_EXIT_VMLOAD:
+    case SVM_EXIT_VMSAVE:
+    case SVM_EXIT_STGI:
+    case SVM_EXIT_CLGI:
+    case SVM_EXIT_SKINIT:
+        //
+        // The guest EFER keeps SVME set, so these instructions exit only at
+        // CPL 0. Inject #UD and leave RIP on the faulting instruction.
+        //
+        SvmInjectEvent(vmcb, SVM_VECTOR_UD, FALSE, 0);
+        break;
+#endif
+
     case SVM_EXIT_NPF:
         if (NptHandleNestedPageFault(vmcb) == FALSE)
         {
@@ -695,8 +1331,37 @@ SvmHandleVmExit(
         return TRUE;
     }
 
+    SvmAccountExit(GuestContext);
     vmcb->StateSaveArea.Rax = GuestContext->Registers->Rax;
     return FALSE;
+}
+
+VOID
+SvmConcealCpuid(
+    _In_ UINT32 Leaf,
+    _Inout_ HACDBG_GUEST_REGISTERS* Registers
+    )
+{
+#if HACDBG_HIDE_VIRTUALIZATION
+    if (Leaf == SVM_CPUID_LEAF_FEATURES)
+    {
+        Registers->Rcx &= ~(UINT64)SVM_CPUID_SVM;
+    }
+    else if (Leaf == SVM_CPUID_LEAF_SVM)
+    {
+        //
+        // Fn8000_000A is the SVM capability leaf. With the SVM feature bit
+        // cleared, the leaf is reported as unsupported and returns zero.
+        //
+        Registers->Rax = 0;
+        Registers->Rbx = 0;
+        Registers->Rcx = 0;
+        Registers->Rdx = 0;
+    }
+#else
+    UNREFERENCED_PARAMETER(Leaf);
+    UNREFERENCED_PARAMETER(Registers);
+#endif
 }
 
 // 给所有已注册处理器打 TLB 刷新标记。

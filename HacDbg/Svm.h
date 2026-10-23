@@ -8,12 +8,21 @@
 #pragma once
 
 #include "Types.h"
+#include "Guest.h"
 
 //
 // See "SVM Related MSRs".
 //
 #define SVM_MSR_VM_CR                         0xc0010114
 #define SVM_MSR_VM_HSAVE_PA                   0xc0010117
+#define SVM_MSR_TIME_STAMP_COUNTER            0x00000010
+#define SVM_MSR_TSC_DEADLINE                  0x000006e0
+#define SVM_MSR_TSC_ADJUST                    0x0000003b
+#define SVM_MSR_MPERF                         0x000000e7
+#define SVM_MSR_APERF                         0x000000e8
+
+#define SVM_VECTOR_UD                         6u
+#define SVM_VECTOR_GP                         13u
 
 #define SVM_VM_CR_SVMDIS                      (1ull << 4)
 
@@ -23,6 +32,11 @@
 #define SVM_INTERCEPT_MISC1_CPUID             (1ull << 18)
 #define SVM_INTERCEPT_MISC1_MSR_PROT          (1ull << 28)
 #define SVM_INTERCEPT_MISC2_VMRUN              (1ull << 0)
+#define SVM_INTERCEPT_MISC2_VMLOAD             (1ull << 2)
+#define SVM_INTERCEPT_MISC2_VMSAVE             (1ull << 3)
+#define SVM_INTERCEPT_MISC2_STGI               (1ull << 4)
+#define SVM_INTERCEPT_MISC2_CLGI               (1ull << 5)
+#define SVM_INTERCEPT_MISC2_SKINIT             (1ull << 6)
 
 //
 // See "VMCB Layout, State Save Area".
@@ -31,7 +45,22 @@
 
 #define SVM_EXIT_CPUID                        0x0072ull
 #define SVM_EXIT_MSR                          0x007cull
+#define SVM_EXIT_VMRUN                        0x0080ull
+#define SVM_EXIT_VMLOAD                       0x0082ull
+#define SVM_EXIT_VMSAVE                       0x0083ull
+#define SVM_EXIT_STGI                         0x0084ull
+#define SVM_EXIT_CLGI                         0x0085ull
+#define SVM_EXIT_SKINIT                       0x0086ull
 #define SVM_EXIT_NPF                          0x0400ull
+
+//
+// EVENTINJ. Type 3 is an exception. Bit 31 validates the event. Bit 11
+// requests that the error code in bits 63:32 be pushed.
+//
+#define SVM_EVENT_TYPE_EXCEPTION              (3ull << 8)
+#define SVM_EVENT_ERROR_VALID                 (1ull << 11)
+#define SVM_EVENT_VALID                       (1ull << 31)
+#define SVM_VMCB_CLEAN_INTERCEPTS             (1ull << 0)
 
 #define SVM_TLB_CONTROL_FLUSH_GUEST           3ull
 
@@ -173,7 +202,10 @@ C_ASSERT(sizeof(VMCB_CONTROL_AREA) == 0x400);
 C_ASSERT(sizeof(VMCB_STATE_SAVE_AREA) == 0x298);
 C_ASSERT(sizeof(VMCB) == 0x1000);
 C_ASSERT(FIELD_OFFSET(VMCB, StateSaveArea) == 0x400);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, TscOffset) == 0x050);
 C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, ExitCode) == 0x070);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, EventInj) == 0x0a8);
+C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, VmcbClean) == 0x0c0);
 C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, NpEnable) == 0x090);
 C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, NCr3) == 0x0b0);
 C_ASSERT(FIELD_OFFSET(VMCB_CONTROL_AREA, NRip) == 0x0c8);
@@ -236,7 +268,34 @@ typedef struct _SVM_PROCESSOR_CONTEXT
     UINT8 Reserved[5];
     SVM_GUEST_REGISTERS Registers;
     volatile LONG TlbFlushRequested;
+    UINT64 TscAtExit;
+    UINT64 TscOffset;
+    UINT64 LastGuestTsc;
+    UINT64 NativeCpuidCost;
+    UINT64 HardwareTransition;
+    UINT64 AperfBase;
+    UINT64 MperfBase;
+    UINT64 AperfTscBase;
+    UINT64 MperfTscBase;
+    UINT64 GuestTscAdjust;
+    UINT8 TscActive;
+    UINT8 TscDeadlineArmed;
+    UINT8 HostDeadlineValid;
+    UINT64 GuestTscDeadline;
+    UINT64 HostTscDeadline;
 } SVM_PROCESSOR_CONTEXT;
+
+VOID
+/**
+ * @brief Clears SVM capability leaves when virtualization hiding is enabled.
+ *
+ * @param Leaf CPUID leaf that produced Registers.
+ * @param Registers Guest EAX/EBX/ECX/EDX to edit.
+ */
+SvmConcealCpuid(
+    _In_ UINT32 Leaf,
+    _Inout_ HACDBG_GUEST_REGISTERS* Registers
+    );
 
 NTSTATUS
 /**

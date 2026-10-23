@@ -559,6 +559,8 @@ HypercallHandleCpuid(
         GuestContext->Registers->Rdx = registers.Edx;
 #if HACDBG_BACKEND_INTEL
         VmxConcealCpuid(leaf, GuestContext->Registers);
+#else
+        SvmConcealCpuid(leaf, GuestContext->Registers);
 #endif
     }
 }
