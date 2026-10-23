@@ -9889,7 +9889,81 @@ static std::string debugger_prompt_text()
 	return breakpoint::has_paused_thread() == 1 ? "0: kd> " : "kd> ";
 }
 
-static void scroll_console_to_cursor();
+static void move_console_window(CONSOLE_SCREEN_BUFFER_INFO info, int top);
+static void set_cursor_keep_window(const COORD caret);
+
+static std::uint8_t console_row_has_text(const HANDLE output, const SHORT row, const SHORT width)
+{
+	constexpr DWORD chunk_limit = 128;
+	char text[chunk_limit] = {};
+	SHORT column = 0;
+
+	while (column < width)
+	{
+		const DWORD count = static_cast<DWORD>(width - column) > chunk_limit ? chunk_limit : static_cast<DWORD>(width - column);
+		DWORD read = 0;
+		const COORD cell = { column, row };
+
+		if (ReadConsoleOutputCharacterA(output, text, count, cell, &read) == 0 || read == 0)
+		{
+			return 2;
+		}
+
+		for (DWORD index = 0; index < read; index++)
+		{
+			if (text[index] != ' ' && text[index] != '\0')
+			{
+				return 1;
+			}
+		}
+
+		column = static_cast<SHORT>(column + static_cast<SHORT>(read));
+	}
+
+	return 0;
+}
+
+//
+// Growing the screen buffer can pin the cursor to the new bottom and leave
+// the printed lines behind a band of blank rows. The next prompt follows
+// the last row that still has text.
+//
+static void place_cursor_after_output()
+{
+	std::fflush(stdout);
+	const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+	CONSOLE_SCREEN_BUFFER_INFO info = {};
+
+	if (GetConsoleScreenBufferInfo(output, &info) == 0 || info.dwSize.X <= 0 || info.dwSize.Y <= 0)
+	{
+		return;
+	}
+
+	SHORT row = info.dwCursorPosition.Y;
+	std::uint8_t row_state = console_row_has_text(output, row, info.dwSize.X);
+
+	while (row_state == 0 && row > 0)
+	{
+		row = static_cast<SHORT>(row - 1);
+		row_state = console_row_has_text(output, row, info.dwSize.X);
+	}
+
+	if (row_state == 2)
+	{
+		return;
+	}
+
+	COORD target = {};
+	target.X = 0;
+	target.Y = row_state == 1 ? static_cast<SHORT>(row + 1) : 0;
+
+	if (target.Y >= info.dwSize.Y || (target.X == info.dwCursorPosition.X && target.Y == info.dwCursorPosition.Y))
+	{
+		return;
+	}
+
+	set_cursor_keep_window(target);
+}
 
 static void ensure_console_scrollback()
 {
@@ -9901,9 +9975,40 @@ static void ensure_console_scrollback()
 		return;
 	}
 
-	const COORD size = { info.dwSize.X, 9000 };
-	SetConsoleScreenBufferSize(output, size);
-	scroll_console_to_cursor();
+	const COORD cursor = info.dwCursorPosition;
+	const int from_top = info.dwCursorPosition.Y - info.srWindow.Top;
+	const int height = info.srWindow.Bottom - info.srWindow.Top + 1;
+	COORD grown = {};
+	grown.X = info.dwSize.X;
+	grown.Y = 9000;
+
+	if (SetConsoleScreenBufferSize(output, grown) == 0)
+	{
+		return;
+	}
+
+	SetConsoleCursorPosition(output, cursor);
+
+	if (GetConsoleScreenBufferInfo(output, &info) == 0)
+	{
+		return;
+	}
+
+	int top = cursor.Y - from_top;
+
+	if (top < 0)
+	{
+		top = 0;
+	}
+
+	const int max_top = info.dwSize.Y - height;
+
+	if (top > max_top)
+	{
+		top = max_top;
+	}
+
+	move_console_window(info, top);
 }
 
 static void move_console_window(CONSOLE_SCREEN_BUFFER_INFO info, int top)
@@ -9936,6 +10041,39 @@ static void move_console_window(CONSOLE_SCREEN_BUFFER_INFO info, int top)
 	SetConsoleWindowInfo(GetStdHandle(STD_OUTPUT_HANDLE), TRUE, &window);
 }
 
+static void set_cursor_keep_window(const COORD caret)
+{
+	const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+	CONSOLE_SCREEN_BUFFER_INFO info = {};
+
+	if (GetConsoleScreenBufferInfo(output, &info) == 0)
+	{
+		SetConsoleCursorPosition(output, caret);
+
+		return;
+	}
+
+	if (info.dwCursorPosition.X == caret.X && info.dwCursorPosition.Y == caret.Y)
+	{
+		return;
+	}
+
+	const SMALL_RECT window = info.srWindow;
+	SetConsoleCursorPosition(output, caret);
+
+	CONSOLE_SCREEN_BUFFER_INFO after = {};
+
+	if (GetConsoleScreenBufferInfo(output, &after) == 0)
+	{
+		return;
+	}
+
+	if (after.srWindow.Top != window.Top || after.srWindow.Bottom != window.Bottom)
+	{
+		move_console_window(after, window.Top);
+	}
+}
+
 static void scroll_console_pages(const int pages)
 {
 	const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
@@ -9964,7 +10102,7 @@ static void scroll_console_to_top()
 	move_console_window(info, 0);
 }
 
-static void scroll_console_to_cursor()
+static void scroll_console_to_row(const int row)
 {
 	const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
 	CONSOLE_SCREEN_BUFFER_INFO info = {};
@@ -9975,8 +10113,20 @@ static void scroll_console_to_cursor()
 	}
 
 	const int height = info.srWindow.Bottom - info.srWindow.Top + 1;
-	const int cursor_row = info.dwCursorPosition.Y;
-	move_console_window(info, cursor_row - height + 1);
+	move_console_window(info, row - height + 1);
+}
+
+static void scroll_console_to_cursor()
+{
+	const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
+	CONSOLE_SCREEN_BUFFER_INFO info = {};
+
+	if (GetConsoleScreenBufferInfo(output, &info) == 0)
+	{
+		return;
+	}
+
+	scroll_console_to_row(info.dwCursorPosition.Y);
 }
 
 static COORD input_origin = {};
@@ -9989,6 +10139,7 @@ static void capture_input_origin()
 	CONSOLE_SCREEN_BUFFER_INFO info = {};
 
 	input_drawn_cells = 0;
+	place_cursor_after_output();
 
 	if (GetConsoleScreenBufferInfo(output, &info) == 0)
 	{
@@ -10087,7 +10238,7 @@ static void paint_input_line(const std::string& prompt, const std::string& text,
 
 	if (caret.Y < info.dwSize.Y)
 	{
-		SetConsoleCursorPosition(output, caret);
+		set_cursor_keep_window(caret);
 	}
 
 	input_drawn_cells = visible.size();
@@ -10096,7 +10247,6 @@ static void paint_input_line(const std::string& prompt, const std::string& text,
 	shown_cursor.dwSize = shown_cursor.dwSize == 0 ? 25 : shown_cursor.dwSize;
 	shown_cursor.bVisible = TRUE;
 	SetConsoleCursorInfo(output, &shown_cursor);
-	scroll_console_to_cursor();
 }
 
 static std::uint8_t starts_with_ignore_case(const std::string_view text, const std::string_view prefix)
@@ -10446,12 +10596,6 @@ static std::uint8_t read_console_command(std::string& command_out)
 						scroll_console_to_cursor();
 
 						continue;
-					}
-
-					if (key == VK_LEFT || key == VK_RIGHT || key == VK_HOME || key == VK_END || key == VK_BACK || key == VK_DELETE ||
-						key == VK_UP || key == VK_DOWN || key == VK_TAB || key == VK_RETURN || key == VK_F5 || key == VK_F10 || key == VK_F11)
-					{
-						scroll_console_to_cursor();
 					}
 
 					if (key == VK_RETURN)
