@@ -33,6 +33,7 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "../script/script.h"
@@ -4054,6 +4055,20 @@ static std::uint64_t eprocess_for_cr3(const std::uint64_t cr3)
 	return 0;
 }
 
+static std::unordered_map<std::uint64_t, std::unordered_set<std::uint64_t>> g_introduced_user_modules;
+
+static std::uint8_t user_module_was_introduced(const std::uint64_t cr3, const std::uint64_t base)
+{
+	const auto introduced = g_introduced_user_modules.find(cr3);
+
+	if (introduced == g_introduced_user_modules.end())
+	{
+		return 0;
+	}
+
+	return static_cast<std::uint8_t>(introduced->second.contains(base));
+}
+
 static std::uint8_t collect_user_modules(const std::uint64_t cr3, std::vector<reload_module_t>& modules_out)
 {
 	const nt_offsets_t* const nt = guest_nt();
@@ -4108,7 +4123,8 @@ static std::uint8_t collect_user_modules(const std::uint64_t cr3, std::vector<re
 		hypercall::read_guest_virtual_memory(&path_length, entry + entry_full_dll_name, cr3, sizeof(path_length));
 		hypercall::read_guest_virtual_memory(&path_buffer, entry + entry_full_dll_name + 8, cr3, sizeof(path_buffer));
 
-		if (base != 0 && image_size != 0 && name_length != 0 && name_length < 1024 && name_buffer != 0)
+		if (base != 0 && image_size != 0 && name_length != 0 && name_length < 1024 && name_buffer != 0 &&
+			user_module_was_introduced(cr3, base) == 0)
 		{
 			std::wstring wide(name_length / 2, L'\0');
 
@@ -4145,6 +4161,33 @@ static std::uint8_t collect_user_modules(const std::uint64_t cr3, std::vector<re
 	}
 
 	return static_cast<std::uint8_t>(modules_out.empty() == false);
+}
+
+static void note_user_modules_introduced(const std::uint64_t cr3, const std::vector<reload_module_t>& before)
+{
+	std::unordered_set<std::uint64_t> present = {};
+
+	for (const reload_module_t& module : before)
+	{
+		present.insert(module.base);
+	}
+
+	std::vector<reload_module_t> after = {};
+
+	if (collect_user_modules(cr3, after) == 0)
+	{
+		return;
+	}
+
+	std::unordered_set<std::uint64_t>& introduced = g_introduced_user_modules[cr3];
+
+	for (const reload_module_t& module : after)
+	{
+		if (present.contains(module.base) == false)
+		{
+			introduced.insert(module.base);
+		}
+	}
 }
 
 struct live_context_t
@@ -4740,6 +4783,38 @@ static void process_symfix_add(const CLI::App* const command)
 	fmt::print("Symbol search path is: {}\n", symbol_parser::search_path());
 }
 
+struct debugger_module_snapshot_t
+{
+	std::uint64_t cr3 = 0;
+	std::vector<reload_module_t> modules = {};
+	std::uint8_t valid = 0;
+};
+
+static debugger_module_snapshot_t capture_debugger_user_modules()
+{
+	debugger_module_snapshot_t snapshot = {};
+	snapshot.cr3 = user_cr3_for_pid(GetCurrentProcessId());
+
+	if (snapshot.cr3 == 0)
+	{
+		return snapshot;
+	}
+
+	snapshot.valid = collect_user_modules(snapshot.cr3, snapshot.modules);
+
+	return snapshot;
+}
+
+static void note_debugger_modules_introduced(const debugger_module_snapshot_t& before)
+{
+	if (before.valid == 0)
+	{
+		return;
+	}
+
+	note_user_modules_introduced(before.cr3, before.modules);
+}
+
 static void process_reload(const CLI::App* const command)
 {
 	(void)command;
@@ -4935,6 +5010,7 @@ static void process_reload(const CLI::App* const command)
 		std::fflush(stdout);
 	}
 
+	const debugger_module_snapshot_t debugger_modules = capture_debugger_user_modules();
 	std::uint64_t loaded = 0;
 	std::uint8_t stopped = 0;
 
@@ -4956,6 +5032,8 @@ static void process_reload(const CLI::App* const command)
 			break;
 		}
 	}
+
+	note_debugger_modules_introduced(debugger_modules);
 
 	if (stopped == 1)
 	{
@@ -5485,6 +5563,7 @@ static void force_load_listed_modules(const std::vector<reload_module_t>& module
 		std::fflush(stdout);
 	}
 
+	const debugger_module_snapshot_t debugger_modules = capture_debugger_user_modules();
 	std::uint64_t loaded = 0;
 	std::uint8_t stopped = 0;
 
@@ -5506,6 +5585,8 @@ static void force_load_listed_modules(const std::vector<reload_module_t>& module
 			break;
 		}
 	}
+
+	note_debugger_modules_introduced(debugger_modules);
 
 	if (stopped == 1)
 	{
