@@ -61,7 +61,7 @@ C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, GuestRsp) == 0x90);
 C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, GuestRflags) == 0x98);
 C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, TscAtExit) == 0x128);
 C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, TscOffset) == 0x130);
-C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, TscOffsetting) == 0x178);
+C_ASSERT(FIELD_OFFSET(VMX_PROCESSOR_CONTEXT, TscOffsetting) == 0x158);
 
 
 
@@ -81,6 +81,10 @@ static UINT64 g_Cr0Fixed1;
 static UINT64 g_Cr4Fixed0;
 static UINT64 g_Cr4Fixed1;
 static UINT32 g_PinControls;
+static UINT32 g_PreemptionTimerShift;
+static BOOLEAN g_PreemptionTimerAvailable;
+static BOOLEAN g_PreemptionTimerSticky;
+static volatile LONG g_PreemptionTimerLogged;
 static UINT32 g_ProcControls;
 static UINT32 g_ProcControls2;
 static UINT32 g_ExitControls;
@@ -93,22 +97,13 @@ static volatile LONG g_GuestIdleIgnored;
 static volatile LONG g_HvTimeReady;
 static BOOLEAN g_PmcFreeze;
 #if HACDBG_HIDE_VIRTUALIZATION
-static BOOLEAN g_AperfPresent;
 static BOOLEAN g_TscAdjustPresent;
 static BOOLEAN g_TscDeadlinePresent;
 #endif
 
-#define HACDBG_TSC_SAMPLE_COUNT 32
-#define VMX_CPUID_APERF_MPERF   (1u << 0)
 #define VMX_CPUID_TSC_ADJUST    (1u << 1)
 #define VMX_CPUID_TSC_DEADLINE  (1u << 24)
 
-#if HACDBG_HIDE_VIRTUALIZATION
-static UINT64
-VmxGuestTsc(
-    _In_ const VMX_PROCESSOR_CONTEXT* ProcessorContext
-    );
-#endif
 static UINT64 g_HvRefTsc;
 static UINT64 g_HvRefTime;
 static UINT64 g_HvTscFrequency;
@@ -790,10 +785,110 @@ VmxWriteTscDeadline(
     }
 }
 
+static BOOLEAN
+VmxReadTscDeadline(
+    _Out_ UINT64* Deadline
+    )
+{
+    __try
+    {
+        //
+        // INVARIANT: This processor is in VMX root, or still before VMXON.
+        // The value is the host-domain IA32_TSC_DEADLINE. The local APIC
+        // compares it with the time-stamp counter itself.
+        //
+        *Deadline = __readmsr(VMX_MSR_TSC_DEADLINE);
+        return TRUE;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return FALSE;
+    }
+}
+
 //
-// SDM 13.5.4.1: the local APIC fires when the time-stamp counter itself
-// reaches IA32_TSC_DEADLINE. RDTSC in non-root returns that counter plus
-// the TSC offset, and root software has to keep the MSR in the same domain.
+// SDM 13.5.4.1: the timer fires when the TSC reaches a non-zero deadline,
+// then the hardware clears the MSR. A zero readback of an already-due
+// deadline is the published state.
+//
+static BOOLEAN
+VmxDeadlineIsPublished(
+    _In_ UINT64 HostDeadline,
+    _In_ UINT64 Seen
+    )
+{
+    if (Seen == HostDeadline)
+    {
+        return TRUE;
+    }
+
+    if (Seen == 0 && HostDeadline != 0 && HostDeadline <= __rdtsc())
+    {
+        return TRUE;
+    }
+
+    return FALSE;
+}
+
+//
+// SDM 13.5.4.1: writing zero disarms the timer and does not generate the
+// interrupt. A later non-zero write arms it. Overwriting an already armed
+// deadline is also allowed, but a matching readback of that overwrite is
+// not treated as proof that the comparator was armed. The publish path
+// therefore disarms first. Postponing can still deliver the old deadline
+// and clear the MSR, so a future deadline is written again when the
+// readback is zero.
+//
+static BOOLEAN
+VmxPublishTscDeadline(
+    _In_ UINT64 HostDeadline
+    )
+{
+    UINT64 seen;
+    UINT32 attempt;
+
+    if (HostDeadline == 0)
+    {
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: Same domain as VmxWriteTscDeadline. Reads and writes of
+    // IA32_TSC_DEADLINE occur in program order, so the readback observes
+    // the write without a serializing instruction.
+    //
+    for (attempt = 0; attempt < 2; attempt++)
+    {
+        if (VmxWriteTscDeadline(0) == FALSE ||
+            VmxWriteTscDeadline(HostDeadline) == FALSE ||
+            VmxReadTscDeadline(&seen) == FALSE)
+        {
+            return FALSE;
+        }
+
+        if (VmxDeadlineIsPublished(HostDeadline, seen) != FALSE)
+        {
+            return TRUE;
+        }
+
+        if (seen != 0)
+        {
+            return FALSE;
+        }
+    }
+
+    return FALSE;
+}
+
+//
+// SDM 13.5.4.1: the local APIC compares IA32_TSC_DEADLINE with the
+// time-stamp counter itself, then clears the MSR. RDTSC in non-root returns
+// that counter plus the TSC offset. The host deadline is the guest deadline
+// minus the current VMCS offset. A stealth bias of at most 10000 cycles
+// moves that offset, so a stale host deadline would fire early or late.
+// The MSR is rewritten only when the converted deadline or the readback
+// differs. Publishing still disarms before arming, because postponing can
+// deliver the old deadline and clear the MSR.
 //
 static VOID
 VmxSyncTscDeadline(
@@ -803,6 +898,7 @@ VmxSyncTscDeadline(
     UINT64 now;
     UINT64 guestNow;
     UINT64 hostDeadline;
+    UINT64 seen;
 
     if (ProcessorContext->TscDeadlineArmed == FALSE)
     {
@@ -813,9 +909,19 @@ VmxSyncTscDeadline(
     guestNow = now + ProcessorContext->TscOffset;
     if (guestNow >= ProcessorContext->GuestTscDeadline)
     {
-        if (ProcessorContext->HostDeadlineValid == FALSE)
+        //
+        // Writing zero disarms the local APIC without an interrupt. A
+        // non-zero deadline at or behind the TSC makes the timer fire.
+        //
+        if (now == 0)
         {
-            (void)VmxWriteTscDeadline(now);
+            now = 1;
+        }
+
+        if (VmxPublishTscDeadline(now) == FALSE)
+        {
+            ProcessorContext->HostDeadlineValid = FALSE;
+            return;
         }
 
         ProcessorContext->TscDeadlineArmed = FALSE;
@@ -827,14 +933,15 @@ VmxSyncTscDeadline(
 
     hostDeadline = ProcessorContext->GuestTscDeadline - ProcessorContext->TscOffset;
     if (ProcessorContext->HostDeadlineValid != FALSE &&
-        hostDeadline == ProcessorContext->HostTscDeadline)
+        ProcessorContext->HostTscDeadline == hostDeadline &&
+        VmxReadTscDeadline(&seen) != FALSE &&
+        seen == hostDeadline)
     {
         return;
     }
 
-    if (VmxWriteTscDeadline(hostDeadline) == FALSE)
+    if (VmxPublishTscDeadline(hostDeadline) == FALSE)
     {
-        ProcessorContext->TscDeadlineArmed = FALSE;
         ProcessorContext->HostDeadlineValid = FALSE;
         return;
     }
@@ -893,13 +1000,6 @@ VmxHandleMsr(
             {
                 deadline = ProcessorContext->GuestTscDeadline;
             }
-            else
-            {
-                ProcessorContext->TscDeadlineArmed = FALSE;
-                ProcessorContext->HostDeadlineValid = FALSE;
-                ProcessorContext->GuestTscDeadline = 0;
-                ProcessorContext->HostTscDeadline = 0;
-            }
 
             ProcessorContext->Registers.Rax = (UINT32)deadline;
             ProcessorContext->Registers.Rdx = deadline >> 32;
@@ -922,7 +1022,9 @@ VmxHandleMsr(
         desired = (ProcessorContext->Registers.Rdx << 32) |
                   (UINT32)ProcessorContext->Registers.Rax;
         now = __rdtsc();
-        ProcessorContext->TscOffset = desired - now;
+        ProcessorContext->GuestTscOffset = desired - now;
+        ProcessorContext->TscBias = 0;
+        ProcessorContext->TscOffset = ProcessorContext->GuestTscOffset;
         ProcessorContext->LastGuestTsc = desired;
         return VmxAdvanceRip();
     }
@@ -945,6 +1047,7 @@ VmxHandleMsr(
                      (UINT32)ProcessorContext->Registers.Rax;
             delta = adjust - ProcessorContext->GuestTscAdjust;
             ProcessorContext->GuestTscAdjust = adjust;
+            ProcessorContext->GuestTscOffset += delta;
             ProcessorContext->TscOffset += delta;
             ProcessorContext->LastGuestTsc += delta;
         }
@@ -953,47 +1056,6 @@ VmxHandleMsr(
             adjust = ProcessorContext->GuestTscAdjust;
             ProcessorContext->Registers.Rax = (UINT32)adjust;
             ProcessorContext->Registers.Rdx = adjust >> 32;
-        }
-
-        return VmxAdvanceRip();
-    }
-
-    if (g_AperfPresent != FALSE &&
-        (msr == (UINT32)VMX_MSR_MPERF || msr == (UINT32)VMX_MSR_APERF))
-    {
-        UINT64 guestTsc;
-        UINT64* base;
-        UINT64* tscBase;
-
-        if (VmxGuestCpl() != 0)
-        {
-            VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
-            return TRUE;
-        }
-
-        guestTsc = VmxGuestTsc(ProcessorContext);
-        if (msr == (UINT32)VMX_MSR_MPERF)
-        {
-            base = &ProcessorContext->MperfBase;
-            tscBase = &ProcessorContext->MperfTscBase;
-        }
-        else
-        {
-            base = &ProcessorContext->AperfBase;
-            tscBase = &ProcessorContext->AperfTscBase;
-        }
-
-        if (Write != FALSE)
-        {
-            *base = 0;
-            *tscBase = guestTsc;
-        }
-        else
-        {
-            UINT64 reading = *base + (guestTsc - *tscBase);
-
-            ProcessorContext->Registers.Rax = (UINT32)reading;
-            ProcessorContext->Registers.Rdx = reading >> 32;
         }
 
         return VmxAdvanceRip();
@@ -1016,7 +1078,7 @@ VmxHandleMsr(
         return VmxAdvanceRip();
     }
 
-    if (msr >= VMX_MSR_BASIC && msr <= 0x4FFu)
+    if (msr >= VMX_MSR_BASIC && msr <= VMX_MSR_VMX_LAST)
     {
         VmxInjectHardwareException(VMX_VECTOR_GP, TRUE, 0);
         return TRUE;
@@ -1219,6 +1281,9 @@ VmxDispatch(
     case VMX_EXIT_EPT_VIOLATION:
         return VmxHandleEptViolation(ProcessorContext) ? FALSE : VmxLeaveVmx(ProcessorContext);
 
+    case VMX_EXIT_PREEMPTION_TIMER:
+        return FALSE;
+
     case VMX_EXIT_GETSEC:
     case VMX_EXIT_VMCALL:
     case VMX_EXIT_VMCLEAR:
@@ -1242,17 +1307,86 @@ VmxDispatch(
     }
 }
 
+#define VMX_TSC_BIAS_LIMIT    10000ull
+#define VMX_TSC_SAMPLE_COUNT  32u
+
+//
+// SDM 28.5.1: the VMX-preemption timer counts only in non-root operation
+// and exits when it reaches zero. The value loaded on VM-entry is the
+// VMCS field. An expiration exit saves zero when the save control is on.
+// Entering again with zero exits before the guest runs, so this function
+// never writes zero. IA32_VMX_MISC bits 4:0 select which TSC bit advances
+// the count.
+//
+static BOOLEAN
+VmxProgramPreemptionTimer(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext,
+    _In_ BOOLEAN Arm
+    )
+{
+    UINT32 pin = g_PinControls;
+    UINT32 ticks = 0xFFFFFFFFu;
+
+    if (g_PreemptionTimerAvailable == FALSE && g_PreemptionTimerSticky == FALSE)
+    {
+        ProcessorContext->PreemptionTimerArmed = FALSE;
+        return Arm == FALSE;
+    }
+
+    if (Arm != FALSE)
+    {
+        ticks = (UINT32)(VMX_TSC_BIAS_LIMIT >> g_PreemptionTimerShift);
+        if (ticks < 2)
+        {
+            ticks = 2;
+        }
+
+        pin |= VMX_PIN_PREEMPTION_TIMER;
+    }
+    else if (g_PreemptionTimerSticky != FALSE)
+    {
+        pin |= VMX_PIN_PREEMPTION_TIMER;
+    }
+
+    //
+    // INVARIANT: The current VMCS belongs to this processor. The timer
+    // value is non-zero. Pin controls stay within the allowed-1 mask
+    // captured at load, with the preemption-timer bit added only when
+    // that bit may be 1.
+    //
+    if (VmxWrite(VMCS_GUEST_PREEMPTION_TIMER, ticks) == FALSE ||
+        VmxWrite(VMCS_CTRL_PIN_BASED, pin) == FALSE)
+    {
+        return FALSE;
+    }
+
+    ProcessorContext->PreemptionTimerArmed = (UINT8)(Arm != FALSE);
+    return TRUE;
+}
+
+static VOID
+VmxNotePreemptionTimerFailure(
+    VOID
+    )
+{
+    if (InterlockedExchange(&g_PreemptionTimerLogged, 1) == 0)
+    {
+        HACDBG_LOG("HacDbg: Err, VMX-preemption timer could not be programmed.\n");
+    }
+}
+
 #if HACDBG_HIDE_VIRTUALIZATION
+// 进入客户前采 32 次 CPUID，取中位数当作客户自己执行这条指令的开销。
 static UINT64
 VmxMedianCpuidCost(
     VOID
     )
 {
-    UINT64 samples[HACDBG_TSC_SAMPLE_COUNT];
+    UINT64 samples[VMX_TSC_SAMPLE_COUNT];
     UINT32 index;
     UINT32 cursor;
 
-    for (index = 0; index < HACDBG_TSC_SAMPLE_COUNT; index++)
+    for (index = 0; index < VMX_TSC_SAMPLE_COUNT; index++)
     {
         int registers[4];
         UINT64 start;
@@ -1266,7 +1400,7 @@ VmxMedianCpuidCost(
         samples[index] = end - start;
     }
 
-    for (index = 1; index < HACDBG_TSC_SAMPLE_COUNT; index++)
+    for (index = 1; index < VMX_TSC_SAMPLE_COUNT; index++)
     {
         UINT64 value = samples[index];
 
@@ -1280,15 +1414,7 @@ VmxMedianCpuidCost(
         samples[cursor] = value;
     }
 
-    return samples[HACDBG_TSC_SAMPLE_COUNT / 2];
-}
-
-static UINT64
-VmxGuestTsc(
-    _In_ const VMX_PROCESSOR_CONTEXT* ProcessorContext
-    )
-{
-    return __rdtsc() + ProcessorContext->TscOffset;
+    return samples[VMX_TSC_SAMPLE_COUNT / 2];
 }
 #endif
 
@@ -1298,42 +1424,123 @@ VmxAccountExit(
     _In_ UINT32 Reason
     )
 {
-    UINT64 now;
-    UINT64 software;
-    UINT64 charge;
-    UINT64 guest;
+    if (Reason == VMX_EXIT_PREEMPTION_TIMER && ProcessorContext->TscOffsetting == FALSE)
+    {
+        if (VmxProgramPreemptionTimer(ProcessorContext, FALSE) == FALSE)
+        {
+            VmxNotePreemptionTimerFailure();
+        }
+
+        return;
+    }
 
     if (ProcessorContext->TscOffsetting == FALSE)
     {
         return;
     }
 
-    now = __rdtsc();
-    software = now - ProcessorContext->TscAtExit;
-    charge = software + ProcessorContext->HardwareTransition;
-    if (Reason == VMX_EXIT_CPUID)
-    {
-        if (charge > ProcessorContext->NativeCpuidCost)
-        {
-            charge -= ProcessorContext->NativeCpuidCost;
-        }
-        else
-        {
-            charge = 0;
-        }
-    }
-
-    ProcessorContext->TscOffset -= charge;
-    guest = now + ProcessorContext->TscOffset;
-    if (guest < ProcessorContext->LastGuestTsc)
-    {
-        ProcessorContext->TscOffset = ProcessorContext->LastGuestTsc - now;
-        guest = ProcessorContext->LastGuestTsc;
-    }
-
-    ProcessorContext->LastGuestTsc = guest;
 #if HACDBG_HIDE_VIRTUALIZATION
+    UINT64 now;
+    UINT64 elapsed;
+    UINT64 bias;
+    UINT64 guestOffset;
+    UINT64 bareGuest;
+    UINT64 room;
+
+    now = __rdtsc();
+    if (ProcessorContext->TscAtExit != 0 && now >= ProcessorContext->TscAtExit)
+    {
+        elapsed = now - ProcessorContext->TscAtExit;
+    }
+    else
+    {
+        elapsed = VMX_TSC_BIAS_LIMIT + 1;
+    }
+
+    if (elapsed > ~ProcessorContext->HardwareTransition)
+    {
+        elapsed = ~0ull;
+    }
+    else
+    {
+        elapsed += ProcessorContext->HardwareTransition;
+    }
+
+    bias = ProcessorContext->TscBias;
+    if (bias > VMX_TSC_BIAS_LIMIT)
+    {
+        bias = VMX_TSC_BIAS_LIMIT;
+    }
+
+    //
+    // A long exit, including a hypercall that copies memory, must not be
+    // charged. Charging it pulls this processor's guest TSC away from the
+    // others and Windows schedules a high-resolution timer past interrupt
+    // time. The preemption-timer exit exists only to retire the bias.
+    //
+    if (Reason == VMX_EXIT_PREEMPTION_TIMER || elapsed > VMX_TSC_BIAS_LIMIT)
+    {
+        bias = 0;
+    }
+    else
+    {
+        UINT64 charge = 0;
+
+        if (elapsed > ProcessorContext->NativeCpuidCost)
+        {
+            charge = elapsed - ProcessorContext->NativeCpuidCost;
+        }
+
+        if (charge <= VMX_TSC_BIAS_LIMIT - bias)
+        {
+            bias += charge;
+        }
+    }
+
+    guestOffset = ProcessorContext->GuestTscOffset;
+    bareGuest = now + guestOffset;
+    if (bareGuest < ProcessorContext->LastGuestTsc)
+    {
+        guestOffset = ProcessorContext->LastGuestTsc - now;
+        bias = 0;
+    }
+    else
+    {
+        room = bareGuest - ProcessorContext->LastGuestTsc;
+        if (bias > room)
+        {
+            bias = room;
+        }
+    }
+
+    if (bias != 0 && g_PreemptionTimerAvailable != FALSE &&
+        VmxProgramPreemptionTimer(ProcessorContext, TRUE) == FALSE)
+    {
+        VmxNotePreemptionTimerFailure();
+        bias = 0;
+        if (VmxProgramPreemptionTimer(ProcessorContext, FALSE) == FALSE)
+        {
+            VmxNotePreemptionTimerFailure();
+        }
+    }
+    else if (bias == 0 &&
+             (ProcessorContext->PreemptionTimerArmed != FALSE ||
+              Reason == VMX_EXIT_PREEMPTION_TIMER))
+    {
+        if (VmxProgramPreemptionTimer(ProcessorContext, FALSE) == FALSE)
+        {
+            VmxNotePreemptionTimerFailure();
+        }
+    }
+
+    ProcessorContext->GuestTscOffset = guestOffset;
+    ProcessorContext->TscBias = bias;
+    ProcessorContext->TscOffset = guestOffset - bias;
+    ProcessorContext->LastGuestTsc = now + ProcessorContext->TscOffset;
     VmxSyncTscDeadline(ProcessorContext);
+#else
+    UNREFERENCED_PARAMETER(ProcessorContext);
+    UNREFERENCED_PARAMETER(Reason);
 #endif
 }
 
@@ -1501,7 +1708,22 @@ VmxLoadControls(
     g_Cr4Fixed0 = __readmsr(VMX_MSR_CR4_FIXED0);
     g_Cr4Fixed1 = __readmsr(VMX_MSR_CR4_FIXED1);
 
-    g_PinControls = VmxAdjust(0, pinMsr);
+    {
+        UINT64 pinCap = __readmsr(pinMsr);
+
+        g_PinControls = VmxAdjust(0, pinMsr);
+        g_PreemptionTimerSticky = ((UINT32)pinCap & VMX_PIN_PREEMPTION_TIMER) != 0;
+        g_PreemptionTimerAvailable = ((UINT32)(pinCap >> 32) & VMX_PIN_PREEMPTION_TIMER) != 0;
+        g_PreemptionTimerShift = 0;
+        if (g_PreemptionTimerAvailable != FALSE)
+        {
+            //
+            // INVARIANT: IA32_VMX_MISC is readable before VMXON. Bits 4:0
+            // are the VMX-preemption timer's TSC relationship.
+            //
+            g_PreemptionTimerShift = (UINT32)(__readmsr(VMX_MSR_MISC) & 0x1Fu);
+        }
+    }
     {
         UINT32 desiredProc = VMX_PROC_USE_MSR_BITMAPS | VMX_PROC_ACTIVATE_SECONDARY;
 
@@ -1530,10 +1752,6 @@ VmxLoadControls(
     {
         int leaf1[4];
 
-        __cpuidex(cpuInfo, 6, 0);
-        g_AperfPresent = ((UINT32)cpuInfo[2] & VMX_CPUID_APERF_MPERF) != 0 &&
-                         VmxMsrPresent((ULONG)VMX_MSR_APERF) != FALSE &&
-                         VmxMsrPresent((ULONG)VMX_MSR_MPERF) != FALSE;
         __cpuidex(cpuInfo, 7, 0);
         g_TscAdjustPresent = ((UINT32)cpuInfo[1] & VMX_CPUID_TSC_ADJUST) != 0 &&
                              VmxMsrPresent((ULONG)VMX_MSR_TSC_ADJUST) != FALSE;
@@ -1807,7 +2025,7 @@ VmxPrepareProcessor(
 
         VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_FEATURE_CONTROL, VMX_MSR_BITMAP_READ_LOW);
         VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_FEATURE_CONTROL, VMX_MSR_BITMAP_WRITE_LOW);
-        for (msr = (UINT32)VMX_MSR_BASIC; msr <= 0x4FFu; msr++)
+        for (msr = (UINT32)VMX_MSR_BASIC; msr <= (UINT32)VMX_MSR_VMX_LAST; msr++)
         {
             VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, msr, VMX_MSR_BITMAP_READ_LOW);
             VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, msr, VMX_MSR_BITMAP_WRITE_LOW);
@@ -1822,18 +2040,6 @@ VmxPrepareProcessor(
                 VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_TSC_ADJUST,
                              VMX_MSR_BITMAP_READ_LOW);
                 VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_TSC_ADJUST,
-                             VMX_MSR_BITMAP_WRITE_LOW);
-            }
-
-            if (g_AperfPresent != FALSE)
-            {
-                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_MPERF,
-                             VMX_MSR_BITMAP_READ_LOW);
-                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_MPERF,
-                             VMX_MSR_BITMAP_WRITE_LOW);
-                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_APERF,
-                             VMX_MSR_BITMAP_READ_LOW);
-                VmxBitmapSet((PUCHAR)ProcessorContext->MsrBitmap, (UINT32)VMX_MSR_APERF,
                              VMX_MSR_BITMAP_WRITE_LOW);
             }
 
@@ -1959,6 +2165,12 @@ VmxFillVmcs(
         VmxWrite(VMCS_CTRL_CR0_READ_SHADOW, cr0) == FALSE ||
         VmxWrite(VMCS_CTRL_CR4_MASK, VMX_CR4_VMXE) == FALSE ||
         VmxWrite(VMCS_CTRL_CR4_READ_SHADOW, VmxCr4ReadShadow(guestCr4)) == FALSE)
+    {
+        return FALSE;
+    }
+
+    if ((g_PinControls & VMX_PIN_PREEMPTION_TIMER) != 0 &&
+        VmxWrite(VMCS_GUEST_PREEMPTION_TIMER, 0xFFFFFFFFull) == FALSE)
     {
         return FALSE;
     }
@@ -2110,9 +2322,12 @@ VmxVirtualizeProcessor(
 #if HACDBG_HIDE_VIRTUALIZATION
     if (g_SyntheticMsrPassthrough == 0)
     {
+        ProcessorContext->GuestTscOffset = 0;
+        ProcessorContext->TscBias = 0;
+        ProcessorContext->TscOffset = 0;
         ProcessorContext->NativeCpuidCost = VmxMedianCpuidCost();
         ProcessorContext->HardwareTransition = 0;
-        ProcessorContext->TscOffset = 0;
+        ProcessorContext->PreemptionTimerArmed = FALSE;
         ProcessorContext->TscOffsetting = TRUE;
         if (g_TscAdjustPresent != FALSE)
         {
@@ -2178,21 +2393,35 @@ VmxVirtualizeProcessor(
 #if HACDBG_HIDE_VIRTUALIZATION
     if (ProcessorContext->TscOffsetting != FALSE)
     {
+        UINT64 deadline = 0;
+
         ProcessorContext->LastGuestTsc = __rdtsc();
-        ProcessorContext->AperfTscBase = ProcessorContext->LastGuestTsc;
-        ProcessorContext->MperfTscBase = ProcessorContext->LastGuestTsc;
-        if (g_AperfPresent != FALSE)
+        ProcessorContext->TscDeadlineArmed = FALSE;
+        ProcessorContext->HostDeadlineValid = FALSE;
+        ProcessorContext->GuestTscDeadline = 0;
+        ProcessorContext->HostTscDeadline = 0;
+        if (g_TscDeadlinePresent != FALSE)
         {
             __try
             {
-                ProcessorContext->AperfBase = __readmsr(VMX_MSR_APERF);
-                ProcessorContext->MperfBase = __readmsr(VMX_MSR_MPERF);
+                //
+                // INVARIANT: Still before the first VM-entry. The offset is
+                // zero, so the OS deadline is already in the host TSC domain.
+                //
+                deadline = __readmsr(VMX_MSR_TSC_DEADLINE);
             }
             __except (EXCEPTION_EXECUTE_HANDLER)
             {
-                ProcessorContext->AperfBase = 0;
-                ProcessorContext->MperfBase = 0;
+                deadline = 0;
             }
+        }
+
+        if (deadline != 0)
+        {
+            ProcessorContext->GuestTscDeadline = deadline;
+            ProcessorContext->HostTscDeadline = deadline;
+            ProcessorContext->HostDeadlineValid = TRUE;
+            ProcessorContext->TscDeadlineArmed = TRUE;
         }
     }
 #endif

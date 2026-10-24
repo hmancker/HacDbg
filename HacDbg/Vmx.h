@@ -13,10 +13,15 @@
 // VMX capability MSRs. IA32_VMX_BASIC bit 55 selects the TRUE_* control MSRs.
 //
 #define VMX_MSR_BASIC                    0x480ull
+//
+// IA32_VMX_EXIT_CTLS2. The next architectural MSR is IA32_A_PMC0 at 4C1H.
+//
+#define VMX_MSR_VMX_LAST                 0x493ull
 #define VMX_MSR_PINBASED_CTLS            0x481ull
 #define VMX_MSR_PROCBASED_CTLS           0x482ull
 #define VMX_MSR_EXIT_CTLS                0x483ull
 #define VMX_MSR_ENTRY_CTLS               0x484ull
+#define VMX_MSR_MISC                     0x485ull
 #define VMX_MSR_CR0_FIXED0               0x486ull
 #define VMX_MSR_CR0_FIXED1               0x487ull
 #define VMX_MSR_CR4_FIXED0               0x488ull
@@ -30,8 +35,6 @@
 #define VMX_MSR_FEATURE_CONTROL          0x3Aull
 #define VMX_MSR_TIME_STAMP_COUNTER       0x10ull
 #define VMX_MSR_TSC_ADJUST               0x3Bull
-#define VMX_MSR_MPERF                    0xE7ull
-#define VMX_MSR_APERF                    0xE8ull
 #define VMX_MSR_TSC_DEADLINE             0x6E0ull
 #define VMX_MSR_PERF_GLOBAL_CTRL         0x38Full
 
@@ -81,6 +84,7 @@
 
 #define VMX_PIN_EXTERNAL_INT_EXITING     (1u << 0)
 #define VMX_PIN_NMI_EXITING              (1u << 3)
+#define VMX_PIN_PREEMPTION_TIMER         (1u << 6)
 
 #define VMX_EXIT_SAVE_DEBUG              (1u << 2)
 #define VMX_EXIT_HOST_ADDR_SPACE_SIZE    (1u << 9)
@@ -160,6 +164,7 @@
 #define VMCS_GUEST_TR_ACCESS             0x00004822ull
 #define VMCS_GUEST_INTERRUPTIBILITY      0x00004824ull
 #define VMCS_GUEST_ACTIVITY_STATE        0x00004826ull
+#define VMCS_GUEST_PREEMPTION_TIMER      0x0000482Eull
 #define VMCS_GUEST_SYSENTER_CS           0x0000482Aull
 #define VMCS_CTRL_CR0_MASK               0x00006000ull
 #define VMCS_CTRL_CR4_MASK               0x00006002ull
@@ -222,6 +227,7 @@
 #define VMX_EXIT_EPT_VIOLATION           48u
 #define VMX_EXIT_EPT_MISCONFIG           49u
 #define VMX_EXIT_INVEPT                  50u
+#define VMX_EXIT_PREEMPTION_TIMER        52u
 #define VMX_EXIT_INVVPID                 53u
 #define VMX_EXIT_XSETBV                  55u
 #define VMX_EXIT_REASON_MASK             0xFFFFu
@@ -281,10 +287,6 @@ typedef struct _VMX_PROCESSOR_CONTEXT
     UINT64 LastGuestTsc;
     UINT64 NativeCpuidCost;
     UINT64 HardwareTransition;
-    UINT64 AperfBase;
-    UINT64 MperfBase;
-    UINT64 AperfTscBase;
-    UINT64 MperfTscBase;
     UINT64 GuestTscAdjust;
     UINT8 TscOffsetting;
     UINT8 TscDeadlineArmed;
@@ -296,6 +298,9 @@ typedef struct _VMX_PROCESSOR_CONTEXT
     UINT64 SavedGdtrBase;
     UINT64 SavedIdtrBase;
     UINT8 DescriptorTablesSaved;
+    UINT64 GuestTscOffset;
+    UINT64 TscBias;
+    UINT8 PreemptionTimerArmed;
 } VMX_PROCESSOR_CONTEXT;
 
 NTSTATUS

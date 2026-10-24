@@ -124,13 +124,13 @@ VmxExitEntry proc
         mov     [rcx+70h], r14
         mov     [rcx+78h], r15
         mov     r12, rcx
-        cmp     byte ptr [r12+178h], 0
-        je      VmxExitNoSample
+        cmp     byte ptr [r12+158h], 0
+        je      VmxExitNoTsc
         rdtsc
         shl     rdx, 32
         or      rax, rdx
         mov     [r12+128h], rax
-VmxExitNoSample:
+VmxExitNoTsc:
         sub     rsp, 28h
         mov     rcx, r12
         call    VmxHandleVmExit
@@ -138,7 +138,7 @@ VmxExitNoSample:
         test    al, al
         jnz     VmxExitLeave
 
-        cmp     byte ptr [r12+178h], 0
+        cmp     byte ptr [r12+158h], 0
         je      VmxExitNoOffset
         mov     rax, 2010h
         mov     rcx, [r12+130h]
