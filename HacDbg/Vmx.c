@@ -31,6 +31,8 @@
 #define VMX_MSR_BITMAP_WRITE_LOW  2048u
 #define VMX_CPUID_VMX_BIT         (1u << 5)
 #define VMX_CPUID_HYPERVISOR_PRESENT (1u << 31)
+#define VMX_ACCESS_CS_L           (1u << 13)
+#define VMX_ACCESS_CS_DB          (1u << 14)
 #define VMX_ACCESS_UNUSABLE       (1u << 16)
 #define VMX_CR0_NW                (1ull << 29)
 #define VMX_CR0_CD                (1ull << 30)
@@ -297,14 +299,37 @@ VmxAdvanceRip(
 {
     UINT64 rip;
     UINT64 length;
+    UINT64 rights;
+    UINT64 next;
 
     if (VmxRead(VMCS_GUEST_RIP, &rip) == FALSE ||
-        VmxRead(VMCS_EXIT_INSTRUCTION_LENGTH, &length) == FALSE)
+        VmxRead(VMCS_EXIT_INSTRUCTION_LENGTH, &length) == FALSE ||
+        VmxRead(VMCS_GUEST_CS_ACCESS, &rights) == FALSE)
     {
         return FALSE;
     }
 
-    return VmxWrite(VMCS_GUEST_RIP, rip + length);
+    //
+    // Vol. 1 Table 3-1: a 32-bit instruction pointer zero-extends EIP, and a
+    // 16-bit instruction pointer updates only IP. Vol. 3C 29.3.1.4: when CS.L
+    // (access-rights bit 13) is 0, VM-entry requires RIP bits 63:32 to be 0.
+    // CS.D/B is access-rights bit 14. A 2-byte instruction at EIP FFFFFFFE
+    // must become 0, not 100000000.
+    //
+    next = rip + length;
+    if ((rights & VMX_ACCESS_CS_L) == 0)
+    {
+        if ((rights & VMX_ACCESS_CS_DB) != 0)
+        {
+            next &= 0xFFFFFFFFull;
+        }
+        else
+        {
+            next = (rip & 0xFFFF0000ull) | (next & 0xFFFFull);
+        }
+    }
+
+    return VmxWrite(VMCS_GUEST_RIP, next);
 }
 
 static VOID
