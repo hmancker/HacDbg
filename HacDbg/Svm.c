@@ -987,6 +987,43 @@ SvmStopCurrentProcessor(
 
 }
 
+#define SVM_RFLAGS_TF          (1ull << 8)
+#define SVM_DEBUGCTL_BTF       (1ull << 1)
+#define SVM_INTERRUPT_SHADOW   1ull
+
+// 被模拟的指令已经完成。清掉这一条指令的中断影子；TF 且不是 BTF 时注入 #DB。
+static VOID
+SvmFinishStepping(
+    _Inout_ VMCB* Vmcb
+    )
+{
+    UINT64 shadow = Vmcb->ControlArea.InterruptShadow;
+    UINT64 rflags = Vmcb->StateSaveArea.Rflags;
+
+    if ((rflags & SVM_RFLAGS_TF) == 0 && (shadow & SVM_INTERRUPT_SHADOW) == 0)
+    {
+        return;
+    }
+
+    //
+    // APM 15.21.5: INTERRUPT_SHADOW bit 0 is one instruction wide and is
+    // reloaded by VMRUN. The exiting instruction is that instruction. APM
+    // Vol. 2 VMCB offset 068h reserves bits 63:2. TF is RFLAGS bit 8. BTF is
+    // IA32_DEBUGCTL bit 1, saved in the VMCB DBGCTL field. Injecting #DB
+    // after RIP already points at the next instruction delivers the trap there.
+    //
+    Vmcb->ControlArea.InterruptShadow = shadow & ~SVM_INTERRUPT_SHADOW;
+    if ((rflags & SVM_RFLAGS_TF) == 0 ||
+        (Vmcb->StateSaveArea.DbgCtl & SVM_DEBUGCTL_BTF) != 0 ||
+        (Vmcb->ControlArea.EventInj & SVM_EVENT_VALID) != 0)
+    {
+        return;
+    }
+
+    Vmcb->ControlArea.EventInj =
+        (UINT64)SVM_VECTOR_DB | SVM_EVENT_TYPE_EXCEPTION | SVM_EVENT_VALID;
+}
+
 // 用 nRIP 前移客户 RIP。nRIP 为 0 时按两字节指令处理。
 static VOID
 SvmAdvanceRip(
@@ -1001,6 +1038,8 @@ SvmAdvanceRip(
     {
         Vmcb->StateSaveArea.Rip += 2;
     }
+
+    SvmFinishStepping(Vmcb);
 }
 
 // 处理 EFER 和隐藏路径上的时间 MSR。注入异常时不前移 RIP。
@@ -1238,16 +1277,7 @@ SvmHandleVmExit(
         GuestContext->Registers->Rax = 1;
         vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_GUEST;
         vmcb->ControlArea.VmcbClean &= ~(1ull << 4);
-
-        if (vmcb->ControlArea.NRip != 0)
-        {
-            vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
-        }
-        else
-        {
-            vmcb->StateSaveArea.Rip += 2;
-        }
-
+        SvmAdvanceRip(vmcb);
         vmcb->StateSaveArea.Rax = GuestContext->Registers->Rax;
         SvmAccountExit(GuestContext);
         return FALSE;
@@ -1283,9 +1313,7 @@ SvmHandleVmExit(
             view.Rip = vmcb->StateSaveArea.Rip;
             view.InGuest = TRUE;
             HypercallHandleCpuid(&view);
-            vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip != 0
-                                          ? vmcb->ControlArea.NRip
-                                          : vmcb->StateSaveArea.Rip + 2;
+            SvmAdvanceRip(vmcb);
         }
         break;
 

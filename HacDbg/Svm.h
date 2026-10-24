@@ -21,6 +21,7 @@
 #define SVM_MSR_MPERF                         0x000000e7
 #define SVM_MSR_APERF                         0x000000e8
 
+#define SVM_VECTOR_DB                         1u
 #define SVM_VECTOR_UD                         6u
 #define SVM_VECTOR_GP                         13u
 

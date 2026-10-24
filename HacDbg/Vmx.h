@@ -189,6 +189,7 @@
 #define VMCS_GUEST_RSP                   0x0000681Cull
 #define VMCS_GUEST_RIP                   0x0000681Eull
 #define VMCS_GUEST_RFLAGS                0x00006820ull
+#define VMCS_GUEST_PENDING_DEBUG         0x00006822ull
 #define VMCS_GUEST_SYSENTER_ESP          0x00006824ull
 #define VMCS_GUEST_SYSENTER_EIP          0x00006826ull
 #define VMCS_HOST_CR0                    0x00006C00ull
@@ -224,6 +225,7 @@
 #define VMX_EXIT_CR_ACCESS               28u
 #define VMX_EXIT_RDMSR                   31u
 #define VMX_EXIT_WRMSR                   32u
+#define VMX_EXIT_MONITOR_TRAP            37u
 #define VMX_EXIT_EPT_VIOLATION           48u
 #define VMX_EXIT_EPT_MISCONFIG           49u
 #define VMX_EXIT_INVEPT                  50u

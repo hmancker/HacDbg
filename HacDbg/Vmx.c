@@ -292,6 +292,73 @@ VmxWriteSegment(
            VmxWrite(BaseField, Base);
 }
 
+#define VMX_RFLAGS_TF                 (1ull << 8)
+#define VMX_DEBUGCTL_BTF              (1ull << 1)
+#define VMX_INTERRUPTIBILITY_STI      (1ull << 0)
+#define VMX_INTERRUPTIBILITY_MOV_SS   (1ull << 1)
+#define VMX_PENDING_DBG_BS            (1ull << 14)
+
+static BOOLEAN
+VmxFinishStepping(
+    VOID
+    )
+{
+    UINT64 rflags;
+    UINT64 debugCtl;
+    UINT64 interruptibility;
+    UINT64 pending;
+    UINT64 nextPending;
+
+    if (VmxRead(VMCS_GUEST_RFLAGS, &rflags) == FALSE ||
+        VmxRead(VMCS_GUEST_INTERRUPTIBILITY, &interruptibility) == FALSE)
+    {
+        return FALSE;
+    }
+
+    if ((rflags & VMX_RFLAGS_TF) == 0 &&
+        (interruptibility & (VMX_INTERRUPTIBILITY_STI | VMX_INTERRUPTIBILITY_MOV_SS)) == 0)
+    {
+        return TRUE;
+    }
+
+    if (VmxRead(VMCS_GUEST_DEBUGCTL, &debugCtl) == FALSE ||
+        VmxRead(VMCS_GUEST_PENDING_DEBUG, &pending) == FALSE)
+    {
+        return FALSE;
+    }
+
+    //
+    // Vol. 3B 20.3.1.4: TF raises a trap after the instruction, not after the
+    // instruction that set TF. Vol. 3C 29.7.1: blocking by STI (bit 0) and by
+    // MOV SS (bit 1) covers one instruction, then clears. The exiting
+    // instruction is that one instruction. Vol. 3C 29.3.1.5: while either
+    // block is set, or the activity state is HLT, pending-debug bit 14 (BS)
+    // must be 1 when TF is 1 and IA32_DEBUGCTL.BTF (bit 1) is 0, and must be
+    // 0 otherwise. Vol. 3C 29.7.3: with MOV SS blocking clear, a set BS bit is
+    // delivered before the next instruction and updates DR6 when exception-
+    // bitmap bit 1 is 0. Leaving the block set postpones that trap by one
+    // instruction.
+    //
+    interruptibility &= ~(VMX_INTERRUPTIBILITY_STI | VMX_INTERRUPTIBILITY_MOV_SS);
+    nextPending = pending;
+    if ((rflags & VMX_RFLAGS_TF) != 0 && (debugCtl & VMX_DEBUGCTL_BTF) == 0)
+    {
+        nextPending |= VMX_PENDING_DBG_BS;
+    }
+    else
+    {
+        nextPending &= ~VMX_PENDING_DBG_BS;
+    }
+
+    if (VmxWrite(VMCS_GUEST_INTERRUPTIBILITY, interruptibility) == FALSE ||
+        VmxWrite(VMCS_GUEST_PENDING_DEBUG, nextPending) == FALSE)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
 static BOOLEAN
 VmxAdvanceRip(
     VOID
@@ -329,7 +396,12 @@ VmxAdvanceRip(
         }
     }
 
-    return VmxWrite(VMCS_GUEST_RIP, next);
+    if (VmxWrite(VMCS_GUEST_RIP, next) == FALSE)
+    {
+        return FALSE;
+    }
+
+    return VmxFinishStepping();
 }
 
 static VOID
@@ -444,6 +516,645 @@ VmxInvalidateEpt(
 }
 
 static BOOLEAN
+VmxClearMonitorTrap(
+    VOID
+    )
+{
+    //
+    // INVARIANT: The current VMCS belongs to this processor. Primary
+    // processor-based controls are restored to the value captured at load,
+    // which does not set the monitor trap flag.
+    //
+    return VmxWrite(VMCS_CTRL_PROCESSOR_BASED, g_ProcControls);
+}
+
+#if HACDBG_HIDE_VIRTUALIZATION
+#define VMX_TIMER_LOOKBEHIND   16u
+#define VMX_TIMER_LOOKAHEAD    40u
+#define VMX_TIMER_MAX_SPILLS   6u
+#define VMX_TIMER_MAX_NOPS     3u
+
+typedef struct _VMX_TIMER_MEM
+{
+    BOOLEAN RipRelative;
+    UINT8 Base;
+    UINT8 Index;
+    UINT8 Scale;
+    INT32 Displacement;
+    UINT64 Target;
+} VMX_TIMER_MEM;
+
+typedef struct _VMX_TIMER_SPILL
+{
+    VMX_TIMER_MEM Mem;
+    UINT32 Source;
+} VMX_TIMER_SPILL;
+
+static BOOLEAN
+VmxReadGuestCode(
+    _In_ UINT64 Cr3,
+    _In_ UINT64 Address,
+    _Out_writes_bytes_(Size) UINT8* Buffer,
+    _In_ UINT32 Size
+    )
+{
+    UINT32 done = 0;
+
+    if (Size == 0 || Address + Size < Address)
+    {
+        return FALSE;
+    }
+
+    while (done < Size)
+    {
+        UINT32 chunk = 0x1000u - (UINT32)((Address + done) & 0xFFFu);
+        SIZE_T got;
+
+        if (chunk > Size - done)
+        {
+            chunk = Size - done;
+        }
+
+        got = GuestVirtualRead(Cr3, HacDbgGuestVirtualAddress(Address + done), Buffer + done, chunk);
+        if (got != chunk)
+        {
+            return FALSE;
+        }
+
+        done += chunk;
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN
+VmxDecodeMemOperand(
+    _In_reads_(Size) const UINT8* Bytes,
+    _In_ UINT32 Size,
+    _In_ UINT64 InstructionRip,
+    _In_ BOOLEAN Require64,
+    _In_ UINT8 ExpectOpcode,
+    _Out_ UINT32* Length,
+    _Out_ UINT32* Reg,
+    _Out_ VMX_TIMER_MEM* Mem
+    )
+{
+    UINT32 cursor = 0;
+    UINT32 rex = 0;
+    BOOLEAN hasRex = FALSE;
+    UINT32 modrm;
+    UINT32 mod;
+    UINT32 reg;
+    UINT32 rm;
+    UINT32 base = 0xFFu;
+    UINT32 index = 0xFFu;
+    UINT32 scale = 0;
+    INT32 disp = 0;
+    BOOLEAN rip = FALSE;
+    UINT32 sib;
+
+    if (cursor < Size && (Bytes[cursor] & 0xF0u) == 0x40)
+    {
+        hasRex = TRUE;
+        rex = Bytes[cursor];
+        cursor++;
+    }
+
+    if (cursor >= Size || Bytes[cursor] != ExpectOpcode)
+    {
+        return FALSE;
+    }
+
+    cursor++;
+    if (Require64 != FALSE)
+    {
+        if (hasRex == FALSE || (rex & 0x08u) == 0)
+        {
+            return FALSE;
+        }
+    }
+    else if (hasRex != FALSE && (rex & 0x08u) != 0)
+    {
+        return FALSE;
+    }
+
+    if (cursor >= Size)
+    {
+        return FALSE;
+    }
+
+    modrm = Bytes[cursor++];
+    mod = modrm >> 6;
+    reg = (modrm >> 3) & 7u;
+    rm = modrm & 7u;
+    if (hasRex != FALSE && (rex & 0x04u) != 0)
+    {
+        reg |= 8u;
+    }
+
+    if (mod == 3)
+    {
+        return FALSE;
+    }
+
+    if (rm == 4)
+    {
+        if (cursor >= Size)
+        {
+            return FALSE;
+        }
+
+        sib = Bytes[cursor++];
+        scale = sib >> 6;
+        index = (sib >> 3) & 7u;
+        base = sib & 7u;
+        if (hasRex != FALSE && (rex & 0x02u) != 0)
+        {
+            index |= 8u;
+        }
+
+        if (hasRex != FALSE && (rex & 0x01u) != 0)
+        {
+            base |= 8u;
+        }
+
+        if (index == 4)
+        {
+            index = 0xFFu;
+        }
+
+        if (mod == 0 && (base & 7u) == 5u && (base & 8u) == 0)
+        {
+            base = 0xFFu;
+            if (cursor + 4 > Size)
+            {
+                return FALSE;
+            }
+
+            RtlCopyMemory(&disp, Bytes + cursor, sizeof(disp));
+            cursor += 4;
+        }
+        else if (mod == 1)
+        {
+            if (cursor >= Size)
+            {
+                return FALSE;
+            }
+
+            disp = (INT32)(INT8)Bytes[cursor++];
+        }
+        else if (mod == 2)
+        {
+            if (cursor + 4 > Size)
+            {
+                return FALSE;
+            }
+
+            RtlCopyMemory(&disp, Bytes + cursor, sizeof(disp));
+            cursor += 4;
+        }
+        else if (mod != 0)
+        {
+            return FALSE;
+        }
+    }
+    else
+    {
+        base = rm;
+        if (hasRex != FALSE && (rex & 0x01u) != 0)
+        {
+            base |= 8u;
+        }
+
+        if (mod == 0 && rm == 5)
+        {
+            rip = TRUE;
+            base = 0xFFu;
+            if (cursor + 4 > Size)
+            {
+                return FALSE;
+            }
+
+            RtlCopyMemory(&disp, Bytes + cursor, sizeof(disp));
+            cursor += 4;
+        }
+        else if (mod == 1)
+        {
+            if (cursor >= Size)
+            {
+                return FALSE;
+            }
+
+            disp = (INT32)(INT8)Bytes[cursor++];
+        }
+        else if (mod == 2)
+        {
+            if (cursor + 4 > Size)
+            {
+                return FALSE;
+            }
+
+            RtlCopyMemory(&disp, Bytes + cursor, sizeof(disp));
+            cursor += 4;
+        }
+        else if (mod != 0)
+        {
+            return FALSE;
+        }
+    }
+
+    if (index == 0xFFu)
+    {
+        scale = 0;
+    }
+
+    *Length = cursor;
+    *Reg = reg;
+    Mem->RipRelative = rip;
+    Mem->Base = (UINT8)base;
+    Mem->Index = (UINT8)index;
+    Mem->Scale = (UINT8)scale;
+    Mem->Displacement = disp;
+    Mem->Target = (rip != FALSE) ? (UINT64)((INT64)(InstructionRip + cursor) + (INT64)disp) : 0;
+    return TRUE;
+}
+
+static BOOLEAN
+VmxSameTimerMem(
+    _In_ const VMX_TIMER_MEM* Left,
+    _In_ const VMX_TIMER_MEM* Right
+    )
+{
+    if (Left->RipRelative != FALSE || Right->RipRelative != FALSE)
+    {
+        return Left->RipRelative != FALSE && Right->RipRelative != FALSE &&
+               Left->Target == Right->Target;
+    }
+
+    return Left->Base == Right->Base && Left->Index == Right->Index && Left->Scale == Right->Scale &&
+           Left->Displacement == Right->Displacement;
+}
+
+static BOOLEAN
+VmxTimerMemStable(
+    _In_ const VMX_TIMER_MEM* Mem
+    )
+{
+    if (Mem->RipRelative != FALSE)
+    {
+        return (Mem->Target & 7u) == 0 && Mem->Target >= 0x10000ull &&
+               Mem->Target <= 0x00007FFFFFFFFFFFull;
+    }
+
+    if (Mem->Base <= 3 || (Mem->Index != 0xFFu && Mem->Index <= 3))
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN
+VmxMatchZeroedReg(
+    _In_reads_(Count) const UINT8* Bytes,
+    _In_ UINT32 Count,
+    _Out_ UINT32* Length,
+    _Out_ UINT32* Reg
+    )
+{
+    const UINT8* bytes;
+
+    if (Count >= 2)
+    {
+        bytes = Bytes + Count - 2;
+        if ((bytes[0] == 0x31 || bytes[0] == 0x33) && (bytes[1] == 0xC0 || bytes[1] == 0xC9))
+        {
+            *Length = 2;
+            *Reg = (bytes[1] == 0xC0) ? 0u : 1u;
+            return TRUE;
+        }
+    }
+
+    if (Count >= 3)
+    {
+        bytes = Bytes + Count - 3;
+        if (bytes[0] == 0x48 && (bytes[1] == 0x31 || bytes[1] == 0x33) &&
+            (bytes[2] == 0xC0 || bytes[2] == 0xC9))
+        {
+            *Length = 3;
+            *Reg = (bytes[2] == 0xC0) ? 0u : 1u;
+            return TRUE;
+        }
+    }
+
+    if (Count >= 5)
+    {
+        bytes = Bytes + Count - 5;
+        if ((bytes[0] == 0xB8 || bytes[0] == 0xB9) && bytes[1] == 0 && bytes[2] == 0 && bytes[3] == 0 &&
+            bytes[4] == 0)
+        {
+            *Length = 5;
+            *Reg = (bytes[0] == 0xB8) ? 0u : 1u;
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static BOOLEAN
+VmxTimerLinear(
+    _In_ const VMX_PROCESSOR_CONTEXT* ProcessorContext,
+    _In_ UINT64 GuestRsp,
+    _In_ const VMX_TIMER_MEM* Mem,
+    _Out_ UINT64* Address
+    )
+{
+    const UINT64* registers = (const UINT64*)&ProcessorContext->Registers;
+    UINT64 value;
+
+    if (Mem->RipRelative != FALSE)
+    {
+        *Address = Mem->Target;
+        return TRUE;
+    }
+
+    value = (UINT64)(INT64)Mem->Displacement;
+    if (Mem->Base != 0xFFu)
+    {
+        if (Mem->Base == 4)
+        {
+            value += GuestRsp;
+        }
+        else if (Mem->Base > 15)
+        {
+            return FALSE;
+        }
+        else
+        {
+            value += registers[Mem->Base];
+        }
+    }
+
+    if (Mem->Index != 0xFFu)
+    {
+        UINT64 index;
+
+        if (Mem->Index == 4)
+        {
+            index = GuestRsp;
+        }
+        else if (Mem->Index > 15)
+        {
+            return FALSE;
+        }
+        else
+        {
+            index = registers[Mem->Index];
+        }
+
+        if (Mem->Scale > 3)
+        {
+            return FALSE;
+        }
+
+        value += index << Mem->Scale;
+    }
+
+    if (value < 0x10000ull || value > 0x00007FFFFFFFFFFFull)
+    {
+        return FALSE;
+    }
+
+    *Address = value;
+    return TRUE;
+}
+
+//
+// VMAware times a user-mode leaf-0 CPUID against a counter incremented on
+// another logical processor. The other core keeps storing through this exit,
+// so TSC compensation cannot change the sample. The shipped shape is a
+// 64-bit load, up to three single-byte NOPs, xor eax/xor ecx, CPUID, dword
+// spills of eax/ebx/ecx/edx, up to three more NOPs, then the same load.
+// Rewriting that register to the first load makes v_post == v_pre, and every
+// instruction sample is discarded. The spills are performed here so the
+// guest resumes at the compare.
+//
+static BOOLEAN
+VmxNeutralizeTimer(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext,
+    _Inout_ HACDBG_GUEST_VIEW* View
+    )
+{
+    UINT8 behind[VMX_TIMER_LOOKBEHIND];
+    UINT8 ahead[VMX_TIMER_LOOKAHEAD];
+    UINT8 opcode[2];
+    UINT64 rights;
+    UINT64 rflags;
+    UINT64 guestRsp;
+    UINT64 sample;
+    UINT64 next;
+    UINT32 cursor;
+    UINT32 firstLen;
+    UINT32 secondLen;
+    UINT32 firstReg;
+    UINT32 secondReg;
+    UINT32 length;
+    UINT32 matches;
+    UINT32 preReg;
+    UINT32 postReg;
+    UINT32 postLen;
+    UINT32 spillCount;
+    UINT32 pos;
+    UINT32 index;
+    UINT32 nopCount;
+    UINT32 cpuidValue[4];
+    VMX_TIMER_MEM preMem;
+    VMX_TIMER_SPILL spills[VMX_TIMER_MAX_SPILLS];
+
+    if (View->Rip < VMX_TIMER_LOOKBEHIND || VmxGuestCpl() != 3 ||
+        ((UINT32)ProcessorContext->Registers.Rax) != 0 ||
+        ((UINT32)ProcessorContext->Registers.Rcx) != 0)
+    {
+        return FALSE;
+    }
+
+    if (VmxRead(VMCS_GUEST_CS_ACCESS, &rights) == FALSE || (rights & VMX_ACCESS_CS_L) == 0 ||
+        VmxRead(VMCS_GUEST_RFLAGS, &rflags) == FALSE || (rflags & VMX_RFLAGS_TF) != 0)
+    {
+        return FALSE;
+    }
+
+    if (VmxReadGuestCode(View->Cr3, View->Rip, opcode, sizeof(opcode)) == FALSE || opcode[0] != 0x0F ||
+        opcode[1] != 0xA2)
+    {
+        return FALSE;
+    }
+
+    if (VmxReadGuestCode(View->Cr3, View->Rip - VMX_TIMER_LOOKBEHIND, behind, sizeof(behind)) == FALSE)
+    {
+        return FALSE;
+    }
+
+    cursor = VMX_TIMER_LOOKBEHIND;
+    if (VmxMatchZeroedReg(behind, cursor, &secondLen, &secondReg) == FALSE)
+    {
+        return FALSE;
+    }
+
+    cursor -= secondLen;
+    if (VmxMatchZeroedReg(behind, cursor, &firstLen, &firstReg) == FALSE || (firstReg ^ secondReg) != 1u)
+    {
+        return FALSE;
+    }
+
+    cursor -= firstLen;
+    nopCount = 0;
+    while (nopCount < VMX_TIMER_MAX_NOPS && cursor > 0 && behind[cursor - 1] == 0x90)
+    {
+        cursor--;
+        nopCount++;
+    }
+
+    matches = 0;
+    preReg = 0;
+    RtlZeroMemory(&preMem, sizeof(preMem));
+    for (length = 3; length <= 15 && length <= cursor; length++)
+    {
+        UINT32 gotLen;
+        UINT32 gotReg;
+        VMX_TIMER_MEM mem;
+        UINT64 instructionRip = View->Rip - (VMX_TIMER_LOOKBEHIND - (cursor - length));
+
+        if (VmxDecodeMemOperand(behind + cursor - length, length, instructionRip, TRUE, 0x8B, &gotLen,
+                                &gotReg, &mem) == FALSE ||
+            gotLen != length || VmxTimerMemStable(&mem) == FALSE)
+        {
+            continue;
+        }
+
+        matches++;
+        preReg = gotReg;
+        preMem = mem;
+    }
+
+    if (matches != 1 || preReg <= 4 || preReg > 15)
+    {
+        return FALSE;
+    }
+
+    if (VmxReadGuestCode(View->Cr3, View->Rip + 2, ahead, sizeof(ahead)) == FALSE)
+    {
+        return FALSE;
+    }
+
+    spillCount = 0;
+    postReg = 0;
+    postLen = 0;
+    pos = 0;
+    nopCount = 0;
+    while (pos < VMX_TIMER_LOOKAHEAD)
+    {
+        UINT32 gotLen;
+        UINT32 gotReg;
+        VMX_TIMER_MEM mem;
+        UINT64 instructionRip = View->Rip + 2 + pos;
+
+        if (ahead[pos] == 0x90)
+        {
+            if (nopCount >= VMX_TIMER_MAX_NOPS)
+            {
+                return FALSE;
+            }
+
+            nopCount++;
+            pos++;
+            continue;
+        }
+
+        if (VmxDecodeMemOperand(ahead + pos, VMX_TIMER_LOOKAHEAD - pos, instructionRip, TRUE, 0x8B, &gotLen,
+                                &gotReg, &mem) != FALSE)
+        {
+            if (VmxSameTimerMem(&preMem, &mem) == FALSE || gotReg == 4 || gotReg > 15)
+            {
+                return FALSE;
+            }
+
+            postReg = gotReg;
+            postLen = gotLen;
+            break;
+        }
+
+        if (VmxDecodeMemOperand(ahead + pos, VMX_TIMER_LOOKAHEAD - pos, instructionRip, FALSE, 0x89, &gotLen,
+                                &gotReg, &mem) == FALSE ||
+            gotLen == 0 || gotReg > 3 || spillCount >= VMX_TIMER_MAX_SPILLS)
+        {
+            return FALSE;
+        }
+
+        spills[spillCount].Mem = mem;
+        spills[spillCount].Source = gotReg;
+        spillCount++;
+        pos += gotLen;
+    }
+
+    if (postLen == 0)
+    {
+        return FALSE;
+    }
+
+    sample = ((UINT64*)&ProcessorContext->Registers)[preReg];
+    HypercallHandleCpuid(View);
+    cpuidValue[0] = (UINT32)ProcessorContext->Registers.Rax;
+    cpuidValue[1] = (UINT32)ProcessorContext->Registers.Rcx;
+    cpuidValue[2] = (UINT32)ProcessorContext->Registers.Rdx;
+    cpuidValue[3] = (UINT32)ProcessorContext->Registers.Rbx;
+
+    if (VmxRead(VMCS_GUEST_RSP, &guestRsp) == FALSE)
+    {
+        return VmxAdvanceRip();
+    }
+
+    for (index = 0; index < spillCount; index++)
+    {
+        UINT64 address;
+        UINT32 value = cpuidValue[spills[index].Source];
+
+        if (VmxTimerLinear(ProcessorContext, guestRsp, &spills[index].Mem, &address) == FALSE ||
+            GuestVirtualWrite(View->Cr3, HacDbgGuestVirtualAddress(address), &value, sizeof(value)) !=
+                sizeof(value))
+        {
+            return VmxAdvanceRip();
+        }
+    }
+
+    ((UINT64*)&ProcessorContext->Registers)[postReg] = sample;
+    next = View->Rip + 2 + pos + postLen;
+
+    //
+    // INVARIANT: next is the guest instruction after the reloaded counter.
+    // CS.L is 1, so the written RIP is the full 64-bit address. The stack
+    // spills above were written through the guest's own page tables.
+    //
+    if (VmxWrite(VMCS_GUEST_RIP, next) == FALSE)
+    {
+        return VmxAdvanceRip();
+    }
+
+    return VmxFinishStepping();
+}
+#endif
+
+static BOOLEAN
+VmxHandleMonitorTrap(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
+    )
+{
+    UNREFERENCED_PARAMETER(ProcessorContext);
+    return VmxClearMonitorTrap();
+}
+
+static BOOLEAN
 VmxHandleCpuid(
     _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
     )
@@ -475,6 +1186,13 @@ VmxHandleCpuid(
         InterlockedExchange(&ProcessorContext->InveptRequested, 0);
         return VmxAdvanceRip();
     }
+
+#if HACDBG_HIDE_VIRTUALIZATION
+    if (VmxNeutralizeTimer(ProcessorContext, &view) != FALSE)
+    {
+        return TRUE;
+    }
+#endif
 
     HypercallHandleCpuid(&view);
     return VmxAdvanceRip();
@@ -1308,6 +2026,9 @@ VmxDispatch(
 
     case VMX_EXIT_PREEMPTION_TIMER:
         return FALSE;
+
+    case VMX_EXIT_MONITOR_TRAP:
+        return VmxHandleMonitorTrap(ProcessorContext) ? FALSE : VmxLeaveVmx(ProcessorContext);
 
     case VMX_EXIT_GETSEC:
     case VMX_EXIT_VMCALL:
