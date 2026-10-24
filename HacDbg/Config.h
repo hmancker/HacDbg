@@ -42,8 +42,10 @@
 //       AMD 清掉 CPUID Fn8000_0001 ECX[2]，Fn8000_000A 返回全 0，EFER 读结果
 //       不带 SVME，VM_CR 与 VM_HSAVE_PA 注入 #GP，SVM 指令注入 #UD。
 //       没有外层 hypervisor 时，不拦截 RDTSC。AMD 按处理器扣退出开销。
-//       Intel 只把短退出记入最多 10000 个 TSC 拍的补偿，长退出和
-//       VMX-preemption timer 退出把补偿清回 0，避免各核 TSC 被拉开。
+//       Intel 把短退出的宿主采样和校准出的硬件过渡记入补偿。VMX-preemption
+//       timer 可用时最多累加 160000 个 TSC 拍，timer 仍按约 10000 拍清回 0。
+//       timer 不可用时累加上限仍是 10000。长退出和 VMX-preemption timer
+//       退出把补偿清回 0，避免各核 TSC 被拉开。
 //       两边都拦截 IA32_TSC_DEADLINE，把客户写入的虚拟 TSC 换算成主机 TSC。
 //       CPUID.1 ECX[31] 已置位时不做这项补偿，也不打开 PERF_GLOBAL_CTRL
 //       保存/加载和对 Processor Trace 隐藏 VMX。

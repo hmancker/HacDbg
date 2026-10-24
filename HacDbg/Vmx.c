@@ -37,6 +37,10 @@
 #define VMX_CR0_NW                (1ull << 29)
 #define VMX_CR0_CD                (1ull << 30)
 #define VMX_CR4_PCIDE             (1ull << 17)
+//
+// SDM Volume 1, Figure 3-8: RFLAGS.IF is bit 9.
+//
+#define VMX_RFLAGS_IF             0x200ull
 
 //
 // MSR indexes 40000000H-400001FFH sit outside both MSR-bitmap windows,
@@ -1627,11 +1631,12 @@ VmxPublishTscDeadline(
 // SDM 13.5.4.1: the local APIC compares IA32_TSC_DEADLINE with the
 // time-stamp counter itself, then clears the MSR. RDTSC in non-root returns
 // that counter plus the TSC offset. The host deadline is the guest deadline
-// minus the current VMCS offset. A stealth bias of at most 10000 cycles
-// moves that offset, so a stale host deadline would fire early or late.
-// The MSR is rewritten only when the converted deadline or the readback
-// differs. Publishing still disarms before arming, because postponing can
-// deliver the old deadline and clear the MSR.
+// minus the current VMCS offset. A stealth bias moves that offset, so a
+// stale host deadline would fire early or late. While the preemption timer
+// can clear it, the bias is at most 160000 cycles; otherwise it stays at
+// most 10000. The MSR is rewritten only when the converted deadline or the
+// readback differs. Publishing still disarms before arming, because
+// postponing can deliver the old deadline and clear the MSR.
 //
 static VOID
 VmxSyncTscDeadline(
@@ -2053,8 +2058,11 @@ VmxDispatch(
     }
 }
 
-#define VMX_TSC_BIAS_LIMIT    10000ull
-#define VMX_TSC_SAMPLE_COUNT  32u
+#define VMX_TSC_BIAS_LIMIT          10000ull
+#define VMX_TSC_ACCUMULATION_LIMIT  160000ull
+#define VMX_TSC_TRANSITION_DISCARD  50000ull
+#define VMX_TSC_TRANSITION_SAMPLES  16u
+#define VMX_TSC_SAMPLE_COUNT        32u
 
 //
 // SDM 28.5.1: the VMX-preemption timer counts only in non-root operation
@@ -2187,35 +2195,22 @@ VmxAccountExit(
 
 #if HACDBG_HIDE_VIRTUALIZATION
     UINT64 now;
+    UINT64 bracket;
     UINT64 elapsed;
     UINT64 bias;
     UINT64 guestOffset;
     UINT64 bareGuest;
     UINT64 room;
+    UINT64 accumLimit;
 
     now = __rdtsc();
     if (ProcessorContext->TscAtExit != 0 && now >= ProcessorContext->TscAtExit)
     {
-        elapsed = now - ProcessorContext->TscAtExit;
+        bracket = now - ProcessorContext->TscAtExit;
     }
     else
     {
-        elapsed = VMX_TSC_BIAS_LIMIT + 1;
-    }
-
-    if (elapsed > ~ProcessorContext->HardwareTransition)
-    {
-        elapsed = ~0ull;
-    }
-    else
-    {
-        elapsed += ProcessorContext->HardwareTransition;
-    }
-
-    bias = ProcessorContext->TscBias;
-    if (bias > VMX_TSC_BIAS_LIMIT)
-    {
-        bias = VMX_TSC_BIAS_LIMIT;
+        bracket = VMX_TSC_BIAS_LIMIT + 1;
     }
 
     //
@@ -2223,8 +2218,23 @@ VmxAccountExit(
     // charged. Charging it pulls this processor's guest TSC away from the
     // others and Windows schedules a high-resolution timer past interrupt
     // time. The preemption-timer exit exists only to retire the bias.
+    // The length test uses the host bracket only. Adding the unmeasured
+    // transition first would turn a short exit into a long one and drop
+    // the charge that hides it.
     //
-    if (Reason == VMX_EXIT_PREEMPTION_TIMER || elapsed > VMX_TSC_BIAS_LIMIT)
+    bias = ProcessorContext->TscBias;
+    accumLimit = VMX_TSC_BIAS_LIMIT;
+    if (g_PreemptionTimerAvailable != FALSE)
+    {
+        accumLimit = VMX_TSC_ACCUMULATION_LIMIT;
+    }
+
+    if (ProcessorContext->TscBiasReset != FALSE)
+    {
+        ProcessorContext->TscBiasReset = FALSE;
+        bias = 0;
+    }
+    else if (Reason == VMX_EXIT_PREEMPTION_TIMER || bracket > VMX_TSC_BIAS_LIMIT)
     {
         bias = 0;
     }
@@ -2232,12 +2242,27 @@ VmxAccountExit(
     {
         UINT64 charge = 0;
 
+        if (bias > accumLimit)
+        {
+            bias = accumLimit;
+        }
+
+        elapsed = bracket;
+        if (elapsed > ~ProcessorContext->HardwareTransition)
+        {
+            elapsed = ~0ull;
+        }
+        else
+        {
+            elapsed += ProcessorContext->HardwareTransition;
+        }
+
         if (elapsed > ProcessorContext->NativeCpuidCost)
         {
             charge = elapsed - ProcessorContext->NativeCpuidCost;
         }
 
-        if (charge <= VMX_TSC_BIAS_LIMIT - bias)
+        if (charge <= accumLimit - bias)
         {
             bias += charge;
         }
@@ -3032,6 +3057,112 @@ VmxFillVmcs(
            VmxWrite(VMCS_HOST_RIP, (UINT64)(ULONG_PTR)VmxExitEntry);
 }
 
+#if HACDBG_HIDE_VIRTUALIZATION
+//
+// The successful VM-entry resumes at RtlCaptureContext, which takes this
+// path because Virtualized is already set. Samples run in the guest, at
+// kernel CPL, so the user-mode leaf-0 rewrite does not match them. The
+// median excess is the exit cost outside the host rdtsc bracket.
+//
+static VOID
+VmxCalibrateHardwareTransition(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
+    )
+{
+    UINT64 samples[VMX_TSC_TRANSITION_SAMPLES];
+    UINT64 flags;
+    UINT64 median;
+    UINT32 count;
+    UINT32 index;
+    UINT32 cursor;
+    int registers[4];
+
+    flags = __readeflags();
+    _disable();
+    count = 0;
+    median = 0;
+
+    for (index = 0; index < VMX_TSC_TRANSITION_SAMPLES; index++)
+    {
+        UINT64 start;
+        UINT64 end;
+        UINT64 delta;
+        UINT64 excess;
+
+        //
+        // INVARIANT: ProcessorContext is this processor's non-paged pool.
+        // EPT does not hide that page. This code runs in the guest with the
+        // kernel CR3 captured at VM-entry, so the store is the memory the
+        // exit handler reads. CPUID exits before the next guest instruction.
+        //
+        ProcessorContext->TscBiasReset = TRUE;
+        __cpuid(registers, 0);
+        _mm_lfence();
+        start = __rdtsc();
+        __cpuid(registers, 0);
+        end = __rdtsc();
+        _mm_lfence();
+
+        if (end < start)
+        {
+            continue;
+        }
+
+        delta = end - start;
+        if (delta < ProcessorContext->NativeCpuidCost)
+        {
+            continue;
+        }
+
+        excess = delta - ProcessorContext->NativeCpuidCost;
+        if (excess > VMX_TSC_TRANSITION_DISCARD)
+        {
+            continue;
+        }
+
+        samples[count] = excess;
+        count++;
+    }
+
+    if (count != 0)
+    {
+        for (index = 1; index < count; index++)
+        {
+            UINT64 value = samples[index];
+
+            cursor = index;
+            while (cursor > 0 && samples[cursor - 1] > value)
+            {
+                samples[cursor] = samples[cursor - 1];
+                cursor--;
+            }
+
+            samples[cursor] = value;
+        }
+
+        median = samples[count / 2];
+        if (median > VMX_TSC_BIAS_LIMIT)
+        {
+            median = VMX_TSC_BIAS_LIMIT;
+        }
+    }
+
+    ProcessorContext->HardwareTransition = median;
+    ProcessorContext->TscTransitionCalibrated = TRUE;
+    ProcessorContext->TscBiasReset = TRUE;
+    __cpuid(registers, 0);
+
+    if ((flags & VMX_RFLAGS_IF) != 0)
+    {
+        _enable();
+    }
+
+    HACDBG_LOG("HacDbg: TSC transition cpu=%u %I64u cycles.\n",
+               KeGetCurrentProcessorNumber(),
+               median);
+}
+#endif
+
 static VOID
 VmxVirtualizeProcessor(
     _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
@@ -3046,6 +3177,14 @@ VmxVirtualizeProcessor(
 
     if (ProcessorContext->Virtualized != FALSE || ProcessorContext->LaunchCompleted != FALSE)
     {
+#if HACDBG_HIDE_VIRTUALIZATION
+        if (ProcessorContext->Virtualized != FALSE &&
+            ProcessorContext->TscOffsetting != FALSE &&
+            ProcessorContext->TscTransitionCalibrated == FALSE)
+        {
+            VmxCalibrateHardwareTransition(ProcessorContext);
+        }
+#endif
         return;
     }
 
@@ -3073,6 +3212,8 @@ VmxVirtualizeProcessor(
         ProcessorContext->TscOffset = 0;
         ProcessorContext->NativeCpuidCost = VmxMedianCpuidCost();
         ProcessorContext->HardwareTransition = 0;
+        ProcessorContext->TscBiasReset = FALSE;
+        ProcessorContext->TscTransitionCalibrated = FALSE;
         ProcessorContext->PreemptionTimerArmed = FALSE;
         ProcessorContext->TscOffsetting = TRUE;
         if (g_TscAdjustPresent != FALSE)

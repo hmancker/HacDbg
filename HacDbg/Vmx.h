@@ -303,6 +303,12 @@ typedef struct _VMX_PROCESSOR_CONTEXT
     UINT64 GuestTscOffset;
     UINT64 TscBias;
     UINT8 PreemptionTimerArmed;
+    //
+    // Fields below are not read by the exit stub. Inserting anything above
+    // TscOffsetting would move the offsets the stub uses.
+    //
+    UINT8 TscBiasReset;
+    UINT8 TscTransitionCalibrated;
 } VMX_PROCESSOR_CONTEXT;
 
 NTSTATUS
