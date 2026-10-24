@@ -166,6 +166,163 @@ static std::uint64_t copy_section_from_file(const std::vector<std::uint8_t>& fil
 	return available;
 }
 
+static std::uint8_t image_headers_usable(const std::vector<std::uint8_t>& headers, std::uint64_t* const section_end_out)
+{
+	*section_end_out = 0;
+
+	if (headers.size() < sizeof(portable_executable::dos_header_t))
+	{
+		return 0;
+	}
+
+	const auto* const dos = reinterpret_cast<const portable_executable::dos_header_t*>(headers.data());
+
+	if (dos->e_magic != 0x5a4d)
+	{
+		return 0;
+	}
+
+	const std::uint64_t nt_offset = dos->e_lfanew;
+	constexpr std::uint64_t nt_fixed = sizeof(std::uint32_t) + sizeof(portable_executable::file_header_t);
+
+	if (nt_offset > headers.size() || nt_fixed > headers.size() - nt_offset)
+	{
+		return 0;
+	}
+
+	const auto* const nt = reinterpret_cast<const portable_executable::nt_headers_t*>(headers.data() + nt_offset);
+
+	if (nt->signature != 0x4550 || sizeof(portable_executable::nt_headers_t) > headers.size() - nt_offset)
+	{
+		return 0;
+	}
+
+	const std::uint64_t section_offset = nt_offset + nt_fixed + nt->file_header.sizeof_optional_header;
+	const std::uint64_t section_bytes =
+		static_cast<std::uint64_t>(nt->file_header.number_of_sections) * sizeof(portable_executable::section_header_t);
+
+	if (section_offset > headers.size() || section_bytes > headers.size() - section_offset)
+	{
+		*section_end_out = section_offset + section_bytes;
+
+		return 0;
+	}
+
+	*section_end_out = section_offset + section_bytes;
+
+	return 1;
+}
+
+std::uint64_t sys::fill_image_bytes_from_disk(std::uint8_t* const destination, const std::uint64_t guest_address,
+                                              const std::uint64_t bytes_present, const std::uint64_t size,
+                                              const std::uint64_t module_base, const std::uint64_t read_cr3,
+                                              const std::string_view module_path, const std::string_view module_name)
+{
+	constexpr std::uint64_t header_limit = 0x10000;
+
+	if (destination == nullptr || module_base == 0 || read_cr3 == 0 || bytes_present >= size ||
+	    guest_address < module_base || guest_address + bytes_present < guest_address)
+	{
+		return bytes_present;
+	}
+
+	std::vector<std::uint8_t> headers(page_size);
+	const std::uint64_t header_bytes = hypercall::read_guest_virtual_memory(
+		headers.data(), module_base, read_cr3, headers.size());
+
+	if (header_bytes < sizeof(portable_executable::dos_header_t))
+	{
+		return bytes_present;
+	}
+
+	headers.resize(static_cast<std::size_t>(header_bytes));
+
+	std::uint64_t section_end = 0;
+	std::uint8_t usable = image_headers_usable(headers, &section_end);
+
+	if (usable == 0 && section_end > headers.size() && section_end <= header_limit)
+	{
+		const std::uint64_t already = headers.size();
+
+		headers.resize(static_cast<std::size_t>(section_end));
+
+		const std::uint64_t more = hypercall::read_guest_virtual_memory(
+			headers.data() + already, module_base + already, read_cr3, section_end - already);
+
+		headers.resize(static_cast<std::size_t>(already + more));
+		usable = image_headers_usable(headers, &section_end);
+	}
+
+	if (usable == 0)
+	{
+		return bytes_present;
+	}
+
+	const auto* const image = reinterpret_cast<const portable_executable::image_t*>(headers.data());
+	const std::uint32_t image_size = image->nt_headers()->optional_header.size_of_image;
+	const std::uint64_t buffer_rva = guest_address - module_base;
+
+	if (image_size == 0 || buffer_rva >= image_size)
+	{
+		return bytes_present;
+	}
+
+	std::wstring full_name;
+	full_name.reserve(module_path.size());
+
+	for (const char character : module_path)
+	{
+		full_name.push_back(static_cast<wchar_t>(static_cast<unsigned char>(character)));
+	}
+
+	const std::vector<std::uint8_t> file = load_matching_kernel_image(
+		full_name, std::string(module_name), image);
+
+	if (file.empty() == true)
+	{
+		return bytes_present;
+	}
+
+	const std::uint64_t max_end = (std::min)(size, static_cast<std::uint64_t>(image_size) - buffer_rva);
+	std::uint64_t filled = bytes_present;
+
+	while (filled < max_end)
+	{
+		const std::uint64_t rva = buffer_rva + filled;
+		const portable_executable::section_header_t* section = nullptr;
+
+		for (const portable_executable::section_header_t& current : image->sections())
+		{
+			const std::uint64_t section_limit =
+				static_cast<std::uint64_t>(current.virtual_address) + current.virtual_size;
+
+			if (current.virtual_size != 0 && rva >= current.virtual_address && rva < section_limit)
+			{
+				section = &current;
+
+				break;
+			}
+		}
+
+		if (section == nullptr)
+		{
+			break;
+		}
+
+		const std::uint64_t copied = copy_section_from_file(
+			file, *section, rva - section->virtual_address, max_end - filled, destination + filled);
+
+		if (copied == 0)
+		{
+			break;
+		}
+
+		filled += copied;
+	}
+
+	return filled;
+}
+
 static std::vector<std::uint8_t> dump_kernel_module(const std::uint64_t module_base_address,
                                                     std::uint32_t* const failed_sections_out = nullptr,
                                                     const std::wstring& full_name = {},

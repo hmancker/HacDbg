@@ -61,4 +61,26 @@ namespace sys
 	{
 		return local_user_cr3 != 0 ? local_user_cr3 : current_cr3;
 	}
+
+	/**
+	 * @brief Fill guest bytes that were never faulted in from the matching image file.
+	 * @details Reads the headers mapped at the module base. The file is accepted only
+	 * when its time stamp and SizeOfImage match those headers. A kernel path is
+	 * converted first, then System32 and System32\\drivers are tried. Missing bytes
+	 * are copied from the section that contains each RVA. The virtual tail past the
+	 * file data is zero.
+	 * @param destination Buffer that already holds the guest prefix.
+	 * @param guest_address Guest virtual address of destination[0].
+	 * @param bytes_present Contiguous prefix already read from the guest.
+	 * @param size Size of destination, in bytes.
+	 * @param module_base Guest virtual base of the image.
+	 * @param read_cr3 Page table used to read the in-memory headers.
+	 * @param module_path Loader path of the image. May be empty.
+	 * @param module_name File name used for the System32 candidates.
+	 * @return Bytes now valid in destination. An unmatched file leaves bytes_present unchanged.
+	 */
+	std::uint64_t fill_image_bytes_from_disk(std::uint8_t* destination, std::uint64_t guest_address,
+	                                         std::uint64_t bytes_present, std::uint64_t size,
+	                                         std::uint64_t module_base, std::uint64_t read_cr3,
+	                                         std::string_view module_path, std::string_view module_name);
 }

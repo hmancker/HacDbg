@@ -1270,6 +1270,9 @@ static void print_disassembly_line(const std::uint64_t address, const std::strin
 	           static_cast<std::uint32_t>(address), bytes, text);
 }
 
+static std::uint64_t fill_unassemble_gap(std::uint8_t* destination, std::uint64_t guest_address,
+                                         std::uint64_t bytes_read, std::uint64_t size, std::uint64_t read_cr3);
+
 static void unassemble_guest_code(const unassemble_request_t& request)
 {
 	if (request.instruction_count == 0)
@@ -1330,8 +1333,17 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 	}
 
 	std::vector<std::uint8_t> buffer(static_cast<std::size_t>(bytes_to_read));
-	const std::uint64_t bytes_read = hypercall::read_guest_virtual_memory(
+	std::uint64_t bytes_read = hypercall::read_guest_virtual_memory(
 		buffer.data(), request.start_address, read_cr3, bytes_to_read);
+
+	if (bytes_read < bytes_to_read)
+	{
+		//
+		// A page that was never faulted in has no PFN. The bytes are still
+		// in the on-disk image when its timestamp and size match.
+		//
+		bytes_read = fill_unassemble_gap(buffer.data(), request.start_address, bytes_read, bytes_to_read, read_cr3);
+	}
 
 	if (bytes_read == 0)
 	{
@@ -4724,6 +4736,62 @@ static std::uint8_t module_contains(const reload_module_t& module, const std::ui
 {
 	return static_cast<std::uint8_t>(module.base != 0 && address >= module.base &&
 		address < module.base + module.size);
+}
+
+static std::uint64_t fill_unassemble_gap(std::uint8_t* const destination, const std::uint64_t guest_address,
+                                         const std::uint64_t bytes_read, const std::uint64_t size,
+                                         const std::uint64_t read_cr3)
+{
+	if (destination == nullptr || bytes_read >= size || read_cr3 == 0)
+	{
+		return bytes_read;
+	}
+
+	reload_module_t module = {};
+
+	if (guest_address <= 0x00007FFFFFFFFFFFull)
+	{
+		std::vector<reload_module_t> modules = {};
+
+		if (collect_user_modules(read_cr3, modules) == 0)
+		{
+			return bytes_read;
+		}
+
+		for (const reload_module_t& current : modules)
+		{
+			if (module_contains(current, guest_address) == 1)
+			{
+				module = current;
+
+				break;
+			}
+		}
+	}
+	else
+	{
+		for (const auto& [module_name, module_info] : sys::kernel::modules_list)
+		{
+			if (module_info.base_address != 0 && guest_address >= module_info.base_address &&
+			    guest_address < module_info.base_address + module_info.size)
+			{
+				module.name = module_name;
+				module.base = module_info.base_address;
+				module.size = module_info.size;
+				module.cr3 = read_cr3;
+
+				break;
+			}
+		}
+	}
+
+	if (module.base == 0)
+	{
+		return bytes_read;
+	}
+
+	return sys::fill_image_bytes_from_disk(destination, guest_address, bytes_read, size, module.base, read_cr3,
+	                                       module.path, module.name);
 }
 
 static void process_sympath(const CLI::App* const command)
