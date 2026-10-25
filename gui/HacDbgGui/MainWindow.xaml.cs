@@ -1,11 +1,12 @@
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
-using System.Runtime.InteropServices;
+using System.Globalization;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media;
 using System.Windows.Threading;
 using HacDbgGui.Interop;
 using Wpf.Ui.Controls;
@@ -21,8 +22,16 @@ public partial class MainWindow : FluentWindow
         "rip", "rflags", "cr3"
     };
 
+    private static readonly (string Name, int Bit)[] Flags =
+    {
+        ("ZF", 6), ("PF", 2), ("AF", 4),
+        ("OF", 11), ("SF", 7), ("DF", 10),
+        ("CF", 0), ("TF", 8), ("IF", 9)
+    };
+
     private readonly ConcurrentQueue<OutputRecord> _pendingOutput = new();
     private readonly ObservableCollection<RegisterRow> _registers = new();
+    private readonly ObservableCollection<FlagRow> _flags = new();
     private readonly ObservableCollection<BreakpointRow> _breakpoints = new();
     private readonly List<string> _history = new();
 
@@ -33,18 +42,36 @@ public partial class MainWindow : FluentWindow
     private bool _closePending;
     private int _historyIndex;
     private string _breakpointSignature = string.Empty;
+    private readonly ulong[] _lastRegisterValues = new ulong[RegisterNames.Length];
+    private readonly bool[] _lastRegisterKnown = new bool[RegisterNames.Length];
+    private bool _lastRegistersPaused;
+    private bool _lastRegisterSnapshotKnown;
 
     public MainWindow()
     {
         InitializeComponent();
+
+        SolidColorBrush errorBrush = TryFindResource("ErrorBrush") as SolidColorBrush ??
+                                     new SolidColorBrush(Color.FromRgb(0xFF, 0x7B, 0x72));
+        SolidColorBrush warningBrush = TryFindResource("WarningBrush") as SolidColorBrush ??
+                                       new SolidColorBrush(Color.FromRgb(0xE3, 0xB3, 0x41));
+        CommandOutput.TextArea.TextView.LineTransformers.Add(
+            new CommandOutputColorizer(errorBrush, warningBrush));
 
         foreach (string name in RegisterNames)
         {
             _registers.Add(new RegisterRow(name));
         }
 
+        foreach ((string name, int _) in Flags)
+        {
+            _flags.Add(new FlagRow(name));
+        }
+
         RegisterGrid.ItemsSource = _registers;
+        FlagsGrid.ItemsSource = _flags;
         BreakpointGrid.ItemsSource = _breakpoints;
+        InitializeStructuredViews();
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -78,15 +105,9 @@ public partial class MainWindow : FluentWindow
 
         try
         {
-            if (HacDbgCore.ApiVersion != 1)
+            if (HacDbgCore.ValidateAbi() == false)
             {
-                AppendError("core API version mismatch");
-                return;
-            }
-
-            if (HacDbgCore.StateSize != (uint)Marshal.SizeOf<HacDbgCoreState>())
-            {
-                AppendError("core state layout mismatch");
+                AppendError("core API or structure layout mismatch");
                 return;
             }
 
@@ -106,6 +127,8 @@ public partial class MainWindow : FluentWindow
             StatusText.Text = "已连接";
             CommandInput.IsEnabled = true;
             CommandInput.Focus();
+            RequestModules();
+            RequestProcesses();
         }
         catch (DllNotFoundException)
         {
@@ -145,6 +168,7 @@ public partial class MainWindow : FluentWindow
         if (_core.GetState(out HacDbgCoreState state) == 0)
         {
             UpdateState(state);
+            PollStructuredViews();
         }
     }
 
@@ -257,6 +281,7 @@ public partial class MainWindow : FluentWindow
 
         UpdateRegisters(state, paused);
         UpdateBreakpoints(state);
+        UpdateStructuredState(state, paused);
 
         CommandInput.IsEnabled = running;
         ContinueButton.IsEnabled = running;
@@ -276,10 +301,116 @@ public partial class MainWindow : FluentWindow
             state.Registers.Rip, state.Registers.Rflags, state.Registers.Cr3
         };
 
+        bool rflagsKnown = paused && state.Registers.RflagsKnown != 0;
+        bool[] known = new bool[values.Length];
+
+        for (int index = 0; index < known.Length; index++)
+        {
+            known[index] = index == 17 ? rflagsKnown : paused;
+        }
+
+        bool snapshotChanged = false;
+
+        if (paused == true)
+        {
+            if (_lastRegisterSnapshotKnown == false)
+            {
+                snapshotChanged = true;
+            }
+            else
+            {
+                for (int index = 0; index < values.Length; index++)
+                {
+                    if (known[index] != _lastRegisterKnown[index] ||
+                        (known[index] == true && values[index] != _lastRegisterValues[index]))
+                    {
+                        snapshotChanged = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        bool markChanges = paused && _lastRegistersPaused && _lastRegisterSnapshotKnown && snapshotChanged;
+
         for (int index = 0; index < _registers.Count; index++)
         {
-            bool known = paused && (index != 17 || state.Registers.RflagsKnown != 0);
-            _registers[index].Value = known ? $"0x{values[index]:X16}" : "—";
+            _registers[index].Value = known[index] == true ? $"0x{values[index]:X16}" : "—";
+
+            if (paused == false)
+            {
+                _registers[index].Changed = false;
+            }
+            else if (snapshotChanged == true)
+            {
+                _registers[index].Changed = markChanges && known[index] && _lastRegisterKnown[index] &&
+                                           values[index] != _lastRegisterValues[index];
+            }
+        }
+
+        ulong previousRflags = _lastRegisterValues[17];
+        bool previousRflagsKnown = _lastRegisterKnown[17];
+
+        for (int index = 0; index < Flags.Length; index++)
+        {
+            FlagRow flag = _flags[index];
+            int bit = Flags[index].Bit;
+
+            if (paused == false)
+            {
+                flag.Value = "—";
+                flag.Changed = false;
+                continue;
+            }
+
+            if (rflagsKnown == false)
+            {
+                flag.Value = "—";
+
+                if (snapshotChanged == true)
+                {
+                    flag.Changed = false;
+                }
+
+                continue;
+            }
+
+            ulong value = (state.Registers.Rflags >> bit) & 1;
+            flag.Value = value.ToString(CultureInfo.InvariantCulture);
+
+            if (snapshotChanged == true)
+            {
+                flag.Changed = markChanges && previousRflagsKnown &&
+                               ((previousRflags >> bit) & 1) != value;
+            }
+        }
+
+        if (paused == true)
+        {
+            Array.Copy(values, _lastRegisterValues, values.Length);
+            Array.Copy(known, _lastRegisterKnown, known.Length);
+            _lastRegisterSnapshotKnown = true;
+        }
+        else
+        {
+            Array.Clear(_lastRegisterValues);
+            Array.Clear(_lastRegisterKnown);
+            _lastRegisterSnapshotKnown = false;
+        }
+
+        _lastRegistersPaused = paused;
+    }
+
+    private void ClearRegisterChangeMarks()
+    {
+        for (int index = 0; index < _registers.Count; index++)
+        {
+            _registers[index].Changed = false;
+        }
+
+        for (int index = 0; index < _flags.Count; index++)
+        {
+            _flags[index].Changed = false;
         }
     }
 
@@ -361,7 +492,10 @@ public partial class MainWindow : FluentWindow
         if (status != 0)
         {
             AppendError($"execute failed (status {status})");
+            return;
         }
+
+        ClearRegisterChangeMarks();
     }
 
     private void AppendError(string message)
@@ -489,6 +623,7 @@ public partial class MainWindow : FluentWindow
 internal sealed class RegisterRow : INotifyPropertyChanged
 {
     private string _value = "—";
+    private bool _changed;
 
     public RegisterRow(string name)
     {
@@ -509,6 +644,66 @@ internal sealed class RegisterRow : INotifyPropertyChanged
 
             _value = value;
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Value)));
+        }
+    }
+
+    public bool Changed
+    {
+        get => _changed;
+        set
+        {
+            if (_changed == value)
+            {
+                return;
+            }
+
+            _changed = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Changed)));
+        }
+    }
+
+    public event PropertyChangedEventHandler? PropertyChanged;
+}
+
+internal sealed class FlagRow : INotifyPropertyChanged
+{
+    private string _value = "—";
+    private bool _changed;
+
+    public FlagRow(string name)
+    {
+        Name = name;
+    }
+
+    public string Name { get; }
+
+    public string Value
+    {
+        get => _value;
+        set
+        {
+            if (_value == value)
+            {
+                return;
+            }
+
+            _value = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Value)));
+        }
+    }
+
+    public bool Changed
+    {
+        get => _changed;
+        set
+        {
+            if (_changed == value)
+            {
+                return;
+            }
+
+            _changed = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Changed)));
         }
     }
 

@@ -821,6 +821,30 @@ constexpr std::uint64_t unassemble_max_range_bytes = 0x10000;
 static std::uint64_t unassemble_next_address = 0;
 static std::uint8_t unassemble_has_next_address = 0;
 
+static std::atomic<std::uint32_t> g_symbol_load_active = 0;
+static std::atomic<std::uint32_t> g_symbol_load_completed = 0;
+static std::atomic<std::uint32_t> g_symbol_load_total = 0;
+
+struct symbol_load_scope_t
+{
+	explicit symbol_load_scope_t(const std::size_t total)
+	{
+		g_symbol_load_completed.store(0);
+		g_symbol_load_total.store(static_cast<std::uint32_t>(total));
+		g_symbol_load_active.store(1);
+	}
+
+	~symbol_load_scope_t()
+	{
+		g_symbol_load_active.store(0);
+	}
+
+	void step()
+	{
+		g_symbol_load_completed.fetch_add(1);
+	}
+};
+
 static std::uint8_t equals_ignore_case(const std::string_view left, const std::string_view right)
 {
 	if (left.size() != right.size())
@@ -1273,20 +1297,26 @@ static void print_disassembly_line(const std::uint64_t address, const std::strin
 static std::uint64_t fill_unassemble_gap(std::uint8_t* destination, std::uint64_t guest_address,
                                          std::uint64_t bytes_read, std::uint64_t size, std::uint64_t read_cr3);
 
-static void unassemble_guest_code(const unassemble_request_t& request)
+static std::uint8_t build_disassembly(const unassemble_request_t& request, const std::uint64_t requested_cr3,
+                                      std::vector<commands::views::instruction_t>& instructions_out,
+                                      std::uint64_t& next_address_out, std::string& error_out)
 {
+	instructions_out.clear();
+	next_address_out = 0;
+	error_out.clear();
+
 	if (request.instruction_count == 0)
 	{
-		LOG_ERR("instruction count is zero");
+		error_out = "instruction count is zero";
 
-		return;
+		return 0;
 	}
 
 	if (request.is_range == 0 && request.instruction_count > unassemble_max_instruction_count)
 	{
-		LOG_ERR("instruction count is above 0x{:x}", unassemble_max_instruction_count);
+		error_out = fmt::format("instruction count is above 0x{:x}", unassemble_max_instruction_count);
 
-		return;
+		return 0;
 	}
 
 	std::uint64_t bytes_to_read = 0;
@@ -1295,18 +1325,18 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 	{
 		if (request.end_address <= request.start_address)
 		{
-			LOG_ERR("empty range");
+			error_out = "empty range";
 
-			return;
+			return 0;
 		}
 
 		const std::uint64_t span = request.end_address - request.start_address;
 
 		if (span > unassemble_max_range_bytes)
 		{
-			LOG_ERR("range is above 0x{:x} bytes", unassemble_max_range_bytes);
+			error_out = fmt::format("range is above 0x{:x} bytes", unassemble_max_range_bytes);
 
-			return;
+			return 0;
 		}
 
 		bytes_to_read = span + (ZYDIS_MAX_INSTRUCTION_LENGTH - 1);
@@ -1318,18 +1348,19 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 
 	if (bytes_to_read != 0 && request.start_address + bytes_to_read < request.start_address)
 	{
-		LOG_ERR("address range wraps");
+		error_out = "address range wraps";
 
-		return;
+		return 0;
 	}
 
-	const std::uint64_t read_cr3 = cr3_for_guest_address(request.start_address);
+	const std::uint64_t read_cr3 =
+		requested_cr3 != 0 ? requested_cr3 : cr3_for_guest_address(request.start_address);
 
 	if (read_cr3 == 0)
 	{
-		LOG_ERR("current cr3 is not set");
+		error_out = "current cr3 is not set";
 
-		return;
+		return 0;
 	}
 
 	std::vector<std::uint8_t> buffer(static_cast<std::size_t>(bytes_to_read));
@@ -1347,18 +1378,18 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 
 	if (bytes_read == 0)
 	{
-		LOG_ERR("failed to read");
+		error_out = "failed to read";
 
-		return;
+		return 0;
 	}
 
 	ZydisDecoder decoder = {};
 
 	if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
 	{
-		LOG_ERR("failed to set up decoder");
+		error_out = "failed to set up decoder";
 
-		return;
+		return 0;
 	}
 
 	ZydisFormatter formatter = {};
@@ -1367,9 +1398,9 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 	{
 		if (ZYAN_FAILED(ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL)))
 		{
-			LOG_ERR("failed to set up formatter");
+			error_out = "failed to set up formatter";
 
-			return;
+			return 0;
 		}
 	}
 
@@ -1393,11 +1424,14 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 			break;
 		}
 
+		commands::views::instruction_t instruction = {};
+		instruction.address = instruction_address;
+
 		const auto symbol = symbols.find(instruction_address);
 
 		if (symbol != symbols.end())
 		{
-			output::print("{}:\n", symbol->second);
+			instruction.symbol = symbol->second;
 		}
 		else
 		{
@@ -1406,7 +1440,7 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 
 			if (symbol_parser::nearest(instruction_address, pdb_name, pdb_displacement) == 1 && pdb_displacement == 0)
 			{
-				output::print("{}:\n", pdb_name);
+				instruction.symbol = pdb_name;
 			}
 		}
 
@@ -1422,7 +1456,11 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 				break;
 			}
 
-			print_disassembly_line(instruction_address, fmt::format("{:02x}", buffer[static_cast<std::size_t>(offset)]), "??");
+			instruction.bytes = fmt::format("{:02x}", buffer[static_cast<std::size_t>(offset)]);
+			instruction.text = "??";
+			instruction.length = 1;
+			instruction.invalid = 1;
+			instructions_out.push_back(std::move(instruction));
 			offset += 1;
 			shown += 1;
 
@@ -1440,7 +1478,11 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 			    &formatter, &decoded_instruction, operands.data(), decoded_instruction.operand_count,
 			    formatted_instruction, sizeof(formatted_instruction), instruction_address, nullptr)))
 		{
-			print_disassembly_line(instruction_address, fmt::format("{:02x}", buffer[static_cast<std::size_t>(offset)]), "??");
+			instruction.bytes = fmt::format("{:02x}", buffer[static_cast<std::size_t>(offset)]);
+			instruction.text = "??";
+			instruction.length = 1;
+			instruction.invalid = 1;
+			instructions_out.push_back(std::move(instruction));
 			offset += 1;
 			shown += 1;
 
@@ -1455,19 +1497,50 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 			bytes += fmt::format("{:02x}", buffer[static_cast<std::size_t>(offset) + byte_index]);
 		}
 
-		print_disassembly_line(instruction_address, bytes, formatted_instruction);
+		instruction.bytes = std::move(bytes);
+		instruction.text = formatted_instruction;
+		instruction.length = decoded_instruction.length;
+		instructions_out.push_back(std::move(instruction));
 		offset += decoded_instruction.length;
 		shown += 1;
 	}
 
 	if (offset == 0)
 	{
-		LOG_ERR("failed to read");
+		error_out = "failed to read";
+
+		return 0;
+	}
+
+	next_address_out = request.start_address + offset;
+
+	return 1;
+}
+
+static void unassemble_guest_code(const unassemble_request_t& request)
+{
+	std::vector<commands::views::instruction_t> instructions = {};
+	std::uint64_t next_address = 0;
+	std::string error = {};
+
+	if (build_disassembly(request, 0, instructions, next_address, error) == 0)
+	{
+		LOG_ERR("{}", error);
 
 		return;
 	}
 
-	unassemble_next_address = request.start_address + offset;
+	for (const commands::views::instruction_t& instruction : instructions)
+	{
+		if (instruction.symbol.empty() == false)
+		{
+			output::print("{}:\n", instruction.symbol);
+		}
+
+		print_disassembly_line(instruction.address, instruction.bytes, instruction.text);
+	}
+
+	unassemble_next_address = next_address;
 	unassemble_has_next_address = 1;
 	output::flush();
 }
@@ -5079,6 +5152,7 @@ static void process_reload(const CLI::App* const command)
 	}
 
 	const debugger_module_snapshot_t debugger_modules = capture_debugger_user_modules();
+	symbol_load_scope_t symbol_load(modules.size());
 	std::uint64_t loaded = 0;
 	std::uint8_t stopped = 0;
 
@@ -5092,6 +5166,7 @@ static void process_reload(const CLI::App* const command)
 		}
 
 		loaded += load_image_symbols(module, force, overwrite);
+		symbol_load.step();
 
 		if (console_interrupt_requested() == 1)
 		{
@@ -5632,6 +5707,7 @@ static void force_load_listed_modules(const std::vector<reload_module_t>& module
 	}
 
 	const debugger_module_snapshot_t debugger_modules = capture_debugger_user_modules();
+	symbol_load_scope_t symbol_load(modules.size());
 	std::uint64_t loaded = 0;
 	std::uint8_t stopped = 0;
 
@@ -5645,6 +5721,7 @@ static void force_load_listed_modules(const std::vector<reload_module_t>& module
 		}
 
 		loaded += load_image_symbols(module, 1, 0);
+		symbol_load.step();
 
 		if (console_interrupt_requested() == 1)
 		{
@@ -7512,36 +7589,30 @@ static void use_thread_context(const guest_thread_t& thread, const std::uint8_t 
 	set_implicit_process(process, 0, reload);
 }
 
-static void print_process_threads(const guest_process_t& process)
+static std::uint8_t collect_process_thread_objects(const guest_process_t& process, const std::size_t limit,
+                                                   std::vector<guest_thread_t>& threads_out,
+                                                   std::uint8_t& truncated_out)
 {
 	const nt_offsets_t* const nt = guest_nt();
 	const std::uint64_t head = nt == nullptr ? 0 : process.eprocess + nt->eprocess_thread_list_head;
 	std::uint64_t link = 0;
-	std::uint64_t shown = 0;
 
-	output::print("Threads of {} cid {:x}:\n", process.image.empty() == true ? "?" : process.image, process.pid);
+	threads_out.clear();
+	truncated_out = 0;
 
 	if (read_kernel_memory(head, &link, sizeof(link)) == 0 || link == 0)
 	{
-		LOG_ERR("failed to read the thread list");
-
-		return;
+		return 0;
 	}
 
-	for (std::uint64_t count = 0; count < 4096 && link != head && shown < 128; count++)
+	for (std::uint64_t count = 0; count < 4096 && link != head && threads_out.size() < limit; count++)
 	{
 		const std::uint64_t ethread = link - nt->ethread_thread_list_entry;
 		guest_thread_t thread = {};
 
 		if (read_guest_thread(ethread, thread) == 1)
 		{
-			const std::uint8_t kernel = static_cast<std::uint8_t>(thread.has_registers == 1 && thread.registers.rip > 0x00007FFFFFFFFFFFull);
-
-			output::print("  {:x}.{:x} {} {} rip={}", thread.pid, thread.tid, format_windbg_address(thread.ethread),
-			           kernel == 1 || thread.system_thread == 1 ? "kernel" : "user",
-			           thread.has_registers == 1 ? format_windbg_address(thread.registers.rip) : "(none)");
-			output::print(" {}\n", thread_state_name(thread.state));
-			shown++;
+			threads_out.push_back(std::move(thread));
 		}
 
 		if (read_kernel_memory(link, &link, sizeof(link)) == 0 || link == 0)
@@ -7550,7 +7621,36 @@ static void print_process_threads(const guest_process_t& process)
 		}
 	}
 
-	if (shown == 128)
+	truncated_out = static_cast<std::uint8_t>(threads_out.size() == limit);
+
+	return 1;
+}
+
+static void print_process_threads(const guest_process_t& process)
+{
+	output::print("Threads of {} cid {:x}:\n", process.image.empty() == true ? "?" : process.image, process.pid);
+
+	std::vector<guest_thread_t> threads = {};
+	std::uint8_t truncated = 0;
+
+	if (collect_process_thread_objects(process, 128, threads, truncated) == 0)
+	{
+		LOG_ERR("failed to read the thread list");
+
+		return;
+	}
+
+	for (const guest_thread_t& thread : threads)
+	{
+		const std::uint8_t kernel = static_cast<std::uint8_t>(thread.has_registers == 1 && thread.registers.rip > 0x00007FFFFFFFFFFFull);
+
+		output::print("  {:x}.{:x} {} {} rip={}", thread.pid, thread.tid, format_windbg_address(thread.ethread),
+		           kernel == 1 || thread.system_thread == 1 ? "kernel" : "user",
+		           thread.has_registers == 1 ? format_windbg_address(thread.registers.rip) : "(none)");
+		output::print(" {}\n", thread_state_name(thread.state));
+	}
+
+	if (truncated == 1)
 	{
 		output::print("  list truncated\n");
 	}
@@ -9682,6 +9782,307 @@ static std::string normalize_symbol_command(const std::string& command)
 	}
 
 	return std::string(text);
+}
+
+commands::symbol_load_progress_t commands::symbol_load_progress()
+{
+	symbol_load_progress_t progress = {};
+
+	progress.active = g_symbol_load_active.load();
+	progress.completed = g_symbol_load_completed.load();
+	progress.total = g_symbol_load_total.load();
+
+	return progress;
+}
+
+std::uint8_t commands::views::modules(std::vector<module_t>& modules_out, std::string& error_out)
+{
+	modules_out.clear();
+	error_out.clear();
+
+	std::vector<reload_module_t> kernel_modules = {};
+	std::vector<reload_module_t> user_modules = {};
+	append_kernel_modules(kernel_modules, {});
+
+	const std::uint64_t user_cr3 = current_user_cr3();
+
+	if (user_cr3 != 0)
+	{
+		collect_user_modules(user_cr3, user_modules);
+	}
+
+	const std::vector<symbol_parser::module_status_t> loaded = symbol_parser::loaded_modules();
+	const auto add_modules = [&](const std::vector<reload_module_t>& modules, const std::uint8_t kernel)
+	{
+		for (const reload_module_t& module : modules)
+		{
+			if (module.base == 0 || module.size == 0)
+			{
+				continue;
+			}
+
+			module_t entry = {};
+			entry.name = module.name;
+			entry.base = module.base;
+			entry.size = module.size;
+			entry.cr3 = module.cr3;
+			entry.kernel = kernel;
+
+			const symbol_parser::module_status_t* const status = loaded_symbol_status(loaded, module);
+
+			if (status != nullptr)
+			{
+				entry.symbols_loaded = 1;
+				entry.symbol_path = status->pdb_path;
+			}
+			else
+			{
+				entry.symbol_path = module.path;
+			}
+
+			modules_out.push_back(std::move(entry));
+		}
+	};
+
+	add_modules(kernel_modules, 1);
+	add_modules(user_modules, 0);
+
+	if (modules_out.empty() == true)
+	{
+		error_out = "no modules are available";
+
+		return 0;
+	}
+
+	return 1;
+}
+
+std::uint8_t commands::views::processes(std::vector<process_t>& processes_out, std::string& error_out)
+{
+	processes_out.clear();
+	error_out.clear();
+
+	for (const guest_process_t& process : list_guest_processes())
+	{
+		process_t entry = {};
+
+		entry.image = process.image;
+		entry.eprocess = process.eprocess;
+		entry.pid = process.pid;
+		entry.parent_pid = process.parent_pid;
+		entry.peb = process.peb;
+		entry.directory = process.directory;
+		entry.user_cr3 = process.user_cr3;
+		processes_out.push_back(std::move(entry));
+	}
+
+	if (processes_out.empty() == true)
+	{
+		error_out = "unable to read the process list";
+
+		return 0;
+	}
+
+	return 1;
+}
+
+std::uint8_t commands::views::threads(const std::uint64_t eprocess, std::vector<thread_t>& threads_out,
+                                      std::uint8_t& truncated_out, std::string& error_out)
+{
+	constexpr std::size_t thread_limit = 512;
+
+	threads_out.clear();
+	truncated_out = 0;
+	error_out.clear();
+
+	guest_process_t process = {};
+
+	if (read_guest_process(eprocess, process) == 0)
+	{
+		error_out = "process was not found";
+
+		return 0;
+	}
+
+	std::vector<guest_thread_t> threads = {};
+	std::uint8_t truncated = 0;
+
+	if (collect_process_thread_objects(process, thread_limit, threads, truncated) == 0)
+	{
+		error_out = "failed to read the thread list";
+
+		return 0;
+	}
+
+	truncated_out = truncated;
+
+	for (const guest_thread_t& thread : threads)
+	{
+		thread_t entry = {};
+
+		entry.image = thread.image;
+		entry.state_name = thread_state_name(thread.state);
+		entry.wait_reason_name = wait_reason_name(thread.wait_reason);
+		entry.ethread = thread.ethread;
+		entry.eprocess = thread.eprocess;
+		entry.pid = thread.pid;
+		entry.tid = thread.tid;
+		entry.teb = thread.teb;
+		entry.trap = thread.trap;
+		entry.win32_start = thread.win32_start;
+		entry.stack_base = thread.stack_base;
+		entry.stack_limit = thread.stack_limit;
+		entry.kernel_stack = thread.kernel_stack;
+		entry.instruction_pointer = thread.has_registers == 1 ? thread.registers.rip : 0;
+		entry.cr3 = thread.has_registers == 1 ? thread.registers.cr3 : 0;
+		entry.context_switches = thread.context_switches;
+		entry.wait_time = thread.wait_time;
+		entry.state = thread.state;
+		entry.priority = thread.priority;
+		entry.suspend_count = thread.suspend_count;
+		entry.wait_reason = thread.wait_reason;
+		entry.wait_mode = thread.wait_mode;
+		entry.system_thread = thread.system_thread;
+		entry.has_registers = thread.has_registers;
+		entry.kernel = static_cast<std::uint8_t>(
+			thread.system_thread == 1 ||
+			(thread.has_registers == 1 && thread.registers.rip > 0x00007FFFFFFFFFFFull));
+		threads_out.push_back(std::move(entry));
+	}
+
+	return 1;
+}
+
+std::uint8_t commands::views::stack(const std::uint32_t frame_count, std::vector<stack_frame_t>& frames_out,
+                                    std::string& error_out)
+{
+	frames_out.clear();
+	error_out.clear();
+
+	if (breakpoint::has_paused_thread() == 0)
+	{
+		error_out = "no paused thread";
+
+		return 0;
+	}
+
+	breakpoint::registers_t registers = {};
+
+	if (breakpoint::paused_registers(registers) == 0)
+	{
+		error_out = "no paused thread";
+
+		return 0;
+	}
+
+	std::vector<::stack_frame_t> frames = {};
+
+	if (build_stack_frames(registers, frame_count == 0 ? 20 : frame_count, frames) == 0)
+	{
+		error_out = "failed to read the stack";
+
+		return 0;
+	}
+
+	for (const ::stack_frame_t& frame : frames)
+	{
+		commands::views::stack_frame_t entry = {};
+
+		entry.symbol = stack_call_site(frame.rip);
+		entry.child_sp = frame.child_sp;
+		entry.return_address = frame.ret;
+		entry.instruction_pointer = frame.rip;
+
+		for (std::uint32_t index = 0; index < 4; index++)
+		{
+			entry.args[index] = frame.args[index];
+			entry.args_valid_mask |= static_cast<std::uint32_t>(frame.args_valid[index]) << index;
+		}
+
+		entry.has_return = frame.has_ret;
+		frames_out.push_back(std::move(entry));
+	}
+
+	if (frames_out.empty() == true)
+	{
+		error_out = "failed to read the stack";
+
+		return 0;
+	}
+
+	return 1;
+}
+
+std::uint8_t commands::views::read_memory(const std::uint64_t address, const std::uint64_t requested_cr3,
+                                          const std::uint32_t size, memory_t& memory_out, std::string& error_out)
+{
+	memory_out = {};
+	error_out.clear();
+
+	if (size == 0)
+	{
+		error_out = "memory size is zero";
+
+		return 0;
+	}
+
+	const std::uint64_t cr3 = requested_cr3 != 0 ? requested_cr3 : cr3_for_guest_address(address);
+
+	if (cr3 == 0)
+	{
+		error_out = "current cr3 is not set";
+
+		return 0;
+	}
+
+	memory_out.bytes.resize(size);
+	const std::uint64_t bytes_read = hypercall::read_guest_virtual_memory(
+		memory_out.bytes.data(), address, cr3, size);
+
+	if (bytes_read == 0)
+	{
+		error_out = "failed to read";
+
+		return 0;
+	}
+
+	memory_out.bytes.resize(static_cast<std::size_t>(bytes_read));
+	memory_out.address = address;
+	memory_out.cr3 = cr3;
+
+	return 1;
+}
+
+std::uint8_t commands::views::disassemble(const std::uint64_t address, const std::uint64_t cr3,
+                                          const std::uint32_t instruction_count,
+                                          std::vector<instruction_t>& instructions_out,
+                                          std::uint64_t& next_address_out, std::string& error_out)
+{
+	unassemble_request_t request = {};
+	request.start_address = address;
+	request.instruction_count = instruction_count;
+
+	return build_disassembly(request, cr3, instructions_out, next_address_out, error_out);
+}
+
+std::uint8_t commands::views::resolve(const std::string_view text, resolved_address_t& address_out,
+                                      std::string& error_out)
+{
+	address_out = {};
+	error_out.clear();
+
+	const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
+
+	if (resolve_windbg_address(aliases, text, address_out.address) == 0)
+	{
+		error_out = fmt::format("invalid address or symbol: {}", text);
+
+		return 0;
+	}
+
+	address_out.symbol = format_nearest_symbol(address_out.address);
+
+	return 1;
 }
 
 std::uint8_t commands::is_quit_command(const std::string& command)

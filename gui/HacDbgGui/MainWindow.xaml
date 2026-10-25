@@ -4,10 +4,10 @@
                  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
                  xmlns:avalonEdit="http://icsharpcode.net/sharpdevelop/avalonedit"
                  Title="HacDbg"
-                 Width="1400"
+                 Width="1600"
                  Height="900"
-                 MinWidth="1000"
-                 MinHeight="680"
+                 MinWidth="1200"
+                 MinHeight="720"
                  WindowStartupLocation="CenterScreen"
                  WindowBackdropType="Mica"
                  ExtendsContentIntoTitleBar="True"
@@ -37,7 +37,28 @@
                 <Button x:Name="StepIntoButton" Content="单步进入 (F11)" Click="StepIntoButton_Click" IsEnabled="False" />
                 <Button x:Name="StepOverButton" Content="单步跳过 (F10)" Click="StepOverButton_Click" IsEnabled="False" />
                 <Button x:Name="CancelButton" Content="取消当前命令" Click="CancelButton_Click" IsEnabled="False" />
+                <Button x:Name="LoadSymbolsButton" Content="加载符号" Click="LoadSymbolsButton_Click" IsEnabled="False" />
+                <Button x:Name="RefreshViewsButton" Content="刷新视图" Click="RefreshViewsButton_Click" IsEnabled="False" />
                 <Button x:Name="ClearButton" Content="清空输出" Click="ClearButton_Click" />
+                <StackPanel x:Name="SymbolProgressPanel"
+                            Orientation="Horizontal"
+                            VerticalAlignment="Center"
+                            Margin="8,0,0,0"
+                            Visibility="Collapsed">
+                    <ProgressBar x:Name="SymbolProgressBar"
+                                 Width="150"
+                                 Height="6"
+                                 Minimum="0"
+                                 Maximum="1"
+                                 Value="0"
+                                 Foreground="{StaticResource AccentBrush}"
+                                 Background="{StaticResource SurfaceRaisedBrush}"
+                                 BorderThickness="0" />
+                    <TextBlock x:Name="SymbolProgressText"
+                               Margin="8,0,0,0"
+                               VerticalAlignment="Center"
+                               Foreground="{StaticResource MutedBrush}" />
+                </StackPanel>
             </StackPanel>
         </Border>
 
@@ -45,7 +66,7 @@
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="6" />
-                <ColumnDefinition Width="430" />
+                <ColumnDefinition Width="640" />
             </Grid.ColumnDefinitions>
 
             <Border Grid.Column="0"
@@ -110,80 +131,571 @@
                           ResizeBehavior="PreviousAndNext"
                           ResizeDirection="Columns" />
 
-            <Grid Grid.Column="2">
-                <Grid.RowDefinitions>
-                    <RowDefinition Height="3*" />
-                    <RowDefinition Height="6" />
-                    <RowDefinition Height="2*" />
-                </Grid.RowDefinitions>
-
-                <Border Grid.Row="0"
-                        Background="{StaticResource SurfaceBrush}"
-                        BorderBrush="{StaticResource BorderBrush}"
-                        BorderThickness="1"
-                        CornerRadius="6"
-                        Padding="10">
-                    <Grid>
+            <TabControl x:Name="ViewTabs"
+                        Grid.Column="2"
+                        Margin="0,8,0,0"
+                        Background="Transparent"
+                        BorderThickness="0">
+                <TabItem x:Name="StatusTab" Header="状态">
+                    <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="*" />
+                            <RowDefinition Height="4*" />
+                            <RowDefinition Height="6" />
+                            <RowDefinition Height="2*" />
                         </Grid.RowDefinitions>
 
-                        <TextBlock Text="寄存器"
-                                   FontSize="14"
-                                   FontWeight="SemiBold"
-                                   Margin="0,0,0,8" />
+                        <Border Grid.Row="0"
+                                Background="{StaticResource SurfaceBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                Padding="10">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                </Grid.RowDefinitions>
 
-                        <DataGrid x:Name="RegisterGrid"
-                                  Grid.Row="1"
-                                  AutoGenerateColumns="False"
-                                  HeadersVisibility="Column">
-                            <DataGrid.Columns>
-                                <DataGridTextColumn Header="寄存器" Binding="{Binding Name}" Width="110" />
-                                <DataGridTextColumn Header="值" Binding="{Binding Value}" Width="*" />
-                            </DataGrid.Columns>
-                        </DataGrid>
+                                <TextBlock Text="寄存器"
+                                           FontSize="14"
+                                           FontWeight="SemiBold"
+                                           Margin="0,0,0,8" />
+
+                                <DataGrid x:Name="RegisterGrid"
+                                          Grid.Row="1"
+                                          AutoGenerateColumns="False"
+                                          HeadersVisibility="Column">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="寄存器" Binding="{Binding Name}" Width="110" />
+                                        <DataGridTextColumn Header="值" Binding="{Binding Value}" Width="*">
+                                            <DataGridTextColumn.ElementStyle>
+                                                <Style TargetType="TextBlock">
+                                                    <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
+                                                    <Style.Triggers>
+                                                        <DataTrigger Binding="{Binding Changed}" Value="True">
+                                                            <Setter Property="Foreground" Value="{StaticResource ErrorBrush}" />
+                                                            <Setter Property="FontWeight" Value="SemiBold" />
+                                                        </DataTrigger>
+                                                    </Style.Triggers>
+                                                </Style>
+                                            </DataGridTextColumn.ElementStyle>
+                                        </DataGridTextColumn>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+
+                                <TextBlock Grid.Row="2"
+                                           Text="标志"
+                                           FontSize="13"
+                                           FontWeight="SemiBold"
+                                           Margin="0,8,0,4" />
+
+                                <ItemsControl x:Name="FlagsGrid" Grid.Row="3">
+                                    <ItemsControl.ItemsPanel>
+                                        <ItemsPanelTemplate>
+                                            <UniformGrid Columns="3" />
+                                        </ItemsPanelTemplate>
+                                    </ItemsControl.ItemsPanel>
+                                    <ItemsControl.ItemTemplate>
+                                        <DataTemplate>
+                                            <Border Margin="0,0,6,4"
+                                                    Padding="6,2"
+                                                    Background="{StaticResource SurfaceRaisedBrush}"
+                                                    BorderBrush="{StaticResource BorderBrush}"
+                                                    BorderThickness="1"
+                                                    CornerRadius="4">
+                                                <Grid>
+                                                    <Grid.ColumnDefinitions>
+                                                        <ColumnDefinition Width="Auto" />
+                                                        <ColumnDefinition Width="*" />
+                                                    </Grid.ColumnDefinitions>
+                                                    <TextBlock Text="{Binding Name}"
+                                                               FontFamily="Cascadia Mono, Consolas"
+                                                               FontWeight="SemiBold"
+                                                               Foreground="{StaticResource MutedBrush}" />
+                                                    <TextBlock Grid.Column="1"
+                                                               Text="{Binding Value}"
+                                                               HorizontalAlignment="Right"
+                                                               Margin="10,0,0,0"
+                                                               FontFamily="Cascadia Mono, Consolas"
+                                                               FontWeight="SemiBold">
+                                                        <TextBlock.Style>
+                                                            <Style TargetType="TextBlock">
+                                                                <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
+                                                                <Style.Triggers>
+                                                                    <DataTrigger Binding="{Binding Changed}" Value="True">
+                                                                        <Setter Property="Foreground" Value="{StaticResource ErrorBrush}" />
+                                                                    </DataTrigger>
+                                                                </Style.Triggers>
+                                                            </Style>
+                                                        </TextBlock.Style>
+                                                    </TextBlock>
+                                                </Grid>
+                                            </Border>
+                                        </DataTemplate>
+                                    </ItemsControl.ItemTemplate>
+                                </ItemsControl>
+                            </Grid>
+                        </Border>
+
+                        <GridSplitter Grid.Row="1"
+                                      HorizontalAlignment="Stretch"
+                                      VerticalAlignment="Stretch"
+                                      Background="Transparent"
+                                      ResizeBehavior="PreviousAndNext"
+                                      ResizeDirection="Rows" />
+
+                        <Border Grid.Row="2"
+                                Background="{StaticResource SurfaceBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                Padding="10">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+
+                                <TextBlock Text="断点"
+                                           FontSize="14"
+                                           FontWeight="SemiBold"
+                                           Margin="0,0,0,8" />
+
+                                <DataGrid x:Name="BreakpointGrid"
+                                          Grid.Row="1"
+                                          AutoGenerateColumns="False"
+                                          HeadersVisibility="Column">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="ID" Binding="{Binding Id}" Width="45" />
+                                        <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="170" />
+                                        <DataGridTextColumn Header="状态" Binding="{Binding Enabled}" Width="55" />
+                                        <DataGridTextColumn Header="暂停" Binding="{Binding Pause}" Width="55" />
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </Border>
                     </Grid>
-                </Border>
+                </TabItem>
 
-                <GridSplitter Grid.Row="1"
-                              HorizontalAlignment="Stretch"
-                              VerticalAlignment="Stretch"
-                              Background="Transparent"
-                              ResizeBehavior="PreviousAndNext"
-                              ResizeDirection="Rows" />
+                <TabItem x:Name="ModulesTab" Header="模块">
+                    <Border Margin="0,6,0,0"
+                            Background="{StaticResource SurfaceBrush}"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            Padding="10">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
 
-                <Border Grid.Row="2"
-                        Background="{StaticResource SurfaceBrush}"
-                        BorderBrush="{StaticResource BorderBrush}"
-                        BorderThickness="1"
-                        CornerRadius="6"
-                        Padding="10">
-                    <Grid>
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+
+                                <TextBlock Text="模块"
+                                           FontSize="14"
+                                           FontWeight="SemiBold" />
+                                <TextBlock x:Name="ModulesStatusText"
+                                           Grid.Column="1"
+                                           HorizontalAlignment="Right"
+                                           VerticalAlignment="Center"
+                                           Margin="8,0,12,0"
+                                           Foreground="{StaticResource MutedBrush}" />
+                                <Button Grid.Column="2"
+                                        Content="刷新"
+                                        Click="RefreshModulesButton_Click" />
+                            </Grid>
+
+                            <DataGrid x:Name="ModuleGrid"
+                                      Grid.Row="1"
+                                      AutoGenerateColumns="False"
+                                      MouseDoubleClick="ModuleGrid_MouseDoubleClick">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="模块" Binding="{Binding Name}" Width="150" />
+                                    <DataGridTextColumn Header="基址" Binding="{Binding Base}" Width="165" />
+                                    <DataGridTextColumn Header="大小" Binding="{Binding Size}" Width="85" />
+                                    <DataGridTextColumn Header="类型" Binding="{Binding Kind}" Width="65" />
+                                    <DataGridTextColumn Header="符号" Binding="{Binding Symbols}" Width="70" />
+                                    <DataGridTextColumn Header="路径" Binding="{Binding SymbolPath}" Width="*" />
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Grid>
+                    </Border>
+                </TabItem>
+
+                <TabItem x:Name="ProcessesTab" Header="进程 / 线程">
+                    <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="Auto" />
-                            <RowDefinition Height="*" />
+                            <RowDefinition Height="3*" />
+                            <RowDefinition Height="6" />
+                            <RowDefinition Height="2*" />
                         </Grid.RowDefinitions>
 
-                        <TextBlock Text="断点"
-                                   FontSize="14"
-                                   FontWeight="SemiBold"
-                                   Margin="0,0,0,8" />
+                        <Border Grid.Row="0"
+                                Background="{StaticResource SurfaceBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                Padding="10">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
 
-                        <DataGrid x:Name="BreakpointGrid"
-                                  Grid.Row="1"
-                                  AutoGenerateColumns="False"
-                                  HeadersVisibility="Column">
-                            <DataGrid.Columns>
-                                <DataGridTextColumn Header="ID" Binding="{Binding Id}" Width="45" />
-                                <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="170" />
-                                <DataGridTextColumn Header="状态" Binding="{Binding Enabled}" Width="55" />
-                                <DataGridTextColumn Header="暂停" Binding="{Binding Pause}" Width="55" />
-                            </DataGrid.Columns>
-                        </DataGrid>
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="进程"
+                                               FontSize="14"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock Grid.Column="1"
+                                               Text="过滤"
+                                               VerticalAlignment="Center"
+                                               Margin="12,0,6,0"
+                                               Foreground="{StaticResource MutedBrush}" />
+                                    <TextBox x:Name="ProcessFilterBox"
+                                             Grid.Column="2"
+                                             Width="160"
+                                             ToolTip="按 PID（十进制或 0x 十六进制）或进程名过滤"
+                                             TextChanged="ProcessFilterBox_TextChanged" />
+                                    <TextBlock x:Name="ProcessesStatusText"
+                                               Grid.Column="3"
+                                               HorizontalAlignment="Right"
+                                               VerticalAlignment="Center"
+                                               Margin="8,0,12,0"
+                                               Foreground="{StaticResource MutedBrush}" />
+                                    <Button Grid.Column="4"
+                                            Content="刷新"
+                                            Click="RefreshProcessesButton_Click" />
+                                </Grid>
+
+                                <DataGrid x:Name="ProcessGrid"
+                                          Grid.Row="1"
+                                          AutoGenerateColumns="False"
+                                          SelectionChanged="ProcessGrid_SelectionChanged">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="PID" Binding="{Binding Pid}" Width="65" />
+                                        <DataGridTextColumn Header="映像" Binding="{Binding Image}" Width="145" />
+                                        <DataGridTextColumn Header="父 PID" Binding="{Binding ParentPid}" Width="75" />
+                                        <DataGridTextColumn Header="EPROCESS" Binding="{Binding Eprocess}" Width="170" />
+                                        <DataGridTextColumn Header="CR3" Binding="{Binding UserCr3}" Width="170" />
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </Border>
+
+                        <GridSplitter Grid.Row="1"
+                                      HorizontalAlignment="Stretch"
+                                      VerticalAlignment="Stretch"
+                                      Background="Transparent"
+                                      ResizeBehavior="PreviousAndNext"
+                                      ResizeDirection="Rows" />
+
+                        <Border Grid.Row="2"
+                                Background="{StaticResource SurfaceBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                Padding="10">
+                            <Grid>
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+
+                                <Grid Margin="0,0,0,8">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="线程"
+                                               FontSize="14"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock Grid.Column="1"
+                                               Text="过滤"
+                                               VerticalAlignment="Center"
+                                               Margin="12,0,6,0"
+                                               Foreground="{StaticResource MutedBrush}" />
+                                    <TextBox x:Name="ThreadFilterBox"
+                                             Grid.Column="2"
+                                             Width="150"
+                                             ToolTip="按 TID/PID（十进制或 0x 十六进制）或进程名过滤"
+                                             TextChanged="ThreadFilterBox_TextChanged" />
+                                    <TextBlock x:Name="ThreadsStatusText"
+                                               Grid.Column="3"
+                                               HorizontalAlignment="Right"
+                                               VerticalAlignment="Center"
+                                               Margin="8,0,0,0"
+                                               Foreground="{StaticResource MutedBrush}" />
+                                </Grid>
+
+                                <DataGrid x:Name="ThreadGrid"
+                                          Grid.Row="1"
+                                          AutoGenerateColumns="False"
+                                          MouseDoubleClick="ThreadGrid_MouseDoubleClick">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="TID" Binding="{Binding Tid}" Width="65" />
+                                        <DataGridTextColumn Header="状态" Binding="{Binding State}" Width="90" />
+                                        <DataGridTextColumn Header="RIP" Binding="{Binding InstructionPointer}" Width="170" />
+                                        <DataGridTextColumn Header="模式" Binding="{Binding Mode}" Width="70" />
+                                        <DataGridTextColumn Header="优先级" Binding="{Binding Priority}" Width="70" />
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+                        </Border>
                     </Grid>
-                </Border>
-            </Grid>
+                </TabItem>
+
+                <TabItem x:Name="StackTab" Header="调用栈">
+                    <Border Margin="0,6,0,0"
+                            Background="{StaticResource SurfaceBrush}"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            Padding="10">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="调用栈"
+                                           FontSize="14"
+                                           FontWeight="SemiBold" />
+                                <TextBlock x:Name="StackStatusText"
+                                           Grid.Column="1"
+                                           HorizontalAlignment="Right"
+                                           VerticalAlignment="Center"
+                                           Margin="8,0,12,0"
+                                           Foreground="{StaticResource MutedBrush}" />
+                                <Button Grid.Column="2"
+                                        Content="刷新"
+                                        Click="RefreshStackButton_Click" />
+                            </Grid>
+
+                            <DataGrid x:Name="StackGrid"
+                                      Grid.Row="1"
+                                      AutoGenerateColumns="False"
+                                      MouseDoubleClick="StackGrid_MouseDoubleClick">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="40" />
+                                    <DataGridTextColumn Header="Child-SP" Binding="{Binding ChildSp}" Width="165" />
+                                    <DataGridTextColumn Header="返回地址" Binding="{Binding ReturnAddress}" Width="165" />
+                                    <DataGridTextColumn Header="调用位置" Binding="{Binding Symbol}" Width="*" />
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Grid>
+                    </Border>
+                </TabItem>
+
+                <TabItem x:Name="MemoryTab" Header="内存">
+                    <Border Margin="0,6,0,0"
+                            Background="{StaticResource SurfaceBrush}"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            Padding="10">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="内存"
+                                           FontSize="14"
+                                           FontWeight="SemiBold" />
+                                <TextBlock x:Name="MemoryStatusText"
+                                           Grid.Column="1"
+                                           HorizontalAlignment="Right"
+                                           VerticalAlignment="Center"
+                                           Margin="8,0,12,0"
+                                           Foreground="{StaticResource MutedBrush}" />
+                                <Button Grid.Column="2"
+                                        Content="刷新"
+                                        Click="MemoryRefreshButton_Click" />
+                            </Grid>
+
+                            <Grid Grid.Row="1" Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="2*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="地址"
+                                           VerticalAlignment="Center"
+                                           Margin="0,0,6,0" />
+                                <TextBox x:Name="MemoryAddressBox"
+                                         Grid.Column="1"
+                                         Text="0x0" />
+                                <TextBlock Grid.Column="2"
+                                           Text="CR3"
+                                           VerticalAlignment="Center"
+                                           Margin="12,0,6,0" />
+                                <TextBox x:Name="MemoryCr3Box"
+                                         Grid.Column="3" />
+                                <Button Grid.Column="4"
+                                        Content="上一页"
+                                        Click="MemoryPreviousButton_Click" />
+                                <Button Grid.Column="5"
+                                        Content="下一页"
+                                        Click="MemoryNextButton_Click" />
+                                <Button Grid.Column="6"
+                                        Content="读取"
+                                        Click="MemoryReadButton_Click" />
+                            </Grid>
+
+                            <DataGrid x:Name="MemoryGrid"
+                                      Grid.Row="2"
+                                      AutoGenerateColumns="False">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="175" />
+                                    <DataGridTextColumn Header="十六进制" Binding="{Binding Hex}" Width="2*" />
+                                    <DataGridTextColumn Header="ASCII" Binding="{Binding Ascii}" Width="*" />
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Grid>
+                    </Border>
+                </TabItem>
+
+                <TabItem x:Name="DisassemblyTab" Header="反汇编">
+                    <Border Margin="0,6,0,0"
+                            Background="{StaticResource SurfaceBrush}"
+                            BorderBrush="{StaticResource BorderBrush}"
+                            BorderThickness="1"
+                            CornerRadius="6"
+                            Padding="10">
+                        <Grid>
+                            <Grid.RowDefinitions>
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="Auto" />
+                                <RowDefinition Height="*" />
+                            </Grid.RowDefinitions>
+
+                            <Grid Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="反汇编"
+                                           FontSize="14"
+                                           FontWeight="SemiBold" />
+                                <TextBlock x:Name="DisassemblyStatusText"
+                                           Grid.Column="1"
+                                           HorizontalAlignment="Right"
+                                           VerticalAlignment="Center"
+                                           Margin="8,0,12,0"
+                                           Foreground="{StaticResource MutedBrush}" />
+                                <CheckBox x:Name="FollowRipCheck"
+                                          Grid.Column="2"
+                                          Content="跟随 RIP"
+                                          VerticalAlignment="Center"
+                                          Margin="0,0,12,0" />
+                                <Button Grid.Column="3"
+                                        Content="RIP"
+                                        Click="RipButton_Click" />
+                            </Grid>
+
+                            <Grid Grid.Row="1" Margin="0,0,0,8">
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="2*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="*" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
+                                </Grid.ColumnDefinitions>
+                                <TextBlock Text="地址"
+                                           VerticalAlignment="Center"
+                                           Margin="0,0,6,0" />
+                                <TextBox x:Name="DisassemblyAddressBox"
+                                         Grid.Column="1"
+                                         Text="0x0" />
+                                <TextBlock Grid.Column="2"
+                                           Text="CR3"
+                                           VerticalAlignment="Center"
+                                           Margin="12,0,6,0" />
+                                <TextBox x:Name="DisassemblyCr3Box"
+                                         Grid.Column="3" />
+                                <ComboBox x:Name="DisassemblyCountBox"
+                                          Grid.Column="4"
+                                          Width="70"
+                                          Margin="8,0"
+                                          SelectedIndex="1">
+                                    <ComboBoxItem Content="32" Tag="32" />
+                                    <ComboBoxItem Content="64" Tag="64" />
+                                    <ComboBoxItem Content="128" Tag="128" />
+                                </ComboBox>
+                                <Button Grid.Column="5"
+                                        Content="上一页"
+                                        Click="DisassemblyPreviousButton_Click" />
+                                <Button Grid.Column="6"
+                                        Content="下一页"
+                                        Click="DisassemblyNextButton_Click" />
+                                <Button Grid.Column="7"
+                                        Content="读取"
+                                        Click="DisassemblyReadButton_Click" />
+                            </Grid>
+
+                            <DataGrid x:Name="DisassemblyGrid"
+                                      Grid.Row="2"
+                                      AutoGenerateColumns="False"
+                                      ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                      MouseDoubleClick="DisassemblyGrid_MouseDoubleClick">
+                                <DataGrid.Columns>
+                                    <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="Auto" MinWidth="175" />
+                                    <DataGridTextColumn Header="字节" Binding="{Binding Bytes}" Width="Auto" MinWidth="130" />
+                                    <DataGridTextColumn Header="指令" Binding="{Binding Text}" Width="Auto" MinWidth="190" />
+                                    <DataGridTemplateColumn Header="符号" Width="Auto" MinWidth="220">
+                                        <DataGridTemplateColumn.CellTemplate>
+                                            <DataTemplate>
+                                                <TextBlock Text="{Binding Symbol}"
+                                                           TextTrimming="None"
+                                                           ToolTip="{Binding Symbol}" />
+                                            </DataTemplate>
+                                        </DataGridTemplateColumn.CellTemplate>
+                                    </DataGridTemplateColumn>
+                                </DataGrid.Columns>
+                            </DataGrid>
+                        </Grid>
+                    </Border>
+                </TabItem>
+            </TabControl>
         </Grid>
 
         <Border Grid.Row="3"

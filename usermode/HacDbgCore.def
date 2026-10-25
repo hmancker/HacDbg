@@ -3,6 +3,7 @@ LIBRARY HacDbgCore
 EXPORTS
     HacDbgCoreApiVersion
     HacDbgCoreStateSize
+    HacDbgCoreStructureSize
     HacDbgCoreCreate
     HacDbgCoreDestroy
     HacDbgCoreStart
@@ -10,3 +11,19 @@ EXPORTS
     HacDbgCoreExecute
     HacDbgCoreCancel
     HacDbgCoreGetState
+    HacDbgCoreGetSymbolProgress
+    HacDbgCoreRequestModules
+    HacDbgCoreRequestProcesses
+    HacDbgCoreRequestThreads
+    HacDbgCoreRequestStack
+    HacDbgCoreRequestMemory
+    HacDbgCoreRequestDisassembly
+    HacDbgCoreRequestResolve
+    HacDbgCoreGetViewStatus
+    HacDbgCoreCopyModules
+    HacDbgCoreCopyProcesses
+    HacDbgCoreCopyThreads
+    HacDbgCoreCopyStack
+    HacDbgCoreCopyMemory
+    HacDbgCoreCopyDisassembly
+    HacDbgCoreCopyResolvedAddress

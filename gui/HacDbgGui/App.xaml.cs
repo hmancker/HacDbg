@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using System.Windows;
 using HacDbgGui.Interop;
 using Wpf.Ui.Appearance;
@@ -18,9 +17,7 @@ public partial class App : Application
         {
             try
             {
-                bool valid = HacDbgCore.ApiVersion == 1 &&
-                             HacDbgCore.StateSize == (uint)Marshal.SizeOf<HacDbgCoreState>();
-                Environment.Exit(valid ? 0 : 1);
+                Environment.Exit(HacDbgCore.ValidateAbi() ? 0 : 1);
             }
             catch
             {
