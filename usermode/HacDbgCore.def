@@ -27,3 +27,7 @@ EXPORTS
     HacDbgCoreCopyMemory
     HacDbgCoreCopyDisassembly
     HacDbgCoreCopyResolvedAddress
+    HacDbgCoreTraceControl
+    HacDbgCoreRequestTraceRead
+    HacDbgCoreGetTraceStatus
+    HacDbgCoreCopyTraceSnapshot

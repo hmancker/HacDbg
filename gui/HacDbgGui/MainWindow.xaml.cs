@@ -72,6 +72,7 @@ public partial class MainWindow : FluentWindow
         FlagsGrid.ItemsSource = _flags;
         BreakpointGrid.ItemsSource = _breakpoints;
         InitializeStructuredViews();
+        InitializeTrace();
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -87,6 +88,7 @@ public partial class MainWindow : FluentWindow
         };
         _timer.Tick += Timer_Tick;
         _timer.Start();
+        StartTracePolling();
 
         if (App.StartWithoutCore)
         {
@@ -109,6 +111,20 @@ public partial class MainWindow : FluentWindow
             {
                 AppendError("core API or structure layout mismatch");
                 return;
+            }
+
+            try
+            {
+                if (HacDbgTraceNative.ValidateAbi() == false)
+                {
+                    _traceDeviceError = true;
+                    SetTraceError("HacDbgTrace.dll ABI 不匹配，实时 trace 已禁用。");
+                }
+            }
+            catch (Exception error)
+            {
+                _traceDeviceError = true;
+                SetTraceError($"HacDbgTrace.dll 无法加载: {error.Message}");
             }
 
             HacDbgCore core = new(OnCoreOutput);
@@ -612,6 +628,8 @@ public partial class MainWindow : FluentWindow
 
         _timer?.Stop();
         _timer = null;
+        StopTracePolling();
+        TraceViewHost.Detach();
         _core?.Dispose();
         _core = null;
         _started = false;

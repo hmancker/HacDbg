@@ -1,0 +1,13 @@
+{
+  "dependencies": [
+    {
+      "name": "imgui",
+      "features": [
+        "docking-experimental",
+        "dx11-binding",
+        "win32-binding"
+      ]
+    }
+  ],
+  "builtin-baseline": "2750401336fb7c95f6619657a46a7e798661341c"
+}

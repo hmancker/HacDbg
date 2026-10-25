@@ -12,7 +12,7 @@
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <AssemblyName>HacDbgGui</AssemblyName>
     <RootNamespace>HacDbgGui</RootNamespace>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
@@ -32,6 +32,9 @@
     <ProjectReference Include="..\..\usermode\HacDbgCore.vcxproj"
                       ReferenceOutputAssembly="false"
                       SkipGetTargetFrameworkProperties="true" />
+    <ProjectReference Include="..\HacDbgTrace\HacDbgTrace.vcxproj"
+                      ReferenceOutputAssembly="false"
+                      SkipGetTargetFrameworkProperties="true" />
   </ItemGroup>
   <Target Name="CopyNativeCore" AfterTargets="Build">
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.dll"
@@ -42,12 +45,24 @@
           DestinationFolder="$(TargetDir)"
           SkipUnchangedFiles="true"
           Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.pdb')" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.dll"
+          DestinationFolder="$(TargetDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.dll')" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.pdb"
+          DestinationFolder="$(TargetDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.pdb')" />
   </Target>
   <Target Name="CopyRuntimeFilesToPublish" AfterTargets="Publish">
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.dll"
           DestinationFolder="$(PublishDir)"
           SkipUnchangedFiles="true"
           Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.dll')" />
+    <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.dll"
+          DestinationFolder="$(PublishDir)"
+          SkipUnchangedFiles="true"
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.dll')" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\usermode.exe"
           DestinationFolder="$(PublishDir)"
           SkipUnchangedFiles="true"

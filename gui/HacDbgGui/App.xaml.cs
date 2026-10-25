@@ -17,7 +17,7 @@ public partial class App : Application
         {
             try
             {
-                Environment.Exit(HacDbgCore.ValidateAbi() ? 0 : 1);
+                Environment.Exit(HacDbgCore.ValidateAbi() && HacDbgTraceNative.ValidateAbi() ? 0 : 1);
             }
             catch
             {

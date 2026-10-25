@@ -3,6 +3,7 @@
                  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
                  xmlns:avalonEdit="http://icsharpcode.net/sharpdevelop/avalonedit"
+                 xmlns:controls="clr-namespace:HacDbgGui.Controls"
                  Title="HacDbg"
                  Width="1600"
                  Height="900"
@@ -694,6 +695,94 @@
                             </DataGrid>
                         </Grid>
                     </Border>
+                </TabItem>
+
+                <TabItem x:Name="TraceTab" Header="实时 trace">
+                    <Grid Margin="0,6,0,0">
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
+
+                        <Border Background="{StaticResource SurfaceBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                Padding="10">
+                            <StackPanel>
+                                <WrapPanel Orientation="Horizontal">
+                                    <Button x:Name="TraceCountersButton"
+                                            Content="开启计数"
+                                            Click="TraceCountersButton_Click"
+                                            IsEnabled="False" />
+                                    <Button x:Name="TraceEventsButton"
+                                            Content="开启事件"
+                                            Click="TraceEventsButton_Click"
+                                            IsEnabled="False" />
+                                    <Button x:Name="TraceStopButton"
+                                            Content="停止"
+                                            Click="TraceStopButton_Click"
+                                            IsEnabled="False" />
+                                    <Button x:Name="TraceResetButton"
+                                            Content="重置"
+                                            Click="TraceResetButton_Click"
+                                            IsEnabled="False" />
+                                    <Button x:Name="TraceExportButton"
+                                            Content="导出 CSV"
+                                            Click="TraceExportButton_Click"
+                                            IsEnabled="False" />
+                                    <TextBlock Text="采样"
+                                               VerticalAlignment="Center"
+                                               Margin="4,0,6,0"
+                                               Foreground="{StaticResource MutedBrush}" />
+                                    <ComboBox x:Name="TraceSampleBox"
+                                              Width="76"
+                                              SelectedIndex="1"
+                                              IsEnabled="False">
+                                        <ComboBoxItem Content="1" Tag="1" />
+                                        <ComboBoxItem Content="64" Tag="64" />
+                                        <ComboBoxItem Content="256" Tag="256" />
+                                    </ComboBox>
+                                    <Button Content="返回命令台"
+                                            Click="TraceReturnFocusButton_Click"
+                                            Margin="12,0,0,0" />
+                                </WrapPanel>
+
+                                <TextBlock Margin="0,8,0,0"
+                                           TextWrapping="Wrap"
+                                           Foreground="{StaticResource WarningBrush}"
+                                           Text="事件模式会改变客户退出时序，可能被检测。DurationTsc 当前未采样，延迟直方图显示为不可用。" />
+                            </StackPanel>
+                        </Border>
+
+                        <TextBlock x:Name="TraceErrorText"
+                                   Grid.Row="1"
+                                   Margin="2,8,2,0"
+                                   TextWrapping="Wrap"
+                                   Foreground="{StaticResource ErrorBrush}"
+                                   Visibility="Collapsed" />
+
+                        <Border Grid.Row="2"
+                                Margin="0,8,0,0"
+                                Background="{StaticResource SurfaceBrush}"
+                                BorderBrush="{StaticResource BorderBrush}"
+                                BorderThickness="1"
+                                CornerRadius="6"
+                                ClipToBounds="True">
+                            <Grid>
+                                <controls:TraceHost x:Name="TraceViewHost" />
+                            </Grid>
+                        </Border>
+
+                        <TextBlock x:Name="TraceStatusText"
+                                   Grid.Row="3"
+                                   Margin="2,8,2,0"
+                                   Text="实时 trace 未连接"
+                                   TextWrapping="Wrap"
+                                   Foreground="{StaticResource MutedBrush}" />
+                    </Grid>
                 </TabItem>
             </TabControl>
         </Grid>

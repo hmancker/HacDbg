@@ -185,6 +185,27 @@ internal struct HacDbgCoreResolvedAddress
     public byte[] Symbol;
 }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct HacDbgCoreTraceStatus
+{
+    public ulong TotalExits;
+    public ulong DroppedEvents;
+    public ulong CapturedTsc;
+    public ulong SnapshotSequence;
+    public uint SnapshotVersion;
+    public uint Supported;
+    public uint Capturing;
+    public uint EventsEnabled;
+    public uint SampleRate;
+    public uint EventMask;
+    public uint CpuCount;
+    public uint LastError;
+    public uint SnapshotEventCount;
+    public uint ControlPending;
+    public uint ReadPending;
+    public uint Reserved;
+}
+
 internal sealed class HacDbgCore : IDisposable
 {
     public const uint ViewModules = 0;
@@ -202,12 +223,26 @@ internal sealed class HacDbgCore : IDisposable
     public const uint StructureMemory = 5;
     public const uint StructureInstruction = 6;
     public const uint StructureResolvedAddress = 7;
+    public const uint StructureTraceStatus = 8;
+    public const uint StructureTraceSnapshot = 9;
     public const int MaxModules = 512;
     public const int MaxProcesses = 512;
     public const int MaxThreads = 512;
     public const int MaxStackFrames = 64;
     public const int MaxDisassemblyLines = 128;
     public const int MaxMemoryBytes = 4096;
+    public const int TraceSnapshotSize = 53288;
+    public const uint TraceControlEnableCounters = 1u << 0;
+    public const uint TraceControlEnableEvents = 1u << 1;
+    public const uint TraceControlReset = 1u << 2;
+    public const uint TraceControlSetSampleRate = 1u << 3;
+    public const uint TraceControlSetEventMask = 1u << 4;
+    public const uint TraceControlDisable = 1u << 5;
+    public const uint TraceEventMaskAll = (1u << 16) - 1u;
+    public const uint TraceErrorNone = 0;
+    public const uint TraceErrorUnsupported = 1;
+    public const uint TraceErrorControlFailed = 2;
+    public const uint TraceErrorReadFailed = 3;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     private delegate void OutputCallback(uint kind, IntPtr text, uint length, IntPtr context);
@@ -239,7 +274,7 @@ internal sealed class HacDbgCore : IDisposable
         static bool Matches<T>(uint structure) where T : struct =>
             GetStructureSize(structure) == (uint)Marshal.SizeOf<T>();
 
-        return ApiVersion == 2 &&
+        return ApiVersion == 3 &&
                StateSize == (uint)Marshal.SizeOf<HacDbgCoreState>() &&
                Matches<HacDbgCoreViewStatus>(StructureViewStatus) &&
                Matches<HacDbgCoreModule>(StructureModule) &&
@@ -248,7 +283,9 @@ internal sealed class HacDbgCore : IDisposable
                Matches<HacDbgCoreStackFrame>(StructureStackFrame) &&
                Matches<HacDbgCoreMemory>(StructureMemory) &&
                Matches<HacDbgCoreInstruction>(StructureInstruction) &&
-               Matches<HacDbgCoreResolvedAddress>(StructureResolvedAddress);
+               Matches<HacDbgCoreResolvedAddress>(StructureResolvedAddress) &&
+               Matches<HacDbgCoreTraceStatus>(StructureTraceStatus) &&
+               GetStructureSize(StructureTraceSnapshot) == TraceSnapshotSize;
     }
 
     public uint Start() => NativeMethods.HacDbgCoreStart(_handle);
@@ -301,6 +338,17 @@ internal sealed class HacDbgCore : IDisposable
 
     public uint CopyResolvedAddress(out HacDbgCoreResolvedAddress address) =>
         NativeMethods.HacDbgCoreCopyResolvedAddress(_handle, out address);
+
+    public uint TraceControl(uint flags, uint sampleRate, uint eventMask) =>
+        NativeMethods.HacDbgCoreTraceControl(_handle, flags, sampleRate, eventMask);
+
+    public uint RequestTraceRead() => NativeMethods.HacDbgCoreRequestTraceRead(_handle);
+
+    public uint GetTraceStatus(out HacDbgCoreTraceStatus status) =>
+        NativeMethods.HacDbgCoreGetTraceStatus(_handle, out status);
+
+    public uint CopyTraceSnapshot(IntPtr snapshot) =>
+        NativeMethods.HacDbgCoreCopyTraceSnapshot(_handle, snapshot);
 
     public void Dispose()
     {
@@ -416,5 +464,19 @@ internal sealed class HacDbgCore : IDisposable
         [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern uint HacDbgCoreCopyResolvedAddress(IntPtr core,
                                                                   out HacDbgCoreResolvedAddress address);
+
+        [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern uint HacDbgCoreTraceControl(IntPtr core, uint flags, uint sampleRate,
+                                                           uint eventMask);
+
+        [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern uint HacDbgCoreRequestTraceRead(IntPtr core);
+
+        [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern uint HacDbgCoreGetTraceStatus(IntPtr core,
+                                                             out HacDbgCoreTraceStatus status);
+
+        [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern uint HacDbgCoreCopyTraceSnapshot(IntPtr core, IntPtr snapshot);
     }
 }

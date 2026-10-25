@@ -86,12 +86,29 @@ struct HACDBG_CORE
 	std::uint32_t disassembly_count = 0;
 	std::uint32_t disassembly_truncated = 0;
 	HACDBG_CORE_RESOLVED_ADDRESS resolved_address = {};
+
+	std::mutex trace_mutex;
+	HACDBG_CORE_TRACE_STATUS trace_status = {};
+	std::uint32_t trace_sample_rate = HACDBG_TRACE_DEFAULT_SAMPLE_RATE;
+	std::uint32_t trace_event_mask = HACDBG_TRACE_EVENT_MASK_ALL;
+	std::uint32_t trace_control_flags = 0;
+	std::uint32_t trace_control_sample_rate = 0;
+	std::uint32_t trace_control_event_mask = 0;
+	std::uint8_t trace_control_pending = 0;
+	std::uint8_t trace_read_pending = 0;
+	std::array<HACDBG_TRACE_SNAPSHOT, 2> trace_snapshots = {};
+	std::uint32_t trace_snapshot_active = 0;
+	std::uint32_t trace_snapshot_write = 1;
+	std::chrono::steady_clock::time_point trace_last_read = {};
+	std::uint8_t trace_last_read_valid = 0;
 };
 
 namespace
 {
 	constexpr std::size_t max_queued_commands = 64;
 	constexpr std::chrono::milliseconds breakpoint_poll_interval(100);
+	constexpr std::chrono::milliseconds trace_poll_interval(33);
+	constexpr std::chrono::milliseconds trace_minimum_read_interval(20);
 
 	HACDBG_CORE* core_from_context(void* const context)
 	{
@@ -574,18 +591,206 @@ namespace
 		core->output_callback(static_cast<std::uint32_t>(kind), text, length, core->output_context);
 	}
 
+	bool has_pending_trace(HACDBG_CORE* const core)
+	{
+		std::lock_guard<std::mutex> lock(core->trace_mutex);
+
+		return core->trace_control_pending != 0 || core->trace_read_pending != 0;
+	}
+
+	std::chrono::milliseconds worker_wait_interval(HACDBG_CORE* const core)
+	{
+		std::lock_guard<std::mutex> lock(core->trace_mutex);
+
+		return core->trace_status.Capturing != 0 ? trace_poll_interval : breakpoint_poll_interval;
+	}
+
+	void apply_pending_trace_control(HACDBG_CORE* const core)
+	{
+		std::uint32_t flags = 0;
+		std::uint32_t sample_rate = 0;
+		std::uint32_t event_mask = 0;
+		std::uint8_t supported = 0;
+
+		{
+			std::lock_guard<std::mutex> lock(core->trace_mutex);
+
+			if (core->trace_control_pending == 0)
+			{
+				return;
+			}
+
+			flags = core->trace_control_flags;
+			sample_rate = core->trace_control_sample_rate;
+			event_mask = core->trace_control_event_mask;
+			supported = static_cast<std::uint8_t>(core->trace_status.Supported != 0);
+			core->trace_control_pending = 0;
+		}
+
+		if (supported == 0)
+		{
+			return;
+		}
+
+		const std::uint64_t result = hypercall::trace_control(flags, sample_rate, event_mask);
+
+		{
+			std::lock_guard<std::mutex> lock(core->trace_mutex);
+
+			if (result == 0)
+			{
+				core->trace_status.LastError = HACDBG_CORE_TRACE_ERROR_CONTROL_FAILED;
+				return;
+			}
+
+			if ((flags & HACDBG_TRACE_CONTROL_SET_SAMPLE_RATE) != 0)
+			{
+				core->trace_sample_rate = sample_rate == 0
+				                              ? HACDBG_TRACE_DEFAULT_SAMPLE_RATE
+				                              : sample_rate;
+			}
+
+			if ((flags & HACDBG_TRACE_CONTROL_SET_EVENT_MASK) != 0)
+			{
+				core->trace_event_mask = event_mask & HACDBG_TRACE_EVENT_MASK_ALL;
+			}
+
+			if ((flags & HACDBG_TRACE_CONTROL_DISABLE) != 0)
+			{
+				core->trace_status.Capturing = 0;
+				core->trace_status.EventsEnabled = 0;
+			}
+			else if ((flags & (HACDBG_TRACE_CONTROL_ENABLE_COUNTERS |
+			                   HACDBG_TRACE_CONTROL_ENABLE_EVENTS)) != 0)
+			{
+				core->trace_status.Capturing = 1;
+				core->trace_status.EventsEnabled =
+					(flags & HACDBG_TRACE_CONTROL_ENABLE_EVENTS) != 0 ? 1u : 0u;
+			}
+			else if ((flags & HACDBG_TRACE_CONTROL_RESET) != 0)
+			{
+				core->trace_status.Capturing = 0;
+				core->trace_status.EventsEnabled = 0;
+			}
+
+			core->trace_status.SampleRate = core->trace_sample_rate;
+			core->trace_status.EventMask = core->trace_event_mask;
+			core->trace_status.LastError = HACDBG_CORE_TRACE_ERROR_NONE;
+
+			if (flags != 0)
+			{
+				core->trace_read_pending = 1;
+			}
+		}
+	}
+
+	bool perform_trace_read(HACDBG_CORE* const core)
+	{
+		std::uint32_t snapshot_index = 0;
+
+		{
+			std::lock_guard<std::mutex> lock(core->trace_mutex);
+
+			if (core->trace_status.Supported == 0)
+			{
+				core->trace_read_pending = 0;
+				return false;
+			}
+
+			const bool forced = core->trace_read_pending != 0;
+			core->trace_read_pending = 0;
+			const auto now = std::chrono::steady_clock::now();
+
+			if (forced == false)
+			{
+				if (core->trace_status.Capturing == 0)
+				{
+					return false;
+				}
+
+				if (core->trace_last_read_valid != 0 &&
+				    now - core->trace_last_read < trace_minimum_read_interval)
+				{
+					return false;
+				}
+			}
+
+			snapshot_index = core->trace_snapshot_write;
+		}
+
+		HACDBG_TRACE_SNAPSHOT& destination = core->trace_snapshots[snapshot_index];
+		const std::uint64_t copied = hypercall::trace_read(destination, HACDBG_TRACE_ALL_CPUS);
+		const auto now = std::chrono::steady_clock::now();
+
+		{
+			std::lock_guard<std::mutex> lock(core->trace_mutex);
+			core->trace_last_read = now;
+			core->trace_last_read_valid = 1;
+
+			if (copied != sizeof(destination) ||
+			    destination.Version != HACDBG_TRACE_VERSION ||
+			    destination.CpuCount > HACDBG_TRACE_MAX_CPUS ||
+			    destination.EventCount > HACDBG_TRACE_MAX_EVENTS)
+			{
+				core->trace_status.LastError = HACDBG_CORE_TRACE_ERROR_READ_FAILED;
+				return false;
+			}
+
+			core->trace_snapshot_active = snapshot_index;
+			core->trace_snapshot_write = snapshot_index == 0 ? 1u : 0u;
+			core->trace_status.SnapshotSequence += 1;
+			core->trace_status.SnapshotVersion = destination.Version;
+			core->trace_status.CpuCount = destination.CpuCount;
+			core->trace_status.SnapshotEventCount = destination.EventCount;
+			core->trace_status.TotalExits = destination.TotalExits;
+			core->trace_status.DroppedEvents = destination.DroppedEvents;
+			core->trace_status.CapturedTsc = destination.CapturedTsc;
+			core->trace_status.Capturing =
+				(destination.Flags & HACDBG_TRACE_FLAG_COUNTERS_ENABLED) != 0 ? 1u : 0u;
+			core->trace_status.EventsEnabled =
+				(destination.Flags & HACDBG_TRACE_FLAG_EVENTS_ENABLED) != 0 ? 1u : 0u;
+			core->trace_status.LastError = HACDBG_CORE_TRACE_ERROR_NONE;
+		}
+
+		return true;
+	}
+
+	void stop_trace_capture(HACDBG_CORE* const core)
+	{
+		bool disable = false;
+
+		{
+			std::lock_guard<std::mutex> lock(core->trace_mutex);
+			disable = core->trace_status.Supported != 0;
+			core->trace_control_pending = 0;
+			core->trace_read_pending = 0;
+		}
+
+		if (disable == false)
+		{
+			return;
+		}
+
+		hypercall::trace_control(HACDBG_TRACE_CONTROL_DISABLE, 0, 0);
+
+		std::lock_guard<std::mutex> lock(core->trace_mutex);
+		core->trace_status.Capturing = 0;
+		core->trace_status.EventsEnabled = 0;
+	}
+
 	void worker_loop(HACDBG_CORE* const core)
 	{
 		while (true)
 		{
 			std::string command;
+			const std::chrono::milliseconds wait_interval = worker_wait_interval(core);
 
 			{
 				std::unique_lock<std::mutex> lock(core->command_mutex);
-				core->command_ready.wait_for(lock, breakpoint_poll_interval, [core]
+				core->command_ready.wait_for(lock, wait_interval, [core]
 				{
 					return core->running.load() == 0 || core->commands.empty() == false ||
-					       has_pending_view(core);
+					       has_pending_view(core) || has_pending_trace(core);
 				});
 
 				if (core->running.load() == 0)
@@ -625,6 +830,13 @@ namespace
 				continue;
 			}
 
+			apply_pending_trace_control(core);
+
+			if (perform_trace_read(core) != false)
+			{
+				continue;
+			}
+
 			core_view_request_t view_request = {};
 
 			if (take_view_request(core, view_request) == true)
@@ -650,6 +862,8 @@ namespace
 				update_state(core);
 			}
 		}
+
+		stop_trace_capture(core);
 	}
 }
 
@@ -690,6 +904,12 @@ uint32_t HacDbgCoreStructureSize(const uint32_t structure)
 
 	case HacDbgStructureResolvedAddress:
 		return static_cast<uint32_t>(sizeof(HACDBG_CORE_RESOLVED_ADDRESS));
+
+	case HacDbgStructureTraceStatus:
+		return static_cast<uint32_t>(sizeof(HACDBG_CORE_TRACE_STATUS));
+
+	case HacDbgStructureTraceSnapshot:
+		return static_cast<uint32_t>(sizeof(HACDBG_TRACE_SNAPSHOT));
 
 	default:
 		return 0;
@@ -763,6 +983,39 @@ uint32_t HacDbgCoreStart(HACDBG_CORE* const core)
 			core->view_requests = {};
 			core->view_status = {};
 			core->next_view_request_id = 1;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(core->trace_mutex);
+			core->trace_status = {};
+			core->trace_sample_rate = HACDBG_TRACE_DEFAULT_SAMPLE_RATE;
+			core->trace_event_mask = HACDBG_TRACE_EVENT_MASK_ALL;
+			core->trace_control_flags = 0;
+			core->trace_control_sample_rate = 0;
+			core->trace_control_event_mask = 0;
+			core->trace_control_pending = 0;
+			core->trace_read_pending = 0;
+			core->trace_snapshot_active = 0;
+			core->trace_snapshot_write = 1;
+			core->trace_last_read = {};
+			core->trace_last_read_valid = 0;
+			core->trace_status.SampleRate = core->trace_sample_rate;
+			core->trace_status.EventMask = core->trace_event_mask;
+		}
+
+		const std::uint64_t trace_supported = hypercall::trace_control(0, 0, 0);
+
+		{
+			std::lock_guard<std::mutex> lock(core->trace_mutex);
+			core->trace_status.Supported = trace_supported != 0 ? 1u : 0u;
+			core->trace_status.LastError = trace_supported != 0
+			                                  ? HACDBG_CORE_TRACE_ERROR_NONE
+			                                  : HACDBG_CORE_TRACE_ERROR_UNSUPPORTED;
+
+			if (trace_supported != 0)
+			{
+				core->trace_read_pending = 1;
+			}
 		}
 
 		std::uint32_t major = 0;
@@ -1178,6 +1431,122 @@ uint32_t HacDbgCoreCopyResolvedAddress(HACDBG_CORE* const core, HACDBG_CORE_RESO
 
 	std::lock_guard<std::mutex> lock(core->view_mutex);
 	*address_out = core->resolved_address;
+
+	return HacDbgCoreStatusOk;
+}
+
+uint32_t HacDbgCoreTraceControl(HACDBG_CORE* const core, const uint32_t flags, const uint32_t sample_rate,
+                                const uint32_t event_mask)
+{
+	if (core == nullptr)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	constexpr std::uint32_t allowed_flags =
+		HACDBG_TRACE_CONTROL_ENABLE_COUNTERS |
+		HACDBG_TRACE_CONTROL_ENABLE_EVENTS |
+		HACDBG_TRACE_CONTROL_RESET |
+		HACDBG_TRACE_CONTROL_SET_SAMPLE_RATE |
+		HACDBG_TRACE_CONTROL_SET_EVENT_MASK |
+		HACDBG_TRACE_CONTROL_DISABLE;
+
+	if ((flags & ~allowed_flags) != 0 || core->running.load() == 0)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(core->trace_mutex);
+
+		if (core->trace_status.Supported == 0)
+		{
+			core->trace_status.LastError = HACDBG_CORE_TRACE_ERROR_UNSUPPORTED;
+			return HacDbgCoreStatusDriver;
+		}
+
+		core->trace_control_flags = flags;
+		core->trace_control_sample_rate = sample_rate;
+		core->trace_control_event_mask = event_mask & HACDBG_TRACE_EVENT_MASK_ALL;
+		core->trace_control_pending = 1;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(core->command_mutex);
+	}
+
+	core->command_ready.notify_one();
+
+	return HacDbgCoreStatusOk;
+}
+
+uint32_t HacDbgCoreRequestTraceRead(HACDBG_CORE* const core)
+{
+	if (core == nullptr)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	if (core->running.load() == 0)
+	{
+		return HacDbgCoreStatusState;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(core->trace_mutex);
+
+		if (core->trace_status.Supported == 0)
+		{
+			return HacDbgCoreStatusDriver;
+		}
+
+		if (core->trace_status.Capturing == 0)
+		{
+			return HacDbgCoreStatusState;
+		}
+
+		core->trace_read_pending = 1;
+	}
+
+	{
+		std::lock_guard<std::mutex> lock(core->command_mutex);
+	}
+
+	core->command_ready.notify_one();
+
+	return HacDbgCoreStatusOk;
+}
+
+uint32_t HacDbgCoreGetTraceStatus(HACDBG_CORE* const core, HACDBG_CORE_TRACE_STATUS* const status_out)
+{
+	if (core == nullptr || status_out == nullptr)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	std::lock_guard<std::mutex> lock(core->trace_mutex);
+	*status_out = core->trace_status;
+	status_out->ControlPending = core->trace_control_pending;
+	status_out->ReadPending = core->trace_read_pending;
+
+	return HacDbgCoreStatusOk;
+}
+
+uint32_t HacDbgCoreCopyTraceSnapshot(HACDBG_CORE* const core, HACDBG_TRACE_SNAPSHOT* const snapshot_out)
+{
+	if (core == nullptr || snapshot_out == nullptr)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	std::lock_guard<std::mutex> lock(core->trace_mutex);
+
+	if (core->trace_status.SnapshotSequence == 0)
+	{
+		return HacDbgCoreStatusState;
+	}
+
+	*snapshot_out = core->trace_snapshots[core->trace_snapshot_active];
 
 	return HacDbgCoreStatusOk;
 }

@@ -34,6 +34,15 @@ https://github.com/icsharpcode/AvalonEdit
 
 The MIT permission text above applies to this component as well.
 
+## Dear ImGui 1.92.9b (docking)
+
+MIT License
+
+Copyright (c) 2014-2025 Omar Cornut
+https://github.com/ocornut/imgui
+
+The MIT permission text above applies to this component as well.
+
 ## .NET and WPF
 
 The self-contained Release output includes Microsoft .NET and WPF runtime

@@ -10,12 +10,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <structures/trace.h>
+
 #ifdef __cplusplus
 extern "C"
 {
 #endif
 
-#define HACDBG_CORE_API_VERSION 2u
+#define HACDBG_CORE_API_VERSION 3u
 #define HACDBG_CORE_MAX_BREAKPOINTS 64u
 #define HACDBG_CORE_VERSION_STRING_SIZE 32u
 #define HACDBG_CORE_MAX_MODULES 512u
@@ -84,8 +86,38 @@ typedef enum _HACDBG_CORE_STRUCTURE
     HacDbgStructureStackFrame = 4,
     HacDbgStructureMemory = 5,
     HacDbgStructureInstruction = 6,
-    HacDbgStructureResolvedAddress = 7
+    HacDbgStructureResolvedAddress = 7,
+    HacDbgStructureTraceStatus = 8,
+    HacDbgStructureTraceSnapshot = 9
 } HACDBG_CORE_STRUCTURE;
+
+/**
+ * @brief Trace status copied without entering the driver.
+ */
+typedef struct _HACDBG_CORE_TRACE_STATUS
+{
+    uint64_t TotalExits;
+    uint64_t DroppedEvents;
+    uint64_t CapturedTsc;
+    uint64_t SnapshotSequence;
+    uint32_t SnapshotVersion;
+    uint32_t Supported;
+    uint32_t Capturing;
+    uint32_t EventsEnabled;
+    uint32_t SampleRate;
+    uint32_t EventMask;
+    uint32_t CpuCount;
+    uint32_t LastError;
+    uint32_t SnapshotEventCount;
+    uint32_t ControlPending;
+    uint32_t ReadPending;
+    uint32_t Reserved;
+} HACDBG_CORE_TRACE_STATUS;
+
+#define HACDBG_CORE_TRACE_ERROR_NONE           0u
+#define HACDBG_CORE_TRACE_ERROR_UNSUPPORTED    1u
+#define HACDBG_CORE_TRACE_ERROR_CONTROL_FAILED 2u
+#define HACDBG_CORE_TRACE_ERROR_READ_FAILED    3u
 
 /**
  * @brief Guest register snapshot captured while a breakpoint paused a thread.
@@ -346,6 +378,31 @@ uint32_t HacDbgCoreCopyDisassembly(HACDBG_CORE* Core, HACDBG_CORE_INSTRUCTION* I
                                    uint32_t Capacity, uint32_t* CountOut);
 uint32_t HacDbgCoreCopyResolvedAddress(HACDBG_CORE* Core, HACDBG_CORE_RESOLVED_ADDRESS* AddressOut);
 
+/**
+ * @brief Queues a trace_control request for the core worker.
+ *
+ * @details Flags use HACDBG_TRACE_CONTROL_*. The request is coalesced with any
+ * pending trace control request. It is not a debugger command.
+ */
+uint32_t HacDbgCoreTraceControl(HACDBG_CORE* Core, uint32_t Flags, uint32_t SampleRate, uint32_t EventMask);
+
+/**
+ * @brief Requests a fresh trace_read snapshot on the core worker.
+ */
+uint32_t HacDbgCoreRequestTraceRead(HACDBG_CORE* Core);
+
+/**
+ * @brief Copies the latest trace status without entering the driver.
+ */
+uint32_t HacDbgCoreGetTraceStatus(HACDBG_CORE* Core, HACDBG_CORE_TRACE_STATUS* StatusOut);
+
+/**
+ * @brief Copies the latest complete trace snapshot without entering the driver.
+ */
+uint32_t HacDbgCoreCopyTraceSnapshot(HACDBG_CORE* Core, HACDBG_TRACE_SNAPSHOT* SnapshotOut);
+
 #ifdef __cplusplus
 }
+
+static_assert(sizeof(HACDBG_CORE_TRACE_STATUS) == 80, "core trace status ABI changed");
 #endif
