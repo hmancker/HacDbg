@@ -1,0 +1,12 @@
+LIBRARY HacDbgCore
+
+EXPORTS
+    HacDbgCoreApiVersion
+    HacDbgCoreStateSize
+    HacDbgCoreCreate
+    HacDbgCoreDestroy
+    HacDbgCoreStart
+    HacDbgCoreStop
+    HacDbgCoreExecute
+    HacDbgCoreCancel
+    HacDbgCoreGetState

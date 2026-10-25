@@ -32,7 +32,7 @@
 // 排除另一边的源文件。DebugIntel / ReleaseIntel 由工程传入 1。
 //
 #ifndef HACDBG_BACKEND_INTEL
-#define HACDBG_BACKEND_INTEL 0
+#define HACDBG_BACKEND_INTEL 1
 #endif
 
 //
@@ -54,5 +54,5 @@
 // VMX 指令仍然注入 #UD。
 //
 #ifndef HACDBG_HIDE_VIRTUALIZATION
-#define HACDBG_HIDE_VIRTUALIZATION 1
+#define HACDBG_HIDE_VIRTUALIZATION 0
 #endif

@@ -974,7 +974,22 @@ std::uint8_t sys::set_up()
 
 	if (current_cr3 <= page_size)
 	{
-		LOG_ERR("hyperv-attachment doesn't seem to be loaded");
+		std::uint32_t major = 0;
+		std::uint32_t minor = 0;
+		std::uint32_t patch = 0;
+		std::uint32_t abi = 0;
+		std::string version;
+		const std::uint8_t hypervisor_answers =
+			hypercall::query_driver_version(major, minor, patch, abi, version);
+
+		if (hypervisor_answers != 0)
+		{
+			LOG_ERR("hypervisor answers CPUID but read_guest_cr3 returned zero");
+		}
+		else
+		{
+			LOG_ERR("hypervisor does not answer CPUID hypercalls");
+		}
 
 		return 0;
 	}

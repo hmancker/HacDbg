@@ -1266,7 +1266,7 @@ static std::unordered_map<std::uint64_t, std::string> make_symbol_index()
 
 static void print_disassembly_line(const std::uint64_t address, const std::string_view bytes, const std::string_view text)
 {
-	fmt::print("{:08x}`{:08x} {:<30} {}\n", static_cast<std::uint32_t>(address >> 32),
+	output::print("{:08x}`{:08x} {:<30} {}\n", static_cast<std::uint32_t>(address >> 32),
 	           static_cast<std::uint32_t>(address), bytes, text);
 }
 
@@ -1397,7 +1397,7 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 
 		if (symbol != symbols.end())
 		{
-			fmt::print("{}:\n", symbol->second);
+			output::print("{}:\n", symbol->second);
 		}
 		else
 		{
@@ -1406,7 +1406,7 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 
 			if (symbol_parser::nearest(instruction_address, pdb_name, pdb_displacement) == 1 && pdb_displacement == 0)
 			{
-				fmt::print("{}:\n", pdb_name);
+				output::print("{}:\n", pdb_name);
 			}
 		}
 
@@ -1469,7 +1469,7 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 
 	unassemble_next_address = request.start_address + offset;
 	unassemble_has_next_address = 1;
-	std::fflush(stdout);
+	output::flush();
 }
 
 static CLI::App* init_u(CLI::App& app)
@@ -1780,7 +1780,7 @@ static void display_guest_memory(const CLI::App* const command, const guest_disp
 
 		if (text.empty() == true)
 		{
-			fmt::print("{}  \"\"\n", format_windbg_address(request.start_address));
+			output::print("{}  \"\"\n", format_windbg_address(request.start_address));
 		}
 
 		for (std::uint64_t printed = 0; printed < text.size(); printed += characters_per_line)
@@ -1790,7 +1790,7 @@ static void display_guest_memory(const CLI::App* const command, const guest_disp
 				                                 : characters_per_line;
 			const std::uint64_t line_address = request.start_address + printed * element_size;
 
-			fmt::print("{}  \"{}\"\n", format_windbg_address(line_address),
+			output::print("{}  \"{}\"\n", format_windbg_address(line_address),
 			           std::string_view(text.data() + printed, static_cast<std::size_t>(line_count)));
 		}
 
@@ -1801,7 +1801,7 @@ static void display_guest_memory(const CLI::App* const command, const guest_disp
 			LOG_ERR("failed to read");
 		}
 
-		std::fflush(stdout);
+		output::flush();
 
 		return;
 	}
@@ -1825,15 +1825,15 @@ static void display_guest_memory(const CLI::App* const command, const guest_disp
 			                                    : elements_per_line;
 		const std::uint64_t line_bytes = line_elements * element_size;
 
-		fmt::print("{}  {}", format_windbg_address(request.start_address + offset),
+		output::print("{}  {}", format_windbg_address(request.start_address + offset),
 		           format_hex_elements(data + offset, line_elements, element_size));
 
 		if (display_shows_ascii(kind) == 1)
 		{
-			fmt::print("  {}", format_display_ascii(data + offset, line_bytes));
+			output::print("  {}", format_display_ascii(data + offset, line_bytes));
 		}
 
-		fmt::print("\n");
+		output::print("\n");
 		offset += line_bytes;
 	}
 
@@ -1844,7 +1844,7 @@ static void display_guest_memory(const CLI::App* const command, const guest_disp
 		LOG_ERR("failed to read");
 	}
 
-	std::fflush(stdout);
+	output::flush();
 }
 
 static CLI::App* init_windbg_command(CLI::App& app, const char* const name, const char* const description)
@@ -2470,20 +2470,20 @@ static std::string format_eflags(const std::uint64_t flags)
 
 static void print_paused_registers(const breakpoint::registers_t& registers)
 {
-	fmt::print("rax={:016x} rbx={:016x} rcx={:016x}\n", registers.rax, registers.rbx, registers.rcx);
-	fmt::print("rdx={:016x} rsi={:016x} rdi={:016x}\n", registers.rdx, registers.rsi, registers.rdi);
-	fmt::print("rip={} rsp={} rbp={:016x}\n", format_windbg_address(registers.rip), format_windbg_address(registers.rsp),
+	output::print("rax={:016x} rbx={:016x} rcx={:016x}\n", registers.rax, registers.rbx, registers.rcx);
+	output::print("rdx={:016x} rsi={:016x} rdi={:016x}\n", registers.rdx, registers.rsi, registers.rdi);
+	output::print("rip={} rsp={} rbp={:016x}\n", format_windbg_address(registers.rip), format_windbg_address(registers.rsp),
 	           registers.rbp);
-	fmt::print(" r8={:016x}  r9={:016x} r10={:016x}\n", registers.r8, registers.r9, registers.r10);
-	fmt::print("r11={:016x} r12={:016x} r13={:016x}\n", registers.r11, registers.r12, registers.r13);
-	fmt::print("r14={:016x} r15={:016x}\n", registers.r14, registers.r15);
+	output::print(" r8={:016x}  r9={:016x} r10={:016x}\n", registers.r8, registers.r9, registers.r10);
+	output::print("r11={:016x} r12={:016x} r13={:016x}\n", registers.r11, registers.r12, registers.r13);
+	output::print("r14={:016x} r15={:016x}\n", registers.r14, registers.r15);
 
 	if (registers.rflags_known == 1)
 	{
-		fmt::print("efl={:08x} {}\n", static_cast<std::uint32_t>(registers.rflags), format_eflags(registers.rflags));
+		output::print("efl={:08x} {}\n", static_cast<std::uint32_t>(registers.rflags), format_eflags(registers.rflags));
 	}
 
-	std::fflush(stdout);
+	output::flush();
 }
 
 static void print_instruction_buffer(const std::uint64_t address, const std::uint8_t* const buffer, const std::uint64_t size)
@@ -3431,8 +3431,8 @@ static void process_r(const CLI::App* const command)
 				return;
 			}
 
-			fmt::print("{}={:016x}\n", std::string(name), value);
-			std::fflush(stdout);
+			output::print("{}={:016x}\n", std::string(name), value);
+			output::flush();
 
 			return;
 		}
@@ -3451,9 +3451,9 @@ static void process_r(const CLI::App* const command)
 			return;
 		}
 
-		fmt::print("{}={:016x}\n", std::string(name), value);
-		fmt::print("context only; the guest thread was not changed\n");
-		std::fflush(stdout);
+		output::print("{}={:016x}\n", std::string(name), value);
+		output::print("context only; the guest thread was not changed\n");
+		output::flush();
 
 		return;
 	}
@@ -3495,8 +3495,8 @@ static void process_r(const CLI::App* const command)
 			return;
 		}
 
-		fmt::print("{}={:016x}\n", std::string(name), *field);
-		std::fflush(stdout);
+		output::print("{}={:016x}\n", std::string(name), *field);
+		output::flush();
 
 		return;
 	}
@@ -3515,8 +3515,8 @@ static void process_r(const CLI::App* const command)
 		return;
 	}
 
-	fmt::print("{}={:016x}\n", std::string(name), value);
-	std::fflush(stdout);
+	output::print("{}={:016x}\n", std::string(name), value);
+	output::flush();
 }
 
 static void process_t(const CLI::App* const command)
@@ -3722,28 +3722,28 @@ static void process_bl(const CLI::App* const command)
 	{
 		const std::string symbol = breakpoint_symbol_name(breakpoint.address);
 
-		fmt::print("{:<4} {} {}", breakpoint.id, breakpoint.enabled == 1 ? "e" : "d",
+		output::print("{:<4} {} {}", breakpoint.id, breakpoint.enabled == 1 ? "e" : "d",
 		           format_windbg_address(breakpoint.address));
 
 		if (breakpoint.pauses_thread == 1)
 		{
-			fmt::print(" pause");
+			output::print(" pause");
 		}
 
 		if (symbol.empty() == false)
 		{
-			fmt::print(" {}", symbol);
+			output::print(" {}", symbol);
 		}
 
 		if (breakpoint.cr3 != 0)
 		{
-			fmt::print(" cr3 {}", format_windbg_address(breakpoint.cr3));
+			output::print(" cr3 {}", format_windbg_address(breakpoint.cr3));
 		}
 
-		fmt::print("\n");
+		output::print("\n");
 	}
 
-	std::fflush(stdout);
+	output::flush();
 }
 
 static void process_bc(const CLI::App* const command)
@@ -3865,8 +3865,8 @@ struct dot_progress_t
 		{
 			while (running.load() == 1)
 			{
-				fmt::print(".");
-				std::fflush(stdout);
+				output::print(".");
+				output::flush();
 				Sleep(200);
 			}
 		})
@@ -3889,9 +3889,9 @@ static void console_interrupt_clear();
 
 static std::uint8_t load_image_symbols(const reload_module_t& module, const std::uint8_t force, const std::uint8_t overwrite)
 {
-	fmt::print("Loading symbols for {:08x}`{:08x} {} ", static_cast<std::uint32_t>(module.base >> 32),
+	output::print("Loading symbols for {:08x}`{:08x} {} ", static_cast<std::uint32_t>(module.base >> 32),
 	           static_cast<std::uint32_t>(module.base), module.name);
-	std::fflush(stdout);
+	output::flush();
 
 	std::string detail = {};
 	std::uint8_t loaded = 0;
@@ -3906,7 +3906,7 @@ static std::uint8_t load_image_symbols(const reload_module_t& module, const std:
 		loaded = symbol_parser::load_module(module.name, module.base, module.size, read, module.path, force, overwrite, detail);
 	}
 
-	fmt::print("\n");
+	output::print("\n");
 
 	if (loaded == 0)
 	{
@@ -3918,7 +3918,7 @@ static std::uint8_t load_image_symbols(const reload_module_t& module, const std:
 		return 0;
 	}
 
-	fmt::print("    {}\n", detail);
+	output::print("    {}\n", detail);
 
 	return 1;
 }
@@ -4388,7 +4388,7 @@ static std::uint8_t current_instruction(std::uint64_t& address_out, std::uint64_
 	{
 		cr3_out = sys::current_cr3;
 	}
-	fmt::print("Current instruction {:08x}`{:08x}\n", static_cast<std::uint32_t>(address_out >> 32),
+	output::print("Current instruction {:08x}`{:08x}\n", static_cast<std::uint32_t>(address_out >> 32),
 	           static_cast<std::uint32_t>(address_out));
 
 	return 1;
@@ -4665,8 +4665,8 @@ static std::uint8_t resume_suspended_process()
 
 	if (resumed == 1)
 	{
-		fmt::print("resumed process {} cid {:x}\n", implicit_process.process.image, implicit_process.process.pid);
-		std::fflush(stdout);
+		output::print("resumed process {} cid {:x}\n", implicit_process.process.image, implicit_process.process.pid);
+		output::flush();
 	}
 
 	return 1;
@@ -4805,19 +4805,19 @@ static void process_sympath(const CLI::App* const command)
 
 		if (current.empty() == true)
 		{
-			fmt::print("Symbol search path is empty. Use .sympath or .symfix\n");
+			output::print("Symbol search path is empty. Use .sympath or .symfix\n");
 		}
 		else
 		{
-			fmt::print("Symbol search path is: {}\n", current);
+			output::print("Symbol search path is: {}\n", current);
 		}
 
 		return;
 	}
 
 	symbol_parser::set_search_path(path);
-	fmt::print("Symbol search path is: {}\n", symbol_parser::search_path());
-	fmt::print("Use .reload /f <module> to load pdb files\n");
+	output::print("Symbol search path is: {}\n", symbol_parser::search_path());
+	output::print("Use .reload /f <module> to load pdb files\n");
 }
 
 static void process_sympath_add(const CLI::App* const command)
@@ -4833,22 +4833,22 @@ static void process_sympath_add(const CLI::App* const command)
 	}
 
 	symbol_parser::append_search_path(path);
-	fmt::print("Symbol search path is: {}\n", symbol_parser::search_path());
+	output::print("Symbol search path is: {}\n", symbol_parser::search_path());
 }
 
 static void process_symfix(const CLI::App* const command)
 {
 	(void)command;
 	symbol_parser::use_microsoft_server(symbol_command_text(".symfix"), 0);
-	fmt::print("Symbol search path is: {}\n", symbol_parser::search_path());
-	fmt::print("Use .reload /f <module> to load pdb files\n");
+	output::print("Symbol search path is: {}\n", symbol_parser::search_path());
+	output::print("Use .reload /f <module> to load pdb files\n");
 }
 
 static void process_symfix_add(const CLI::App* const command)
 {
 	(void)command;
 	symbol_parser::use_microsoft_server(symbol_command_text(".symfix+"), 1);
-	fmt::print("Symbol search path is: {}\n", symbol_parser::search_path());
+	output::print("Symbol search path is: {}\n", symbol_parser::search_path());
 }
 
 struct debugger_module_snapshot_t
@@ -5054,7 +5054,7 @@ static void process_reload(const CLI::App* const command)
 			std::string pdb_name = {};
 			std::uint64_t displacement = 0;
 			const std::uint8_t has_pdb = symbol_parser::nearest(module.base, pdb_name, displacement);
-			fmt::print("{:08x}`{:08x} {:08x} {} {}\n", static_cast<std::uint32_t>(module.base >> 32),
+			output::print("{:08x}`{:08x} {:08x} {} {}\n", static_cast<std::uint32_t>(module.base >> 32),
 			           static_cast<std::uint32_t>(module.base), module.size, module.name, has_pdb == 1 ? "symbols" : "deferred");
 		}
 
@@ -5066,7 +5066,7 @@ static void process_reload(const CLI::App* const command)
 		for (const reload_module_t& module : modules)
 		{
 			symbol_parser::unload_module(module.base);
-			fmt::print("Unloaded symbols for {}\n", module.name);
+			output::print("Unloaded symbols for {}\n", module.name);
 		}
 
 		return;
@@ -5074,8 +5074,8 @@ static void process_reload(const CLI::App* const command)
 
 	if (kernel_symbols == 1)
 	{
-		fmt::print("Loading Kernel Symbols\n");
-		std::fflush(stdout);
+		output::print("Loading Kernel Symbols\n");
+		output::flush();
 	}
 
 	const debugger_module_snapshot_t debugger_modules = capture_debugger_user_modules();
@@ -5106,7 +5106,7 @@ static void process_reload(const CLI::App* const command)
 	if (stopped == 1)
 	{
 		console_interrupt_clear();
-		fmt::print("interrupted\n");
+		output::print("interrupted\n");
 
 		return;
 	}
@@ -5120,7 +5120,7 @@ static void process_reload(const CLI::App* const command)
 
 	if (kernel_symbols == 1)
 	{
-		fmt::print("Loaded symbols for {} module(s)\n", loaded);
+		output::print("Loaded symbols for {} module(s)\n", loaded);
 	}
 }
 
@@ -5450,15 +5450,15 @@ static void print_lm_modules(const std::vector<reload_module_t>& modules, const 
 
 		const std::uint64_t end = module.base + module.size < module.base ? module.base : module.base + module.size;
 		const symbol_parser::module_status_t* const status = loaded_symbol_status(loaded, module);
-		fmt::print("{} {}   {:<14} {}", format_windbg_address(module.base), format_windbg_address(end),
+		output::print("{} {}   {:<14} {}", format_windbg_address(module.base), format_windbg_address(end),
 		           module_display_name(module.name), status == nullptr ? "(deferred)" : "(pdb symbols)");
 
 		if (status != nullptr && status->pdb_path.empty() == false)
 		{
-			fmt::print("          {}", status->pdb_path);
+			output::print("          {}", status->pdb_path);
 		}
 
-		fmt::print("\n");
+		output::print("\n");
 		shown_out += 1;
 
 		if (options.verbose == 0)
@@ -5466,20 +5466,20 @@ static void print_lm_modules(const std::vector<reload_module_t>& modules, const 
 			continue;
 		}
 
-		fmt::print("    Image name: {}\n", module.name);
-		fmt::print("    Image size: {:08x}\n", module.size);
+		output::print("    Image name: {}\n", module.name);
+		output::print("    Image size: {:08x}\n", module.size);
 		image_facts_t facts = {};
 
 		if (read_image_facts(module.base, module.cr3, facts) == 1)
 		{
-			fmt::print("    Machine: {} ({:x})\n", machine_name(facts.machine), facts.machine);
-			fmt::print("    Timestamp: {:08x}\n", facts.timestamp);
-			fmt::print("    CheckSum: {:08x}\n", facts.checksum);
+			output::print("    Machine: {} ({:x})\n", machine_name(facts.machine), facts.machine);
+			output::print("    Timestamp: {:08x}\n", facts.timestamp);
+			output::print("    CheckSum: {:08x}\n", facts.checksum);
 		}
 
 		if (status != nullptr && status->pdb_path.empty() == false)
 		{
-			fmt::print("    Symbol file: {}\n", status->pdb_path);
+			output::print("    Symbol file: {}\n", status->pdb_path);
 		}
 	}
 }
@@ -5523,25 +5523,25 @@ static void process_lm(const CLI::App* const command)
 		}
 	}
 
-	fmt::print("start             end                 module name\n");
+	output::print("start             end                 module name\n");
 	std::uint64_t shown = 0;
 	print_lm_modules(kernel_modules, options, loaded, shown);
 	const std::uint64_t kernel_shown = shown;
 
 	if (kernel_shown != 0 && user_modules.empty() == false)
 	{
-		fmt::print("\n");
+		output::print("\n");
 	}
 
 	print_lm_modules(user_modules, options, loaded, shown);
 
 	if (shown == 0 && options.loaded_only == 1)
 	{
-		fmt::print("no module has symbols loaded\n");
+		output::print("no module has symbols loaded\n");
 	}
 	else if (shown == 0)
 	{
-		fmt::print("no matching module\n");
+		output::print("no matching module\n");
 	}
 }
 
@@ -5621,14 +5621,14 @@ static void force_load_listed_modules(const std::vector<reload_module_t>& module
 	{
 		if (user_modules == 1)
 		{
-			fmt::print("Loading User Symbols\n");
+			output::print("Loading User Symbols\n");
 		}
 		else
 		{
-			fmt::print("Loading Kernel Symbols\n");
+			output::print("Loading Kernel Symbols\n");
 		}
 
-		std::fflush(stdout);
+		output::flush();
 	}
 
 	const debugger_module_snapshot_t debugger_modules = capture_debugger_user_modules();
@@ -5659,7 +5659,7 @@ static void force_load_listed_modules(const std::vector<reload_module_t>& module
 	if (stopped == 1)
 	{
 		console_interrupt_clear();
-		fmt::print("interrupted\n");
+		output::print("interrupted\n");
 
 		return;
 	}
@@ -5673,19 +5673,19 @@ static void force_load_listed_modules(const std::vector<reload_module_t>& module
 
 	if (modules.size() > 1)
 	{
-		fmt::print("Loaded symbols for {} module(s)\n", loaded);
+		output::print("Loaded symbols for {} module(s)\n", loaded);
 	}
 }
 
 static void print_guest_process(const guest_process_t& process)
 {
-	fmt::print("PROCESS {:08x}`{:08x}\n", static_cast<std::uint32_t>(process.eprocess >> 32),
+	output::print("PROCESS {:08x}`{:08x}\n", static_cast<std::uint32_t>(process.eprocess >> 32),
 	           static_cast<std::uint32_t>(process.eprocess));
-	fmt::print("    Cid: {:x}    Peb: {:08x}`{:08x}  ParentCid: {:x}\n", process.pid,
+	output::print("    Cid: {:x}    Peb: {:08x}`{:08x}  ParentCid: {:x}\n", process.pid,
 	           static_cast<std::uint32_t>(process.peb >> 32), static_cast<std::uint32_t>(process.peb), process.parent_pid);
-	fmt::print("    DirBase: {:08x}`{:08x}\n", static_cast<std::uint32_t>(process.directory >> 32),
+	output::print("    DirBase: {:08x}`{:08x}\n", static_cast<std::uint32_t>(process.directory >> 32),
 	           static_cast<std::uint32_t>(process.directory));
-	fmt::print("    Image: {}\n", process.image.empty() == true ? "?" : process.image);
+	output::print("    Image: {}\n", process.image.empty() == true ? "?" : process.image);
 }
 
 static std::uint8_t effective_process(guest_process_t& process_out)
@@ -5988,8 +5988,8 @@ static std::uint8_t wait_for_direct_pause(const ULONGLONG deadline, const ULONGL
 			return 1;
 		}
 
-		fmt::print(".");
-		std::fflush(stdout);
+		output::print(".");
+		output::flush();
 		Sleep(200);
 	}
 
@@ -6017,7 +6017,7 @@ static void undo_process_suspend()
 
 static void report_process_break(const guest_process_t& process, const std::uint8_t reload)
 {
-	fmt::print("\nProcess suspended.\n");
+	output::print("\nProcess suspended.\n");
 
 	if (reload == 1)
 	{
@@ -6056,8 +6056,8 @@ static std::uint8_t hijack_user_thread(const user_thread_t& user_thread, const s
 		return 0;
 	}
 
-	fmt::print("\nthread {:x} ", user_thread.tid);
-	std::fflush(stdout);
+	output::print("\nthread {:x} ", user_thread.tid);
+	output::flush();
 
 	if (write_thread_rip(thread, user_thread.trap, entry) == 0)
 	{
@@ -6253,8 +6253,8 @@ static std::uint8_t wait_until_user_pause()
 			return 1;
 		}
 
-		fmt::print(".");
-		std::fflush(stdout);
+		output::print(".");
+		output::flush();
 		Sleep(200);
 	}
 
@@ -6289,8 +6289,8 @@ static std::uint8_t hook_next_and_run(const user_thread_t& thread, const guest_p
 		return 0;
 	}
 
-	fmt::print("\nthread {:x} next {} ", thread.tid, format_windbg_address(rip));
-	std::fflush(stdout);
+	output::print("\nthread {:x} next {} ", thread.tid, format_windbg_address(rip));
+	output::flush();
 
 	// Point only this frame at the stub. KiSwapContext is left unchanged.
 	if (write_kernel_memory(trap + nt->ktrap_rip, &entry, sizeof(entry)) == 0)
@@ -6339,7 +6339,7 @@ static std::uint8_t hook_next_and_run(const user_thread_t& thread, const guest_p
 	freeze_process_again();
 	breakpoint::remove(breakpoint_id);
 	CloseHandle(handle);
-	fmt::print("\n");
+	output::print("\n");
 
 	return 0;
 }
@@ -6364,8 +6364,8 @@ static std::uint8_t hijack_kernel_thread(const user_thread_t& kernel_thread, con
 		return 0;
 	}
 
-	fmt::print("\nkernel thread {:x} ", kernel_thread.tid);
-	std::fflush(stdout);
+	output::print("\nkernel thread {:x} ", kernel_thread.tid);
+	output::flush();
 
 	if (write_kernel_memory(kernel_thread.trap + nt->ktrap_rip, &entry, sizeof(entry)) == 0)
 	{
@@ -6421,7 +6421,7 @@ static std::uint8_t suspend_implicit_process(const guest_process_t& process)
 
 	if (status < 0)
 	{
-		fmt::print("\n");
+		output::print("\n");
 		LOG_ERR("suspend process {} failed: {:08x}", process.pid, static_cast<std::uint32_t>(status));
 
 		return 0;
@@ -6456,15 +6456,15 @@ static void break_into_process(const guest_process_t& process, const std::uint8_
 	implicit_process.set = 1;
 	implicit_process.suspended = 0;
 	implicit_process.process = process;
-	fmt::print("Implicit process: {} cid {:x}\n", process.image, process.pid);
-	fmt::print("waiting for a user return");
-	std::fflush(stdout);
+	output::print("Implicit process: {} cid {:x}\n", process.image, process.pid);
+	output::print("waiting for a user return");
+	output::flush();
 
 	const std::uint64_t cave_hint = ntdll_cave_hint(process.user_cr3);
 
 	if (cave_hint == 0)
 	{
-		fmt::print("\n");
+		output::print("\n");
 		LOG_ERR("ntdll cave was not found");
 
 		return;
@@ -6492,8 +6492,8 @@ static void break_into_process(const guest_process_t& process, const std::uint8_
 				continue;
 			}
 
-			fmt::print("\nhooking the next instruction");
-			std::fflush(stdout);
+			output::print("\nhooking the next instruction");
+			output::flush();
 			hooked = 1;
 
 			if (hook_next_and_run(thread, process, cave_hint) == 1)
@@ -6516,18 +6516,18 @@ static void break_into_process(const guest_process_t& process, const std::uint8_
 
 		if (hooked == 0)
 		{
-			fmt::print(".");
-			std::fflush(stdout);
+			output::print(".");
+			output::flush();
 		}
 
 		undo_process_suspend();
 		Sleep(100);
 	}
 
-	fmt::print("\n");
+	output::print("\n");
 	undo_process_suspend();
 	console_interrupt_clear();
-	fmt::print("interrupted\n");
+	output::print("interrupted\n");
 }
 
 static std::uint8_t set_implicit_process(const guest_process_t& process, const std::uint8_t suspend, const std::uint8_t reload)
@@ -6563,14 +6563,14 @@ static std::uint8_t set_implicit_process(const guest_process_t& process, const s
 
 	implicit_process.set = 1;
 	implicit_process.process = process;
-	fmt::print("Implicit process: {} cid {:x}\n", process.image, process.pid);
+	output::print("Implicit process: {} cid {:x}\n", process.image, process.pid);
 
 	if (suspend == 1)
 	{
-		fmt::print("Process suspended. The guest thread was not switched.\n");
+		output::print("Process suspended. The guest thread was not switched.\n");
 	}
 
-	std::fflush(stdout);
+	output::flush();
 
 	if (reload == 1)
 	{
@@ -6637,7 +6637,7 @@ static void process_bang_process()
 		{
 			if (flags != 0)
 			{
-				fmt::print("thread details are not shown\n");
+				output::print("thread details are not shown\n");
 			}
 
 			image_filter = third;
@@ -6709,8 +6709,8 @@ static void process_dot_detach()
 		resume_suspended_process();
 	}
 
-	fmt::print("shadow pages released\n");
-	std::fflush(stdout);
+	output::print("shadow pages released\n");
+	output::flush();
 }
 
 static void process_dot_process()
@@ -6773,8 +6773,8 @@ static void process_dot_process()
 		}
 
 		print_guest_process(process);
-		fmt::print("    Context: {}\n", implicit_process.set == 1 ? "explicit" : "current debugger");
-		fmt::print("    Suspended: {}\n", implicit_process.suspended == 1 ? "yes" : "no");
+		output::print("    Context: {}\n", implicit_process.set == 1 ? "explicit" : "current debugger");
+		output::print("    Suspended: {}\n", implicit_process.suspended == 1 ? "yes" : "no");
 
 		if (reload == 1)
 		{
@@ -7338,29 +7338,29 @@ static std::uint8_t processor_current_thread(guest_thread_t& thread_out)
 
 static void print_guest_thread(const guest_thread_t& thread, const std::uint8_t show_process)
 {
-	fmt::print("THREAD {}  Cid {:x}.{:x}  Teb: {}\n", format_windbg_address(thread.ethread), thread.pid, thread.tid,
+	output::print("THREAD {}  Cid {:x}.{:x}  Teb: {}\n", format_windbg_address(thread.ethread), thread.pid, thread.tid,
 	           format_windbg_address(thread.teb));
-	fmt::print("    Owning Process {}       Image: {}\n", format_windbg_address(thread.eprocess),
+	output::print("    Owning Process {}       Image: {}\n", format_windbg_address(thread.eprocess),
 	           thread.image.empty() == true ? "?" : thread.image);
-	fmt::print("    Win32 Start Address {}\n", format_windbg_address(thread.win32_start));
-	fmt::print("    Win32Thread {}\n", format_windbg_address(thread.win32_thread));
-	fmt::print("    Stack Init {} Base {} Limit {}\n", format_windbg_address(thread.initial_stack),
+	output::print("    Win32 Start Address {}\n", format_windbg_address(thread.win32_start));
+	output::print("    Win32Thread {}\n", format_windbg_address(thread.win32_thread));
+	output::print("    Stack Init {} Base {} Limit {}\n", format_windbg_address(thread.initial_stack),
 	           format_windbg_address(thread.stack_base), format_windbg_address(thread.stack_limit));
-	fmt::print("    Kernel stack {}\n", format_windbg_address(thread.kernel_stack));
-	fmt::print("    Context Switch Count {}\n", thread.context_switches);
-	fmt::print("    WaitTime {}\n", thread.wait_time);
-	fmt::print("    State: {} ({})  WaitReason: {} ({})  WaitMode: {}\n", thread_state_name(thread.state), thread.state,
+	output::print("    Kernel stack {}\n", format_windbg_address(thread.kernel_stack));
+	output::print("    Context Switch Count {}\n", thread.context_switches);
+	output::print("    WaitTime {}\n", thread.wait_time);
+	output::print("    State: {} ({})  WaitReason: {} ({})  WaitMode: {}\n", thread_state_name(thread.state), thread.state,
 	           wait_reason_name(thread.wait_reason), thread.wait_reason, thread.wait_mode == 1 ? "User" : "Kernel");
-	fmt::print("    Priority: {}  SuspendCount: {}  SystemThread: {}\n", static_cast<int>(thread.priority),
+	output::print("    Priority: {}  SuspendCount: {}  SystemThread: {}\n", static_cast<int>(thread.priority),
 	           static_cast<int>(thread.suspend_count), thread.system_thread == 1 ? "yes" : "no");
 
 	if (thread.trap == 0 || thread.has_registers == 0)
 	{
-		fmt::print("    Trap Frame: (none)\n");
+		output::print("    Trap Frame: (none)\n");
 	}
 	else
 	{
-		fmt::print("    Trap Frame {}  rip={} rsp={}\n", format_windbg_address(thread.trap),
+		output::print("    Trap Frame {}  rip={} rsp={}\n", format_windbg_address(thread.trap),
 		           format_windbg_address(thread.registers.rip), format_windbg_address(thread.registers.rsp));
 	}
 
@@ -7374,7 +7374,7 @@ static void print_guest_thread(const guest_thread_t& thread, const std::uint8_t 
 		}
 	}
 
-	std::fflush(stdout);
+	output::flush();
 }
 
 static std::uint8_t current_context_thread(guest_thread_t& thread_out)
@@ -7418,11 +7418,11 @@ static std::uint8_t show_implicit_register_context()
 		return 1;
 	}
 
-	fmt::print("Last set context:\n");
+	output::print("Last set context:\n");
 	print_paused_registers(implicit_thread.thread.registers);
-	fmt::print("r12-r15 are not stored in the trap frame\n");
+	output::print("r12-r15 are not stored in the trap frame\n");
 	print_memory_instruction(implicit_thread.thread.registers.rip, implicit_thread.thread.registers.cr3);
-	std::fflush(stdout);
+	output::flush();
 
 	return 1;
 }
@@ -7485,8 +7485,8 @@ static void use_thread_context(const guest_thread_t& thread, const std::uint8_t 
 {
 	implicit_thread.set = 1;
 	implicit_thread.thread = thread;
-	fmt::print("Using context of thread {}\n", format_windbg_address(thread.ethread));
-	std::fflush(stdout);
+	output::print("Using context of thread {}\n", format_windbg_address(thread.ethread));
+	output::flush();
 
 	if (switch_process == 0 && reload == 0)
 	{
@@ -7519,7 +7519,7 @@ static void print_process_threads(const guest_process_t& process)
 	std::uint64_t link = 0;
 	std::uint64_t shown = 0;
 
-	fmt::print("Threads of {} cid {:x}:\n", process.image.empty() == true ? "?" : process.image, process.pid);
+	output::print("Threads of {} cid {:x}:\n", process.image.empty() == true ? "?" : process.image, process.pid);
 
 	if (read_kernel_memory(head, &link, sizeof(link)) == 0 || link == 0)
 	{
@@ -7537,10 +7537,10 @@ static void print_process_threads(const guest_process_t& process)
 		{
 			const std::uint8_t kernel = static_cast<std::uint8_t>(thread.has_registers == 1 && thread.registers.rip > 0x00007FFFFFFFFFFFull);
 
-			fmt::print("  {:x}.{:x} {} {} rip={}", thread.pid, thread.tid, format_windbg_address(thread.ethread),
+			output::print("  {:x}.{:x} {} {} rip={}", thread.pid, thread.tid, format_windbg_address(thread.ethread),
 			           kernel == 1 || thread.system_thread == 1 ? "kernel" : "user",
 			           thread.has_registers == 1 ? format_windbg_address(thread.registers.rip) : "(none)");
-			fmt::print(" {}\n", thread_state_name(thread.state));
+			output::print(" {}\n", thread_state_name(thread.state));
 			shown++;
 		}
 
@@ -7552,10 +7552,10 @@ static void print_process_threads(const guest_process_t& process)
 
 	if (shown == 128)
 	{
-		fmt::print("  list truncated\n");
+		output::print("  list truncated\n");
 	}
 
-	std::fflush(stdout);
+	output::flush();
 }
 
 static void process_dot_thread()
@@ -7614,8 +7614,8 @@ static void process_dot_thread()
 		if (implicit_thread.set == 1)
 		{
 			print_guest_thread(implicit_thread.thread, 0);
-			fmt::print("    Context: explicit\n");
-			std::fflush(stdout);
+			output::print("    Context: explicit\n");
+			output::flush();
 
 			if (reload == 1)
 			{
@@ -7629,14 +7629,14 @@ static void process_dot_thread()
 		{
 			breakpoint::registers_t registers = {};
 
-			fmt::print("Implicit thread is not set. Register context is the paused thread.\n");
+			output::print("Implicit thread is not set. Register context is the paused thread.\n");
 
 			if (breakpoint::paused_registers(registers) == 1)
 			{
-				fmt::print("rip={}\n", format_windbg_address(registers.rip));
+				output::print("rip={}\n", format_windbg_address(registers.rip));
 			}
 
-			std::fflush(stdout);
+			output::flush();
 
 			return;
 		}
@@ -7649,8 +7649,8 @@ static void process_dot_thread()
 		}
 
 		print_guest_thread(thread, 0);
-		fmt::print("    Context: current\n");
-		std::fflush(stdout);
+		output::print("    Context: current\n");
+		output::flush();
 
 		return;
 	}
@@ -7667,8 +7667,8 @@ static void process_dot_thread()
 	if (selector == 0)
 	{
 		clear_implicit_thread();
-		fmt::print("Implicit thread cleared\n");
-		std::fflush(stdout);
+		output::print("Implicit thread cleared\n");
+		output::flush();
 
 		return;
 	}
@@ -7774,8 +7774,8 @@ static void process_bang_thread()
 
 	if ((flags & 4) != 0)
 	{
-		fmt::print("    stack trace is not available\n");
-		std::fflush(stdout);
+		output::print("    stack trace is not available\n");
+		output::flush();
 	}
 }
 
@@ -8531,23 +8531,23 @@ static void print_stack_frames(const std::vector<stack_frame_t>& frames, const s
 {
 	if (style == stack_style_t::verbose)
 	{
-		fmt::print(" # Child-SP          RetAddr               : Args to Child                                                           : Call Site\n");
+		output::print(" # Child-SP          RetAddr               : Args to Child                                                           : Call Site\n");
 	}
 	else if (style == stack_style_t::args3)
 	{
-		fmt::print(" # Child-SP          RetAddr               : Args to Child                                      : Call Site\n");
+		output::print(" # Child-SP          RetAddr               : Args to Child                                      : Call Site\n");
 	}
 	else if (style == stack_style_t::dump)
 	{
-		fmt::print(" # Child-SP          RetAddr               Memory\n");
+		output::print(" # Child-SP          RetAddr               Memory\n");
 	}
 	else if (style == stack_style_t::params)
 	{
-		fmt::print(" # Call Site\n");
+		output::print(" # Call Site\n");
 	}
 	else
 	{
-		fmt::print(" # Child-SP          RetAddr               Call Site\n");
+		output::print(" # Child-SP          RetAddr               Call Site\n");
 	}
 
 	for (std::uint64_t index = 0; index < frames.size(); index++)
@@ -8564,49 +8564,49 @@ static void print_stack_frames(const std::vector<stack_frame_t>& frames, const s
 
 		if (style == stack_style_t::params)
 		{
-			fmt::print("{:02x} {}{}\n", index, size_text.empty() == true ? "" : "[" + size_text + "] ", site);
+			output::print("{:02x} {}{}\n", index, size_text.empty() == true ? "" : "[" + size_text + "] ", site);
 
 			for (std::uint32_t arg = 0; arg < 4; arg++)
 			{
-				fmt::print("            Parameter[{}] = {}\n", arg, stack_qword(frame.args_valid[arg], frame.args[arg]));
+				output::print("            Parameter[{}] = {}\n", arg, stack_qword(frame.args_valid[arg], frame.args[arg]));
 			}
 
 			continue;
 		}
 
-		fmt::print("{:02x} {} {} ", index, format_windbg_address(frame.child_sp), ret);
+		output::print("{:02x} {} {} ", index, format_windbg_address(frame.child_sp), ret);
 
 		if (style == stack_style_t::args3 || style == stack_style_t::verbose)
 		{
 			const std::uint32_t arg_count = style == stack_style_t::args3 ? 3 : 4;
-			fmt::print(": ");
+			output::print(": ");
 
 			for (std::uint32_t arg = 0; arg < arg_count; arg++)
 			{
-				fmt::print("{}{}", stack_qword(frame.args_valid[arg], frame.args[arg]), arg + 1 == arg_count ? "" : " ");
+				output::print("{}{}", stack_qword(frame.args_valid[arg], frame.args[arg]), arg + 1 == arg_count ? "" : " ");
 			}
 
-			fmt::print(" : {}", site);
+			output::print(" : {}", site);
 		}
 		else if (style == stack_style_t::dump)
 		{
-			fmt::print("{} {} {}", ret, stack_qword(frame.args_valid[0], frame.args[0]), stack_qword(frame.args_valid[1], frame.args[1]));
-			fmt::print(" {}", site);
+			output::print("{} {} {}", ret, stack_qword(frame.args_valid[0], frame.args[0]), stack_qword(frame.args_valid[1], frame.args[1]));
+			output::print(" {}", site);
 		}
 		else
 		{
-			fmt::print("{}", site);
+			output::print("{}", site);
 		}
 
 		if (show_size == 1 && size_text.empty() == false)
 		{
-			fmt::print(" ({})", size_text);
+			output::print(" ({})", size_text);
 		}
 
-		fmt::print("\n");
+		output::print("\n");
 	}
 
-	std::fflush(stdout);
+	output::flush();
 }
 
 static std::uint8_t stack_style_letter(const std::string_view text, stack_style_t& style_out)
@@ -8787,7 +8787,7 @@ static void process_lmi(const CLI::App* const command)
 
 	for (const reload_module_t& module : modules)
 	{
-		fmt::print("Loaded Module Info: [{}]\n", module_display_name(module.name));
+		output::print("Loaded Module Info: [{}]\n", module_display_name(module.name));
 		std::uint64_t shown = 0;
 		std::vector<reload_module_t> one = { module };
 		print_lm_modules(one, options, loaded, shown);
@@ -8943,19 +8943,19 @@ static void display_symbolized_memory(const CLI::App* const command, const std::
 
 		if (element_size == 8)
 		{
-			fmt::print("{}  {}", format_windbg_address(address), format_windbg_address(value));
+			output::print("{}  {}", format_windbg_address(address), format_windbg_address(value));
 		}
 		else
 		{
-			fmt::print("{}  {:08x}", format_windbg_address(address), static_cast<std::uint32_t>(value));
+			output::print("{}  {:08x}", format_windbg_address(address), static_cast<std::uint32_t>(value));
 		}
 
 		if (symbol.empty() == false)
 		{
-			fmt::print(" {}", symbol);
+			output::print(" {}", symbol);
 		}
 
-		fmt::print("\n");
+		output::print("\n");
 	}
 
 	remember_display_address(request.start_address + available);
@@ -9100,7 +9100,7 @@ static void process_dt(const CLI::App* const command)
 		}
 	}
 
-	fmt::print("{}!{}\n", info.module, info.name);
+	output::print("{}!{}\n", info.module, info.name);
 	std::uint64_t shown = 0;
 	const std::uint64_t read_cr3 = has_address == 1 ? cr3_for_guest_address(address) : sys::current_cr3;
 
@@ -9130,7 +9130,7 @@ static void process_dt(const CLI::App* const command)
 
 		if (field.bitfield == 1)
 		{
-			fmt::print("   +0x{:03x} {:<{}} : Pos {}, {} Bit\n", field.offset, field.name, width, field.bit_position, field.bit_length);
+			output::print("   +0x{:03x} {:<{}} : Pos {}, {} Bit\n", field.offset, field.name, width, field.bit_position, field.bit_length);
 
 			continue;
 		}
@@ -9150,11 +9150,11 @@ static void process_dt(const CLI::App* const command)
 
 		if (value_text.empty() == true)
 		{
-			fmt::print("   +0x{:03x} {:<{}} : {}\n", field.offset, field.name, width, field.type_name);
+			output::print("   +0x{:03x} {:<{}} : {}\n", field.offset, field.name, width, field.type_name);
 		}
 		else
 		{
-			fmt::print("   +0x{:03x} {:<{}} : {} {}\n", field.offset, field.name, width, value_text, field.type_name);
+			output::print("   +0x{:03x} {:<{}} : {} {}\n", field.offset, field.name, width, value_text, field.type_name);
 		}
 	}
 
@@ -9167,8 +9167,8 @@ static void process_dt(const CLI::App* const command)
 static void process_symopt(const CLI::App* const command)
 {
 	(void)command;
-	fmt::print("Symbol options are: 0x{:x}\n", symbol_parser::options());
-	fmt::print("Symbol search path is: {}\n", symbol_parser::search_path().empty() == true ? "(empty)" : symbol_parser::search_path());
+	output::print("Symbol options are: 0x{:x}\n", symbol_parser::options());
+	output::print("Symbol search path is: {}\n", symbol_parser::search_path().empty() == true ? "(empty)" : symbol_parser::search_path());
 }
 
 static void process_examine(const CLI::App* const command)
@@ -9202,7 +9202,7 @@ static void process_examine(const CLI::App* const command)
 			return;
 		}
 
-		fmt::print("{:016x} {}!{}\n", address, module, symbol);
+		output::print("{:016x} {}!{}\n", address, module, symbol);
 
 		return;
 	}
@@ -9254,12 +9254,12 @@ static void process_examine(const CLI::App* const command)
 
 	for (std::size_t index = 0; index < shown; index++)
 	{
-		fmt::print("{:016x} {}\n", matches[index].address, matches[index].name);
+		output::print("{:016x} {}\n", matches[index].address, matches[index].name);
 	}
 
 	if (matches.size() > match_limit)
 	{
-		fmt::print("output truncated at {} matches\n", match_limit);
+		output::print("output truncated at {} matches\n", match_limit);
 	}
 }
 
@@ -9306,43 +9306,23 @@ static void process_nearest(const CLI::App* const command)
 
 	if (displacement == 0)
 	{
-		fmt::print("{:016x} {}\n", address, name);
+		output::print("{:016x} {}\n", address, name);
 	}
 	else
 	{
-		fmt::print("{:016x} {}+{:x}\n", address, name, displacement);
+		output::print("{:016x} {}+{:x}\n", address, name, displacement);
 	}
-}
-
-static void clear_console_screen()
-{
-	const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
-	CONSOLE_SCREEN_BUFFER_INFO info = {};
-
-	if (GetConsoleScreenBufferInfo(output, &info) == 0)
-	{
-		fmt::print("\n");
-
-		return;
-	}
-
-	const DWORD cells = static_cast<DWORD>(info.dwSize.X) * static_cast<DWORD>(info.dwSize.Y);
-	DWORD written = 0;
-	const COORD origin = { 0, 0 };
-	FillConsoleOutputCharacterA(output, ' ', cells, origin, &written);
-	FillConsoleOutputAttribute(output, info.wAttributes, cells, origin, &written);
-	SetConsoleCursorPosition(output, origin);
 }
 
 static void process_cls(const CLI::App* const)
 {
-	clear_console_screen();
+	output::clear();
 }
 
 static void process_echo(const CLI::App* const)
 {
-	fmt::print("{}\n", symbol_command_text(".echo"));
-	std::fflush(stdout);
+	output::print("{}\n", symbol_command_text(".echo"));
+	output::flush();
 }
 
 static std::uint8_t take_command_token(std::string_view& text, std::string& token_out)
@@ -9414,19 +9394,19 @@ static void print_format_text(const std::string_view format, std::string_view ar
 
 			if (escaped == 'n')
 			{
-				fmt::print("\n");
+				output::print("\n");
 			}
 			else if (escaped == 't')
 			{
-				fmt::print("\t");
+				output::print("\t");
 			}
 			else if (escaped == 'r')
 			{
-				fmt::print("\r");
+				output::print("\r");
 			}
 			else
 			{
-				fmt::print("{}", escaped);
+				output::print("{}", escaped);
 			}
 
 			continue;
@@ -9434,7 +9414,7 @@ static void print_format_text(const std::string_view format, std::string_view ar
 
 		if (character != '%' || index + 1 >= format.size())
 		{
-			fmt::print("{}", character);
+			output::print("{}", character);
 
 			continue;
 		}
@@ -9444,7 +9424,7 @@ static void print_format_text(const std::string_view format, std::string_view ar
 
 		if (specifier == '%')
 		{
-			fmt::print("%");
+			output::print("%");
 
 			continue;
 		}
@@ -9460,7 +9440,7 @@ static void print_format_text(const std::string_view format, std::string_view ar
 
 		if (specifier == 's')
 		{
-			fmt::print("{}", token);
+			output::print("{}", token);
 
 			continue;
 		}
@@ -9476,15 +9456,15 @@ static void print_format_text(const std::string_view format, std::string_view ar
 
 		if (specifier == 'd' || specifier == 'i')
 		{
-			fmt::print("{}", static_cast<std::int64_t>(value));
+			output::print("{}", static_cast<std::int64_t>(value));
 		}
 		else if (specifier == 'u')
 		{
-			fmt::print("{}", value);
+			output::print("{}", value);
 		}
 		else if (specifier == 'x' || specifier == 'X' || specifier == 'p')
 		{
-			fmt::print("{:x}", value);
+			output::print("{:x}", value);
 		}
 		else
 		{
@@ -9494,7 +9474,7 @@ static void print_format_text(const std::string_view format, std::string_view ar
 		}
 	}
 
-	std::fflush(stdout);
+	output::flush();
 }
 
 static void process_printf(const CLI::App* const)
@@ -9531,33 +9511,33 @@ static void process_printf(const CLI::App* const)
 
 static void print_expression_formats(const std::uint64_t value)
 {
-	fmt::print("Evaluate expression: {:08x}`{:08x} = {}\n", static_cast<std::uint32_t>(value >> 32),
+	output::print("Evaluate expression: {:08x}`{:08x} = {}\n", static_cast<std::uint32_t>(value >> 32),
 	           static_cast<std::uint32_t>(value), value);
-	fmt::print("Hex:     {:016x}\n", value);
-	fmt::print("Decimal: {}\n", value);
-	fmt::print("Octal:   {:o}\n", value);
-	fmt::print("Binary:  ");
+	output::print("Hex:     {:016x}\n", value);
+	output::print("Decimal: {}\n", value);
+	output::print("Octal:   {:o}\n", value);
+	output::print("Binary:  ");
 
 	for (int shift = 63; shift >= 0; shift--)
 	{
-		fmt::print("{}", (value >> shift) & 1);
+		output::print("{}", (value >> shift) & 1);
 
 		if (shift % 8 == 0 && shift != 0)
 		{
-			fmt::print(" ");
+			output::print(" ");
 		}
 	}
 
-	fmt::print("\nChars:   ");
+	output::print("\nChars:   ");
 
 	for (int shift = 0; shift < 64; shift += 8)
 	{
 		const unsigned char character = static_cast<unsigned char>((value >> shift) & 0xff);
-		fmt::print("{}", character >= 0x20 && character < 0x7f ? static_cast<char>(character) : '.');
+		output::print("{}", character >= 0x20 && character < 0x7f ? static_cast<char>(character) : '.');
 	}
 
-	fmt::print("\n");
-	std::fflush(stdout);
+	output::print("\n");
+	output::flush();
 }
 
 static void process_formats(const CLI::App* const)
@@ -9588,9 +9568,9 @@ static void process_time(const CLI::App* const)
 {
 	SYSTEMTIME time = {};
 	GetLocalTime(&time);
-	fmt::print("Debugger time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}\n", time.wYear, time.wMonth, time.wDay, time.wHour,
+	output::print("Debugger time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}\n", time.wYear, time.wMonth, time.wDay, time.wHour,
 	           time.wMinute, time.wSecond, time.wMilliseconds);
-	std::fflush(stdout);
+	output::flush();
 }
 
 static void process_version(const CLI::App* const)
@@ -9601,44 +9581,44 @@ static void process_version(const CLI::App* const)
 	std::uint32_t driver_abi = 0;
 	std::string driver_version;
 
-	fmt::print("HacDbg usermode: {}\n", HACDBG_VERSION_STRING);
+	output::print("HacDbg usermode: {}\n", HACDBG_VERSION_STRING);
 
 	if (hypercall::query_driver_version(driver_major, driver_minor, driver_patch, driver_abi,
 	                                    driver_version) == 1)
 	{
-		fmt::print("HacDbg hypervisor: {}\n", driver_version);
+		output::print("HacDbg hypervisor: {}\n", driver_version);
 
 		if (driver_version != HACDBG_VERSION_STRING)
 		{
-			fmt::print("Version mismatch: usermode {} hypervisor {}\n", HACDBG_VERSION_STRING,
+			output::print("Version mismatch: usermode {} hypervisor {}\n", HACDBG_VERSION_STRING,
 			           driver_version);
 		}
 	}
 	else
 	{
-		fmt::print("HacDbg hypervisor: unavailable\n");
+		output::print("HacDbg hypervisor: unavailable\n");
 	}
 
 	const std::string path = symbol_parser::search_path();
-	fmt::print("Symbol search path: {}\n", path.empty() == true ? "(empty)" : path);
-	std::fflush(stdout);
+	output::print("Symbol search path: {}\n", path.empty() == true ? "(empty)" : path);
+	output::flush();
 }
 
 static void process_help(const CLI::App* const)
 {
-	fmt::print("Display:    db dw dd dq dp dc da du dds dps dqs\n");
-	fmt::print("Enter:      eb ew ed eq ep ea eu eza ezu\n");
-	fmt::print("Unassemble: u\n");
-	fmt::print("Breakpoint: bp bl bc bd be\n");
-	fmt::print("Execute:    g t p tc tt tct pc pt pct\n");
-	fmt::print("Stack:      k kb kd kp kv\n");
-	fmt::print("Register:   r .thread\n");
-	fmt::print("Symbol:     .sympath .sympath+ .symfix .symfix+ .reload .symopt lm lmi ld x ln dt\n");
-	fmt::print("Process:    !process .process .detach !thread\n");
-	fmt::print("Misc:       .cls .echo .printf .formats ? .time version .help q\n");
-	fmt::print("Guest:      rgpm wgpm cgpm gvat rgvm wgvm cgvm gva\n");
-	fmt::print("Hook:       akh rkh hgpp fl hfpc lkm kme dkm\n");
-	std::fflush(stdout);
+	output::print("Display:    db dw dd dq dp dc da du dds dps dqs\n");
+	output::print("Enter:      eb ew ed eq ep ea eu eza ezu\n");
+	output::print("Unassemble: u\n");
+	output::print("Breakpoint: bp bl bc bd be\n");
+	output::print("Execute:    g t p tc tt tct pc pt pct\n");
+	output::print("Stack:      k kb kd kp kv\n");
+	output::print("Register:   r .thread\n");
+	output::print("Symbol:     .sympath .sympath+ .symfix .symfix+ .reload .symopt lm lmi ld x ln dt\n");
+	output::print("Process:    !process .process .detach !thread\n");
+	output::print("Misc:       .cls .echo .printf .formats ? .time version .help q\n");
+	output::print("Guest:      rgpm wgpm cgpm gvat rgvm wgvm cgvm gva\n");
+	output::print("Hook:       akh rkh hgpp fl hfpc lkm kme dkm\n");
+	output::flush();
 }
 
 static std::string normalize_symbol_command(const std::string& command)
@@ -9941,8 +9921,8 @@ void commands::process(const std::string& command)
 
 static void print_debugger_prompt()
 {
-	fmt::print("{}", breakpoint::has_paused_thread() == 1 ? "0: kd> " : "kd> ");
-	std::fflush(stdout);
+	output::print("{}", breakpoint::has_paused_thread() == 1 ? "0: kd> " : "kd> ");
+	output::flush();
 }
 
 static void announce_breakpoint_hit()
@@ -9955,9 +9935,9 @@ static void announce_breakpoint_hit()
 	}
 
 	clear_implicit_thread();
-	fmt::print("Breakpoint {} hit\n", breakpoint::paused_breakpoint_id());
+	output::print("Breakpoint {} hit\n", breakpoint::paused_breakpoint_id());
 	print_paused_instruction(registers.rip);
-	std::fflush(stdout);
+	output::flush();
 }
 
 static std::atomic<std::uint8_t> console_cancel = 0;
@@ -10021,6 +10001,34 @@ static void console_interrupt_clear()
 	console_cancel.store(0);
 }
 
+std::uint8_t commands::poll_breakpoint()
+{
+	if (breakpoint::poll_new_pause() == 1)
+	{
+		output::print("\n");
+		announce_breakpoint_hit();
+
+		return 1;
+	}
+
+	return 0;
+}
+
+void commands::cancel()
+{
+	console_cancel.store(1);
+}
+
+void commands::clear_cancel()
+{
+	console_cancel.store(0);
+}
+
+std::uint8_t commands::interrupt_requested()
+{
+	return console_cancel.load();
+}
+
 static BOOL WINAPI console_ctrl_handler(const DWORD type)
 {
 	if (type == CTRL_C_EVENT || type == CTRL_BREAK_EVENT)
@@ -10079,7 +10087,7 @@ static std::uint8_t console_row_has_text(const HANDLE output, const SHORT row, c
 //
 static void place_cursor_after_output()
 {
-	std::fflush(stdout);
+	output::flush();
 	const HANDLE output = GetStdHandle(STD_OUTPUT_HANDLE);
 	CONSOLE_SCREEN_BUFFER_INFO info = {};
 
@@ -10345,8 +10353,8 @@ static void paint_input_line(const std::string& prompt, const std::string& text,
 
 	if (GetConsoleScreenBufferInfo(output, &info) == 0 || info.dwSize.X <= 0)
 	{
-		fmt::print("\r{}{}", prompt, text);
-		std::fflush(stdout);
+		output::print("\r{}{}", prompt, text);
+		output::flush();
 		drawn = text.size();
 
 		return;
@@ -10579,23 +10587,23 @@ static std::uint8_t apply_completion(std::string& line, std::size_t& cursor)
 		                            ? static_cast<WORD>(FOREGROUND_RED | FOREGROUND_GREEN | FOREGROUND_BLUE)
 		                            : screen.wAttributes;
 
-	std::fflush(stdout);
+	output::flush();
 	SetConsoleTextAttribute(output, static_cast<WORD>(FOREGROUND_GREEN | FOREGROUND_BLUE | FOREGROUND_INTENSITY));
-	fmt::print("\n");
+	output::print("\n");
 	constexpr std::size_t show_limit = 48;
 	const std::size_t shown = matches.size() > show_limit ? show_limit : matches.size();
 
 	for (std::size_t index = 0; index < shown; index++)
 	{
-		fmt::print("{}\n", matches[index]);
+		output::print("{}\n", matches[index]);
 	}
 
 	if (matches.size() > shown)
 	{
-		fmt::print("... {} matches\n", matches.size());
+		output::print("... {} matches\n", matches.size());
 	}
 
-	std::fflush(stdout);
+	output::flush();
 	SetConsoleTextAttribute(output, previous_color);
 
 	return 2;
@@ -10675,8 +10683,8 @@ static std::uint8_t read_console_command(std::string& command_out)
 
 			if (breakpoint::has_paused_thread() == 0)
 			{
-				fmt::print("\nno paused thread\n");
-				std::fflush(stdout);
+				output::print("\nno paused thread\n");
+				output::flush();
 				capture_input_origin();
 				paint_input_line(prompt, line, cursor, drawn);
 
@@ -10684,8 +10692,8 @@ static std::uint8_t read_console_command(std::string& command_out)
 			}
 
 			line = "t";
-			fmt::print("{}\n", line);
-			std::fflush(stdout);
+			output::print("{}\n", line);
+			output::flush();
 			remember_command(line);
 			SetConsoleMode(input, previous_mode);
 			command_out = line;
@@ -10698,8 +10706,8 @@ static std::uint8_t read_console_command(std::string& command_out)
 			console_cancel.store(0);
 			line.clear();
 			cursor = 0;
-			fmt::print("^C\n");
-			std::fflush(stdout);
+			output::print("^C\n");
+			output::flush();
 			capture_input_origin();
 			paint_input_line(prompt, line, cursor, drawn);
 		}
@@ -10752,14 +10760,14 @@ static std::uint8_t read_console_command(std::string& command_out)
 						if (line.empty() == true && console_history.empty() == false)
 						{
 							line = console_history.back();
-							fmt::print("{}\n", line);
+							output::print("{}\n", line);
 						}
 						else
 						{
-							fmt::print("\n");
+							output::print("\n");
 						}
 
-						std::fflush(stdout);
+						output::flush();
 						remember_command(line);
 						SetConsoleMode(input, previous_mode);
 						command_out = line;
@@ -10777,8 +10785,8 @@ static std::uint8_t read_console_command(std::string& command_out)
 
 						if (breakpoint::has_paused_thread() == 0)
 						{
-							fmt::print("\nno paused thread\n");
-							std::fflush(stdout);
+							output::print("\nno paused thread\n");
+							output::flush();
 							capture_input_origin();
 							paint_input_line(prompt, line, cursor, drawn);
 
@@ -10786,8 +10794,8 @@ static std::uint8_t read_console_command(std::string& command_out)
 						}
 
 						line = key == VK_F5 ? "g" : key == VK_F10 ? "p" : "t";
-						fmt::print("{}\n", line);
-						std::fflush(stdout);
+						output::print("{}\n", line);
+						output::flush();
 						remember_command(line);
 						SetConsoleMode(input, previous_mode);
 						command_out = line;
@@ -10930,10 +10938,10 @@ static std::uint8_t read_console_command(std::string& command_out)
 
 		if (breakpoint::poll_new_pause() == 1)
 		{
-			fmt::print("\n");
+			output::print("\n");
 			announce_breakpoint_hit();
 			prompt = debugger_prompt_text();
-			std::fflush(stdout);
+			output::flush();
 			capture_input_origin();
 			paint_input_line(prompt, line, cursor, drawn);
 		}

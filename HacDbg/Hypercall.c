@@ -454,6 +454,12 @@ HypercallExecute(
     }
 
     case read_guest_cr3:
+        if (g_KernelCr3 == 0)
+        {
+            HACDBG_LOG("HacDbg: Err, read_guest_cr3 has no kernel directory current=0x%I64x.\n",
+                     CurrentCr3);
+        }
+
         result = g_KernelCr3;
         break;
 

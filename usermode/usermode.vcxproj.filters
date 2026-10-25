@@ -72,6 +72,9 @@
     <ClCompile Include="src\logs\logs.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\output\output_sink.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\script\script.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -143,6 +146,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\logs\logs.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\output\output_sink.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\script\script.h">
