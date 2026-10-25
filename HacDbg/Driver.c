@@ -11,6 +11,7 @@
 #include "Hypercall.h"
 #include "Logs.h"
 #include "PhysicalMemory.h"
+#include "Trace.h"
 #include "Debug.h"
 #include "../shared/hypercall/control.h"
 #if HACDBG_BACKEND_INTEL
@@ -59,6 +60,7 @@ C_ASSERT(sizeof(HACDBG_VERSION_STRING) <= HACDBG_VERSION_STRING_SIZE);
 #define HACDBG_LOAD_STAGE_POWER          7
 #define HACDBG_LOAD_STAGE_PROCESSORS     8
 #define HACDBG_LOAD_STAGE_COMPLETE       9
+#define HACDBG_LOAD_STAGE_TRACE          10
 #define HACDBG_REGISTRY_PATH_CHARS       512
 #endif
 
@@ -278,7 +280,10 @@ SvmStartAllProcessors(
         if (context != NULL)
         {
             g_Contexts[index] = context;
-            status = SvmInitialize(context, NptMainRootPa(), 1);
+            context->TraceState = TraceCpuState((UINT32)index);
+            status = context->TraceState == NULL
+                         ? STATUS_INSUFFICIENT_RESOURCES
+                         : SvmInitialize(context, NptMainRootPa(), 1);
         }
         else
         {
@@ -489,6 +494,7 @@ SvmPowerCallback(
     }
     else
     {
+        TraceDisable();
         HACDBG_STOP_ALL();
         HypercallInitialize();
         g_VirtualizationSuspended = TRUE;
@@ -684,8 +690,10 @@ DriverUnload(
     }
 
     HacDbgDeleteDevice();
+    TraceDisable();
     HACDBG_STOP_ALL();
     HACDBG_FREE_ALL();
+    TraceCleanup();
 
     LogsCleanup();
     HACDBG_SHARED_CLEANUP();
@@ -805,16 +813,32 @@ DriverEntry(
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_POWER, STATUS_UNSUCCESSFUL);
     }
 
+    status = TraceInitialize();
+    if (!NT_SUCCESS(status))
+    {
+        HACDBG_LOG("HacDbg: Err, trace initialization failed: 0x%08x.\n", status);
+        HacDbgDeleteDevice();
+        ExUnregisterCallback(g_PowerCallbackRegistration);
+        g_PowerCallbackRegistration = NULL;
+        HACDBG_SHARED_CLEANUP();
+        LogsCleanup();
+        HACDBG_PAGING_CLEANUP();
+        PhysicalMemoryCleanup();
+        return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_TRACE, status);
+    }
+
     status = HACDBG_START_ALL();
     if (!NT_SUCCESS(status))
     {
         HACDBG_LOG("HacDbg: Err, processor virtualization failed: 0x%08x.\n", status);
         HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_PROCESSORS, status);
+        TraceDisable();
         HACDBG_STOP_ALL();
         HacDbgDeleteDevice();
         ExUnregisterCallback(g_PowerCallbackRegistration);
         g_PowerCallbackRegistration = NULL;
         HACDBG_FREE_ALL();
+        TraceCleanup();
 
         LogsCleanup();
         HACDBG_SHARED_CLEANUP();

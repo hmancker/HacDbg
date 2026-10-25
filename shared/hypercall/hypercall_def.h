@@ -26,11 +26,23 @@ typedef enum _hypercall_type_t
     flush_slat_cache,
     breakpoint_pause_poll,
     breakpoint_resume,
-    query_hypervisor_version
+    query_hypervisor_version,
+    trace_control,
+    trace_read
 #ifdef __cplusplus
 };
 #else
 } hypercall_type_t;
+#endif
+
+#ifdef __cplusplus
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::trace_control) == 14,
+              "hypercall trace_control number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::trace_read) == 15,
+              "hypercall trace_read number changed");
+#else
+_Static_assert(trace_control == 14, "hypercall trace_control number changed");
+_Static_assert(trace_read == 15, "hypercall trace_read number changed");
 #endif
 
 // log_current_state with this bit set is a breakpoint hit. The stub pushes

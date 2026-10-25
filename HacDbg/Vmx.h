@@ -8,6 +8,7 @@
 #pragma once
 
 #include "Guest.h"
+#include "Trace.h"
 
 //
 // VMX capability MSRs. IA32_VMX_BASIC bit 55 selects the TRUE_* control MSRs.
@@ -309,6 +310,7 @@ typedef struct _VMX_PROCESSOR_CONTEXT
     //
     UINT8 TscBiasReset;
     UINT8 TscTransitionCalibrated;
+    HACDBG_TRACE_CPU_STATE* TraceState;
 } VMX_PROCESSOR_CONTEXT;
 
 NTSTATUS

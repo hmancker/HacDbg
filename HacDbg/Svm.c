@@ -94,7 +94,7 @@ C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, TscActive) == 0x130);
 C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, TscDeadlineArmed) == 0x131);
 C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, HostDeadlineValid) == 0x132);
 C_ASSERT(FIELD_OFFSET(SVM_PROCESSOR_CONTEXT, GuestTscDeadline) == 0x138);
-C_ASSERT(sizeof(SVM_PROCESSOR_CONTEXT) == 0x148);
+C_ASSERT(sizeof(SVM_PROCESSOR_CONTEXT) == 0x150);
 
 // 分配非分页内存并返回 4 KiB 对齐的首地址，原指针写入 AllocationBase。
 static PVOID
@@ -1250,6 +1250,16 @@ SvmHandleVmExit(
 
     __svm_vmload(processor->HostVmcbPa);
     GuestContext->Registers->Rax = vmcb->StateSaveArea.Rax;
+
+    if (TraceIsEnabled() != FALSE)
+    {
+        TraceRecordExit(processor->TraceState, processor->TscAtExit,
+                        vmcb->StateSaveArea.Rip, vmcb->StateSaveArea.Cr3,
+                        (UINT32)vmcb->ControlArea.ExitCode, vmcb->ControlArea.ExitInfo1,
+                        vmcb->ControlArea.ExitInfo2, 0,
+                        vmcb->ControlArea.ExitCode == SVM_EXIT_CPUID,
+                        GuestContext->Registers->Rcx);
+    }
 
     if (vmcb->StateSaveArea.Cpl == 0)
     {

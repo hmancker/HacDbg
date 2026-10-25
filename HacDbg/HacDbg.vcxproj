@@ -187,6 +187,7 @@
     <ClCompile Include="Driver.c" />
     <ClCompile Include="Hypercall.c" />
     <ClCompile Include="Logs.c" />
+    <ClCompile Include="Trace.c" />
     <ClCompile Include="Npt.c">
       <ExcludedFromBuild Condition="'$(Configuration)'=='DebugIntel'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseIntel'">true</ExcludedFromBuild>
@@ -216,6 +217,7 @@
     <ClInclude Include="Debug.h" />
     <ClInclude Include="Hypercall.h" />
     <ClInclude Include="Logs.h" />
+    <ClInclude Include="Trace.h" />
     <ClInclude Include="Npt.h" />
     <ClInclude Include="PhysicalMemory.h" />
     <ClInclude Include="Ept.h" />

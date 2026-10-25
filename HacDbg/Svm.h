@@ -9,6 +9,7 @@
 
 #include "Types.h"
 #include "Guest.h"
+#include "Trace.h"
 
 //
 // See "SVM Related MSRs".
@@ -284,6 +285,7 @@ typedef struct _SVM_PROCESSOR_CONTEXT
     UINT8 HostDeadlineValid;
     UINT64 GuestTscDeadline;
     UINT64 HostTscDeadline;
+    HACDBG_TRACE_CPU_STATE* TraceState;
 } SVM_PROCESSOR_CONTEXT;
 
 VOID

@@ -4,6 +4,7 @@
 #include <vector>
 
 #include <structures/trap_frame.h>
+#include <structures/trace.h>
 
 namespace hypercall
 {
@@ -39,4 +40,8 @@ namespace hypercall
 	std::uint64_t flush_slat_cache();
 
 	std::uint64_t breakpoint_resume();
+
+	std::uint64_t trace_control(std::uint64_t control_flags, std::uint32_t sample_rate,
+	                            std::uint32_t event_mask);
+	std::uint64_t trace_read(HACDBG_TRACE_SNAPSHOT& snapshot_out, std::uint32_t cpu_filter);
 }

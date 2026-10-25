@@ -9,6 +9,7 @@
 #include "Debug.h"
 #include "Logs.h"
 #include "PhysicalMemory.h"
+#include "Trace.h"
 #if HACDBG_BACKEND_INTEL
 #include "Ept.h"
 #include "Vmx.h"
@@ -546,6 +547,15 @@ HypercallExecute(
         HacDbgSpinLockRelease(&g_BreakpointLock);
         break;
     }
+
+    case trace_control:
+        result = TraceControl(registers->Rdx, registers->R8, registers->R9);
+        break;
+
+    case trace_read:
+        result = TraceRead(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx),
+                           registers->R8, registers->R9);
+        break;
 
     default:
         break;

@@ -298,3 +298,19 @@ std::uint64_t hypercall::breakpoint_resume()
 
 	return launch_cpuid_hypercall(call_type, 0, 0, 0, 0);
 }
+
+std::uint64_t hypercall::trace_control(const std::uint64_t control_flags, const std::uint32_t sample_rate,
+                                       const std::uint32_t event_mask)
+{
+	constexpr auto call_type = hypercall_type_t::trace_control;
+
+	return launch_cpuid_hypercall(call_type, 0, control_flags, sample_rate, event_mask);
+}
+
+std::uint64_t hypercall::trace_read(HACDBG_TRACE_SNAPSHOT& snapshot_out, const std::uint32_t cpu_filter)
+{
+	constexpr auto call_type = hypercall_type_t::trace_read;
+
+	return launch_cpuid_hypercall(call_type, 0, reinterpret_cast<std::uint64_t>(&snapshot_out),
+	                              sizeof(snapshot_out), cpu_filter);
+}

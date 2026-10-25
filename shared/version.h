@@ -6,8 +6,8 @@
 // HACDBG_VERSION_MAJOR only for an incompatible release.
 //
 #define HACDBG_VERSION_MAJOR 1
-#define HACDBG_VERSION_MINOR 0
-#define HACDBG_VERSION_PATCH 19
+#define HACDBG_VERSION_MINOR 1
+#define HACDBG_VERSION_PATCH 0
 
 #define HACDBG_STRINGIFY_INNER(Value) #Value
 #define HACDBG_STRINGIFY(Value)       HACDBG_STRINGIFY_INNER(Value)

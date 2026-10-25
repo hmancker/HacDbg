@@ -33,6 +33,9 @@
     <ClCompile Include="Logs.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Trace.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Npt.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -68,6 +71,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Logs.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Trace.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="Npt.h">

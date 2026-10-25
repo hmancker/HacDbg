@@ -12,4 +12,7 @@
   <Project Path="gui/HacDbgGui/HacDbgGui.csproj">
     <Platform Solution="*|x64" Project="x64" />
   </Project>
+  <Project Path="tools/trace-probe/HacDbgTraceProbe.vcxproj" Id="6f6d2e1a-8e2b-4c7d-9a31-5b4c8d2e1f77">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
 </Solution>

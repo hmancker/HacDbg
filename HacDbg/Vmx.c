@@ -2338,6 +2338,24 @@ VmxHandleVmExit(
     VmxRead(VMCS_GUEST_RIP, &ProcessorContext->GuestRip);
     VmxRead(VMCS_GUEST_CR3, &ProcessorContext->GuestCr3);
 
+    if (TraceIsEnabled() != FALSE)
+    {
+        UINT64 exitInfo1 = 0;
+        UINT64 exitInfo2 = 0;
+
+        if (TraceEventsEnabled() != FALSE)
+        {
+            VmxRead(VMCS_EXIT_QUALIFICATION, &exitInfo1);
+            VmxRead(VMCS_GUEST_PHYSICAL_ADDRESS, &exitInfo2);
+        }
+
+        TraceRecordExit(ProcessorContext->TraceState, ProcessorContext->TscAtExit,
+                        ProcessorContext->GuestRip, ProcessorContext->GuestCr3, reason,
+                        exitInfo1, exitInfo2,
+                        entryFailure != FALSE ? HACDBG_TRACE_EVENT_FLAG_ENTRY_FAILURE : 0,
+                        reason == VMX_EXIT_CPUID, ProcessorContext->Registers.Rcx);
+    }
+
     if (entryFailure == FALSE)
     {
         UINT64 rights = 0;
@@ -3424,7 +3442,10 @@ VmxStartAllProcessors(
         {
             RtlZeroMemory(context, sizeof(*context));
             g_Processors[index] = context;
-            status = VmxPrepareProcessor(context, (UINT16)(index + 1));
+            context->TraceState = TraceCpuState((UINT32)index);
+            status = context->TraceState == NULL
+                         ? STATUS_INSUFFICIENT_RESOURCES
+                         : VmxPrepareProcessor(context, (UINT16)(index + 1));
         }
 
         KeRevertToUserGroupAffinityThread(&previous);
