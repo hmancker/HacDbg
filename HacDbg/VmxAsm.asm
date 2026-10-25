@@ -131,10 +131,25 @@ VmxExitEntry proc
         or      rax, rdx
         mov     [r12+128h], rax
 VmxExitNoTsc:
-        sub     rsp, 28h
+        ; A VM exit is transparent to the guest. The x64 C ABI lets the C
+        ; handler clobber XMM0-XMM5, so preserve those guest registers while
+        ; running the handler. Keep the stack 16-byte aligned for movaps.
+        sub     rsp, 88h
+        movaps  xmmword ptr [rsp+20h], xmm0
+        movaps  xmmword ptr [rsp+30h], xmm1
+        movaps  xmmword ptr [rsp+40h], xmm2
+        movaps  xmmword ptr [rsp+50h], xmm3
+        movaps  xmmword ptr [rsp+60h], xmm4
+        movaps  xmmword ptr [rsp+70h], xmm5
         mov     rcx, r12
         call    VmxHandleVmExit
-        add     rsp, 28h
+        movaps  xmm0, xmmword ptr [rsp+20h]
+        movaps  xmm1, xmmword ptr [rsp+30h]
+        movaps  xmm2, xmmword ptr [rsp+40h]
+        movaps  xmm3, xmmword ptr [rsp+50h]
+        movaps  xmm4, xmmword ptr [rsp+60h]
+        movaps  xmm5, xmmword ptr [rsp+70h]
+        add     rsp, 88h
         test    al, al
         jnz     VmxExitLeave
 
