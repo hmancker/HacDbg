@@ -54,7 +54,7 @@
                 <Button x:Name="ResetLayoutButton"
                         Content="重置布局"
                         Click="ResetLayoutButton_Click"
-                        ToolTip="把所有文档恢复到默认的单页选项卡布局并立即保存。" />
+                        ToolTip="恢复默认单页布局，并把命令台与文档区、状态页、进程页的分隔条以及表格列宽恢复到默认大小。窗口位置和大小不变。" />
                 <Button x:Name="SearchButton"
                         Content="搜索 (Ctrl+F)"
                         Click="SearchButton_Click"
@@ -314,9 +314,9 @@
                                            CanFloat="False">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="4*" />
+                            <RowDefinition x:Name="StatusRegisterRow" Height="4*" />
                             <RowDefinition Height="6" />
-                            <RowDefinition Height="2*" />
+                            <RowDefinition x:Name="StatusBreakpointRow" Height="2*" />
                         </Grid.RowDefinitions>
 
                         <Border Grid.Row="0"
@@ -516,9 +516,9 @@
                                            CanFloat="False">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
-                            <RowDefinition Height="3*" />
+                            <RowDefinition x:Name="ProcessListRow" Height="3*" />
                             <RowDefinition Height="6" />
-                            <RowDefinition Height="2*" />
+                            <RowDefinition x:Name="ThreadListRow" Height="2*" />
                         </Grid.RowDefinitions>
 
                         <Border Grid.Row="0"

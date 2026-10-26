@@ -26,7 +26,10 @@ public partial class MainWindow
         WriteIndented = true
     };
 
+    private const double DefaultDocumentPaneWidth = 640;
+
     private readonly Dictionary<string, object> _dockContentById = new(StringComparer.Ordinal);
+    private readonly List<(DataGridColumn Column, DataGridLength Width)> _defaultColumnWidths = new();
     private bool _guiStateRestored;
 
     private static string SettingsDirectory =>
@@ -48,6 +51,7 @@ public partial class MainWindow
             _dockContentById.TryAdd(document.ContentId, document.Content);
         }
 
+        CaptureDefaultColumnWidths();
         ApplyDockDocumentPolicy();
     }
 
@@ -246,8 +250,46 @@ public partial class MainWindow
     private void ResetDockLayout()
     {
         BuildDefaultDockLayout();
+        RestoreDefaultPaneSizes();
         SaveDockLayout();
+        SaveGuiSettings();
         AppendInfo("layout reset to defaults");
+    }
+
+    private void CaptureDefaultColumnWidths()
+    {
+        if (_defaultColumnWidths.Count != 0)
+        {
+            return;
+        }
+
+        DataGrid[] grids =
+        {
+            RegisterGrid, BreakpointGrid, ModuleGrid, ProcessGrid,
+            ThreadGrid, StackGrid, MemoryGrid, DisassemblyGrid
+        };
+
+        foreach (DataGrid grid in grids)
+        {
+            foreach (DataGridColumn column in grid.Columns)
+            {
+                _defaultColumnWidths.Add((column, column.Width));
+            }
+        }
+    }
+
+    private void RestoreDefaultPaneSizes()
+    {
+        RightPanelColumn.Width = new GridLength(DefaultDocumentPaneWidth);
+        StatusRegisterRow.Height = new GridLength(4, GridUnitType.Star);
+        StatusBreakpointRow.Height = new GridLength(2, GridUnitType.Star);
+        ProcessListRow.Height = new GridLength(3, GridUnitType.Star);
+        ThreadListRow.Height = new GridLength(2, GridUnitType.Star);
+
+        foreach ((DataGridColumn column, DataGridLength width) in _defaultColumnWidths)
+        {
+            column.Width = width;
+        }
     }
 
     private void BuildDefaultDockLayout()
@@ -516,7 +558,7 @@ public partial class MainWindow
         public double? Width { get; set; } = 1600;
         public double? Height { get; set; } = 900;
         public string WindowState { get; set; } = "Normal";
-        public double? DockPanelWidth { get; set; } = 640;
+        public double? DockPanelWidth { get; set; } = DefaultDocumentPaneWidth;
         public string ActiveDocument { get; set; } = "status";
         public uint TraceSampleRate { get; set; } = 64;
         public bool FollowRip { get; set; }
