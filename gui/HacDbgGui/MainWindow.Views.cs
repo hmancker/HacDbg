@@ -730,6 +730,27 @@ public partial class MainWindow
         DisassemblyStatusText.Text = status.Truncated != 0
             ? $"{count} 条，已截断"
             : $"{count} 条";
+        SelectPausedInstruction();
+    }
+
+    private void SelectPausedInstruction()
+    {
+        if (_pausedNow == false || _lastPausedRip == 0)
+        {
+            return;
+        }
+
+        for (int index = 0; index < _disassembly.Count; index++)
+        {
+            if (_disassembly[index].AddressValue != _lastPausedRip)
+            {
+                continue;
+            }
+
+            DisassemblyGrid.SelectedIndex = index;
+            DisassemblyGrid.ScrollIntoView(_disassembly[index]);
+            return;
+        }
     }
 
     private void PollResolve()
@@ -889,9 +910,10 @@ public partial class MainWindow
             return;
         }
 
+        bool enteredPause = _pausedNow == false;
         _pausedCr3 = state.Registers.Cr3;
         ulong rip = state.Registers.Rip;
-        bool pauseChanged = _pausedNow == false || _lastPausedRip != rip;
+        bool pauseChanged = enteredPause || _lastPausedRip != rip;
         _pausedNow = true;
         _lastPausedRip = rip;
 
@@ -902,7 +924,11 @@ public partial class MainWindow
 
         RequestStack();
 
-        if (FollowRipCheck.IsChecked == true && rip != 0)
+        //
+        // A breakpoint hit opens the disassembly view on its own. Follow RIP
+        // only keeps later steps on that view.
+        //
+        if (rip != 0 && (enteredPause || FollowRipCheck.IsChecked == true))
         {
             OpenDisassemblyAt(rip, _pausedCr3);
         }

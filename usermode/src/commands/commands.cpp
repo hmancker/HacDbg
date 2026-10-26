@@ -10404,15 +10404,12 @@ static void console_interrupt_clear()
 
 std::uint8_t commands::poll_breakpoint()
 {
-	if (breakpoint::poll_new_pause() == 1)
-	{
-		output::print("\n");
-		announce_breakpoint_hit();
-
-		return 1;
-	}
-
-	return 0;
+	//
+	// The GUI opens the disassembly view from the pause snapshot. Printing
+	// the hit here would embed that break in the command console. The CLI
+	// input loop still announces the hit itself.
+	//
+	return breakpoint::poll_new_pause();
 }
 
 void commands::cancel()
