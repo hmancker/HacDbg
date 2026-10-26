@@ -3,6 +3,7 @@ using System.IO;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Threading;
 
 namespace HacDbgGui;
@@ -10,18 +11,16 @@ namespace HacDbgGui;
 public partial class MainWindow
 {
     //
-    // Ctrl+1 through Ctrl+7 and the trace renderer document actions use this
+    // Ctrl+1 through Ctrl+4 and the trace renderer document actions use this
     // order. The command tab is a peer in the tab strip, but it is not one of
-    // these slots.
+    // these slots. Registers, breakpoints, memory and the call stack are panes
+    // inside the disassembly tab.
     //
     private static readonly (string ContentId, string Title)[] DefaultDockDocuments =
     {
-        ("status", "状态"),
+        ("disassembly", "反汇编"),
         ("modules", "模块"),
         ("processes", "进程 / 线程"),
-        ("stack", "调用栈"),
-        ("memory", "内存"),
-        ("disassembly", "反汇编"),
         ("trace", "实时 trace")
     };
 
@@ -59,11 +58,11 @@ public partial class MainWindow
         ApplyTraceSampleRate(settings.TraceSampleRate);
         FollowRipCheck.IsChecked = settings.FollowRip;
 
-        string activeDocument = settings.ActiveDocument ?? "status";
+        string activeDocument = NormalizeDocumentId(settings.ActiveDocument);
 
         if (ActivateDocument(activeDocument) == false)
         {
-            ActivateDocument("status");
+            ActivateDocument("disassembly");
         }
     }
 
@@ -116,7 +115,39 @@ public partial class MainWindow
             return tag;
         }
 
-        return "status";
+        return "disassembly";
+    }
+
+    private static string NormalizeDocumentId(string? contentId)
+    {
+        //
+        // Older settings named the panes that now live inside disassembly.
+        //
+        if (contentId is null or "" or "status" or "stack" or "memory")
+        {
+            return "disassembly";
+        }
+
+        return contentId;
+    }
+
+    private static bool TryDocumentShortcut(Key key, out int index)
+    {
+        if (key >= Key.D1 && key <= Key.D9)
+        {
+            index = (int)key - (int)Key.D1;
+        }
+        else if (key >= Key.NumPad1 && key <= Key.NumPad9)
+        {
+            index = (int)key - (int)Key.NumPad1;
+        }
+        else
+        {
+            index = -1;
+            return false;
+        }
+
+        return index < DefaultDockDocuments.Length;
     }
 
     private void ViewTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
@@ -150,7 +181,7 @@ public partial class MainWindow
 
     private void ResetViewLayout()
     {
-        ActivateDocument("status");
+        ActivateDocument("disassembly");
         RestoreDefaultPaneSizes();
         SaveGuiSettings();
         AppendInfo("layout reset to defaults");
@@ -180,6 +211,12 @@ public partial class MainWindow
 
     private void RestoreDefaultPaneSizes()
     {
+        CpuTopRow.Height = new GridLength(3, GridUnitType.Star);
+        CpuBottomRow.Height = new GridLength(2, GridUnitType.Star);
+        CpuDisasmColumn.Width = new GridLength(5, GridUnitType.Star);
+        CpuRegisterColumn.Width = new GridLength(2, GridUnitType.Star);
+        CpuMemoryColumn.Width = new GridLength(3, GridUnitType.Star);
+        CpuStackColumn.Width = new GridLength(2, GridUnitType.Star);
         StatusRegisterRow.Height = new GridLength(4, GridUnitType.Star);
         StatusBreakpointRow.Height = new GridLength(2, GridUnitType.Star);
         ProcessListRow.Height = new GridLength(3, GridUnitType.Star);
@@ -324,7 +361,7 @@ public partial class MainWindow
         public double? Width { get; set; } = 1600;
         public double? Height { get; set; } = 900;
         public string WindowState { get; set; } = "Normal";
-        public string ActiveDocument { get; set; } = "status";
+        public string ActiveDocument { get; set; } = "disassembly";
         public uint TraceSampleRate { get; set; } = 64;
         public bool FollowRip { get; set; }
         public string Theme { get; set; } = GuiTheme.DarkName;

@@ -35,9 +35,11 @@ public partial class MainWindow : FluentWindow
     private readonly ObservableCollection<FlagRow> _flags = new();
     private readonly ObservableCollection<BreakpointRow> _breakpoints = new();
     private readonly List<string> _history = new();
-    private readonly Brush _errorBrush;
-    private readonly Brush _warningBrush;
-    private readonly Brush _mutedBrush;
+    private readonly CommandOutputColorizer _outputColorizer;
+    private Brush _errorBrush;
+    private Brush _warningBrush;
+    private Brush _mutedBrush;
+    private bool _versionWarningActive;
 
     private HacDbgCore? _core;
     private DispatcherTimer? _timer;
@@ -67,14 +69,11 @@ public partial class MainWindow : FluentWindow
     {
         InitializeComponent();
 
-        _errorBrush = TryFindResource("ErrorBrush") as SolidColorBrush ??
-                      new SolidColorBrush(Color.FromRgb(0xFF, 0x7B, 0x72));
-        _warningBrush = TryFindResource("WarningBrush") as SolidColorBrush ??
-                        new SolidColorBrush(Color.FromRgb(0xE3, 0xB3, 0x41));
-        _mutedBrush = TryFindResource("MutedBrush") as SolidColorBrush ??
-                      new SolidColorBrush(Color.FromRgb(0x8B, 0x98, 0xA5));
-        CommandOutput.TextArea.TextView.LineTransformers.Add(
-            new CommandOutputColorizer(_errorBrush, _warningBrush));
+        _errorBrush = BrushOrFallback("ErrorBrush", 0xFF, 0x7B, 0x72);
+        _warningBrush = BrushOrFallback("WarningBrush", 0xE3, 0xB3, 0x41);
+        _mutedBrush = BrushOrFallback("MutedBrush", 0x8B, 0x98, 0xA5);
+        _outputColorizer = new CommandOutputColorizer(_errorBrush, _warningBrush);
+        CommandOutput.TextArea.TextView.LineTransformers.Add(_outputColorizer);
 
         foreach (string name in RegisterNames)
         {
@@ -426,6 +425,10 @@ public partial class MainWindow : FluentWindow
             StepIntoButton.IsEnabled = running;
             StepOverButton.IsEnabled = running;
             CancelButton.IsEnabled = running;
+            ContinueMenuItem.IsEnabled = running;
+            StepIntoMenuItem.IsEnabled = running;
+            StepOverMenuItem.IsEnabled = running;
+            CancelMenuItem.IsEnabled = running;
         }
     }
 
@@ -439,6 +442,7 @@ public partial class MainWindow : FluentWindow
 
         if (versionMismatch || hypercallMismatch)
         {
+            _versionWarningActive = true;
             VersionText.Foreground = _warningBrush;
 
             if (_versionWarningReported == false)
@@ -465,7 +469,27 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
+        _versionWarningActive = false;
         VersionText.Foreground = _mutedBrush;
+    }
+
+    private Brush BrushOrFallback(string key, byte red, byte green, byte blue)
+    {
+        if (TryFindResource(key) is Brush brush)
+        {
+            return brush;
+        }
+
+        return new SolidColorBrush(Color.FromRgb(red, green, blue));
+    }
+
+    private void RefreshCapturedThemeBrushes()
+    {
+        _errorBrush = BrushOrFallback("ErrorBrush", 0xFF, 0x7B, 0x72);
+        _warningBrush = BrushOrFallback("WarningBrush", 0xE3, 0xB3, 0x41);
+        _mutedBrush = BrushOrFallback("MutedBrush", 0x8B, 0x98, 0xA5);
+        _outputColorizer.Refresh(_errorBrush, _warningBrush);
+        VersionText.Foreground = _versionWarningActive ? _warningBrush : _mutedBrush;
     }
 
     private void UpdateRegisters(HacDbgCoreState state, bool paused)
@@ -818,31 +842,11 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
-        if (control && key >= Key.D1 && key <= Key.D7)
+        if (control && TryDocumentShortcut(key, out int documentIndex))
         {
-            int index = (int)key - (int)Key.D1;
-
-            if (index >= 0 && index < DefaultDockDocuments.Length)
-            {
-                e.Handled = true;
-                CloseCompletion();
-                ActivateDocument(DefaultDockDocuments[index].ContentId);
-            }
-
-            return;
-        }
-
-        if (control && key >= Key.NumPad1 && key <= Key.NumPad7)
-        {
-            int index = (int)key - (int)Key.NumPad1;
-
-            if (index >= 0 && index < DefaultDockDocuments.Length)
-            {
-                e.Handled = true;
-                CloseCompletion();
-                ActivateDocument(DefaultDockDocuments[index].ContentId);
-            }
-
+            e.Handled = true;
+            CloseCompletion();
+            ActivateDocument(DefaultDockDocuments[documentIndex].ContentId);
             return;
         }
 
@@ -883,6 +887,33 @@ public partial class MainWindow : FluentWindow
     private void ResetLayoutButton_Click(object sender, RoutedEventArgs e)
     {
         ResetViewLayout();
+    }
+
+    private void ExitMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        Close();
+    }
+
+    private void ViewMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (sender is System.Windows.Controls.MenuItem item && item.Tag is string tag)
+        {
+            ActivateDocument(tag);
+        }
+    }
+
+    private void CommandHelpMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        ActivateDocument("command");
+        ExecuteCommand(".help");
+    }
+
+    private void ShortcutHelpMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        ActivateDocument("command");
+        AppendInfo("F5 继续，F10 单步跳过，F11 单步进入。");
+        AppendInfo("Ctrl+Tab 切换标签，Ctrl+1 到 Ctrl+4 从反汇编到实时 trace。");
+        AppendInfo("Esc 回到命令台，Tab 补全，Ctrl+F 搜索，Ctrl+L 清空输出。");
     }
 
     private void MainWindow_Closing(object? sender, CancelEventArgs e)

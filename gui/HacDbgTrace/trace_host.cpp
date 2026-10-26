@@ -78,9 +78,6 @@ namespace
 				case '2':
 				case '3':
 				case '4':
-				case '5':
-				case '6':
-				case '7':
 					trace_invoke_action(
 						trace,
 						static_cast<uint32_t>(HacDbgTraceActionDocument1) +
@@ -91,9 +88,6 @@ namespace
 				case VK_NUMPAD2:
 				case VK_NUMPAD3:
 				case VK_NUMPAD4:
-				case VK_NUMPAD5:
-				case VK_NUMPAD6:
-				case VK_NUMPAD7:
 					trace_invoke_action(
 						trace,
 						static_cast<uint32_t>(HacDbgTraceActionDocument1) +

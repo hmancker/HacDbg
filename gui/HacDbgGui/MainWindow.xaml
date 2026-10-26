@@ -12,7 +12,7 @@
                  WindowStartupLocation="CenterScreen"
                  WindowBackdropType="Mica"
                  ExtendsContentIntoTitleBar="True"
-                 Background="{StaticResource WindowBackgroundBrush}"
+                 Background="{DynamicResource WindowBackgroundBrush}"
                  UseLayoutRounding="True"
                  SnapsToDevicePixels="True"
                  TextOptions.TextFormattingMode="Display"
@@ -30,62 +30,80 @@
 
         <ui:TitleBar Grid.Row="0" Title="HacDbg" />
 
-        <Border Grid.Row="1"
-                Margin="12,4,12,10"
-                Padding="10,8"
-                Background="{StaticResource SurfaceBrush}"
-                BorderBrush="{StaticResource BorderBrush}"
-                BorderThickness="1"
-                CornerRadius="6">
-            <WrapPanel Orientation="Horizontal">
-                <Button x:Name="ContinueButton" Content="继续 (F5)" Click="ContinueButton_Click" IsEnabled="False" />
-                <Button x:Name="StepIntoButton" Content="单步进入 (F11)" Click="StepIntoButton_Click" IsEnabled="False" />
-                <Button x:Name="StepOverButton" Content="单步跳过 (F10)" Click="StepOverButton_Click" IsEnabled="False" />
-                <Button x:Name="CancelButton" Content="取消当前命令" Click="CancelButton_Click" IsEnabled="False" />
-                <Button x:Name="LoadSymbolsButton" Content="加载符号" Click="LoadSymbolsButton_Click" IsEnabled="False" />
-                <Button x:Name="RefreshViewsButton" Content="刷新视图" Click="RefreshViewsButton_Click" IsEnabled="False" />
-                <Button x:Name="ClearButton"
-                        Content="清空输出 (Ctrl+L)"
-                        Click="ClearButton_Click"
-                        ToolTip="清空命令台输出，不改变寄存器、断点或客户状态。" />
-                <Button x:Name="ResetLayoutButton"
-                        Content="重置布局"
-                        Click="ResetLayoutButton_Click"
-                        ToolTip="回到「状态」标签，并把状态页、进程页的分隔条以及表格列宽恢复到默认大小。窗口位置和大小不变。" />
-                <Button x:Name="SearchButton"
-                        Content="搜索 (Ctrl+F)"
-                        Click="SearchButton_Click"
-                        ToolTip="在命令台输出中查找。F3 下一个，Shift+F3 上一个。" />
-                <Button x:Name="ThemeButton"
-                        Content="亮色主题"
-                        Click="ThemeButton_Click"
-                        ToolTip="在暗色和亮色主题之间切换，并记住选择。" />
-                <TextBlock Text="Ctrl+Tab 切换标签 · Ctrl+1–7 从状态到实时 trace · Esc 回命令台 · Tab 补全"
+        <DockPanel Grid.Row="1" Margin="8,0,12,2" LastChildFill="True">
+            <StackPanel x:Name="SymbolProgressPanel"
+                        DockPanel.Dock="Right"
+                        Orientation="Horizontal"
+                        VerticalAlignment="Center"
+                        Margin="8,0,0,0"
+                        Visibility="Collapsed">
+                <ProgressBar x:Name="SymbolProgressBar"
+                             Width="150"
+                             Height="6"
+                             Minimum="0"
+                             Maximum="1"
+                             Value="0"
+                             Foreground="{DynamicResource AccentBrush}"
+                             Background="{DynamicResource SurfaceRaisedBrush}"
+                             BorderThickness="0" />
+                <TextBlock x:Name="SymbolProgressText"
+                           Margin="8,0,0,0"
                            VerticalAlignment="Center"
-                           Margin="4,0,0,0"
-                           Foreground="{StaticResource MutedBrush}"
-                           FontSize="12" />
-                <StackPanel x:Name="SymbolProgressPanel"
-                            Orientation="Horizontal"
-                            VerticalAlignment="Center"
-                            Margin="8,0,0,0"
-                            Visibility="Collapsed">
-                    <ProgressBar x:Name="SymbolProgressBar"
-                                 Width="150"
-                                 Height="6"
-                                 Minimum="0"
-                                 Maximum="1"
-                                 Value="0"
-                                 Foreground="{StaticResource AccentBrush}"
-                                 Background="{StaticResource SurfaceRaisedBrush}"
-                                 BorderThickness="0" />
-                    <TextBlock x:Name="SymbolProgressText"
-                               Margin="8,0,0,0"
-                               VerticalAlignment="Center"
-                               Foreground="{StaticResource MutedBrush}" />
-                </StackPanel>
-            </WrapPanel>
-        </Border>
+                           Foreground="{DynamicResource MutedBrush}" />
+            </StackPanel>
+
+            <Menu VerticalAlignment="Center" KeyboardNavigation.ControlTabNavigation="None">
+                <MenuItem Header="文件((_F))">
+                    <MenuItem Header="退出" Click="ExitMenuItem_Click" />
+                </MenuItem>
+                <MenuItem Header="视图((_V))">
+                    <MenuItem Header="命令台" Tag="command" Click="ViewMenuItem_Click" />
+                    <MenuItem Header="反汇编" Tag="disassembly" Click="ViewMenuItem_Click" />
+                    <MenuItem Header="模块" Tag="modules" Click="ViewMenuItem_Click" />
+                    <MenuItem Header="进程 / 线程" Tag="processes" Click="ViewMenuItem_Click" />
+                    <MenuItem Header="实时 trace" Tag="trace" Click="ViewMenuItem_Click" />
+                </MenuItem>
+                <MenuItem Header="调试((_D))">
+                    <MenuItem x:Name="ContinueMenuItem"
+                              Header="继续"
+                              InputGestureText="F5"
+                              Click="ContinueButton_Click"
+                              IsEnabled="False" />
+                    <MenuItem x:Name="StepIntoMenuItem"
+                              Header="单步进入"
+                              InputGestureText="F11"
+                              Click="StepIntoButton_Click"
+                              IsEnabled="False" />
+                    <MenuItem x:Name="StepOverMenuItem"
+                              Header="单步跳过"
+                              InputGestureText="F10"
+                              Click="StepOverButton_Click"
+                              IsEnabled="False" />
+                    <MenuItem x:Name="CancelMenuItem"
+                              Header="取消当前命令"
+                              Click="CancelButton_Click"
+                              IsEnabled="False" />
+                    <Separator Style="{StaticResource MenuSeparator}" />
+                    <MenuItem x:Name="RefreshViewsMenuItem"
+                              Header="刷新视图"
+                              Click="RefreshViewsButton_Click"
+                              IsEnabled="False" />
+                </MenuItem>
+                <MenuItem Header="选项((_O))">
+                    <MenuItem x:Name="ThemeMenuItem"
+                              Header="亮色主题"
+                              Click="ThemeButton_Click"
+                              ToolTip="在暗色和亮色主题之间切换，并记住选择。" />
+                    <MenuItem Header="重置布局"
+                              Click="ResetLayoutButton_Click"
+                              ToolTip="回到「反汇编」，并把反汇编页、进程页的分隔条以及表格列宽恢复到默认大小。窗口位置和大小不变。" />
+                </MenuItem>
+                <MenuItem Header="帮助((_H))">
+                    <MenuItem Header="命令帮助" Click="CommandHelpMenuItem_Click" />
+                    <MenuItem Header="快捷键" Click="ShortcutHelpMenuItem_Click" />
+                </MenuItem>
+            </Menu>
+        </DockPanel>
 
         <TabControl x:Name="ViewTabs"
                     Grid.Row="2"
@@ -93,20 +111,32 @@
                     KeyboardNavigation.ControlTabNavigation="None"
                     SelectedIndex="1">
             <TabItem Header="命令台" Tag="command">
-                <Border Background="{StaticResource SurfaceBrush}"
-                        BorderBrush="{StaticResource BorderBrush}"
+                <Border Background="{DynamicResource SurfaceBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}"
                         BorderThickness="1"
                         CornerRadius="6"
                         Padding="10">
                     <Grid>
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
+                            <RowDefinition Height="Auto" />
                             <RowDefinition Height="*" />
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
+                    <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,8">
+                        <Button x:Name="ClearButton"
+                                Content="清空输出"
+                                Click="ClearButton_Click"
+                                ToolTip="清空命令台输出，不改变寄存器、断点或客户状态。Ctrl+L" />
+                        <Button x:Name="SearchButton"
+                                Content="查找"
+                                Click="SearchButton_Click"
+                                ToolTip="在命令台输出中查找，不区分大小写。Ctrl+F，F3 下一个，Shift+F3 上一个。" />
+                    </StackPanel>
+
                     <Grid x:Name="CommandSearchBar"
-                          Grid.Row="0"
+                          Grid.Row="1"
                           Margin="0,0,0,8"
                           Visibility="Collapsed">
                         <Grid.ColumnDefinitions>
@@ -141,20 +171,20 @@
                     </Grid>
 
                     <avalonEdit:TextEditor x:Name="CommandOutput"
-                                           Grid.Row="1"
+                                           Grid.Row="2"
                                            IsReadOnly="True"
                                            ShowLineNumbers="False"
                                            WordWrap="False"
                                            FontFamily="Cascadia Mono, Consolas"
                                            FontSize="13"
-                                           Background="{StaticResource SurfaceBrush}"
-                                           Foreground="{StaticResource ForegroundBrush}"
+                                           Background="{DynamicResource SurfaceBrush}"
+                                           Foreground="{DynamicResource ForegroundBrush}"
                                            BorderThickness="0"
                                            Padding="4"
                                            HorizontalScrollBarVisibility="Auto"
                                            VerticalScrollBarVisibility="Auto" />
 
-                    <Grid Grid.Row="2" Margin="0,8,0,0">
+                    <Grid Grid.Row="3" Margin="0,8,0,0">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="*" />
@@ -164,7 +194,7 @@
                                    VerticalAlignment="Center"
                                    Margin="4,0,8,0"
                                    FontFamily="Cascadia Mono, Consolas"
-                                   Foreground="{StaticResource AccentBrush}" />
+                                   Foreground="{DynamicResource AccentBrush}" />
 
                         <TextBox x:Name="CommandInput"
                                  Grid.Column="1"
@@ -249,153 +279,472 @@
                 </Border>
             </TabItem>
 
-            <TabItem Header="状态" Tag="status">
-                    <Grid Margin="0,6,0,0">
+            <TabItem Header="反汇编" Tag="disassembly">
+                <Border Margin="0,6,0,0"
+                        Background="{DynamicResource SurfaceBrush}"
+                        BorderBrush="{DynamicResource BorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="6">
+                    <Grid>
                         <Grid.RowDefinitions>
-                            <RowDefinition x:Name="StatusRegisterRow" Height="4*" />
-                            <RowDefinition Height="6" />
-                            <RowDefinition x:Name="StatusBreakpointRow" Height="2*" />
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition x:Name="CpuTopRow" Height="3*" />
+                            <RowDefinition Height="5" />
+                            <RowDefinition x:Name="CpuBottomRow" Height="2*" />
                         </Grid.RowDefinitions>
 
                         <Border Grid.Row="0"
-                                Background="{StaticResource SurfaceBrush}"
-                                BorderBrush="{StaticResource BorderBrush}"
-                                BorderThickness="1"
-                                CornerRadius="6"
-                                Padding="10">
-                            <Grid>
-                                <Grid.RowDefinitions>
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="*" />
-                                    <RowDefinition Height="Auto" />
-                                    <RowDefinition Height="Auto" />
-                                </Grid.RowDefinitions>
-
-                                <TextBlock Text="寄存器"
-                                           FontSize="14"
-                                           FontWeight="SemiBold"
-                                           Margin="0,0,0,8" />
-
-                                <DataGrid x:Name="RegisterGrid"
-                                          Grid.Row="1"
-                                          AutoGenerateColumns="False"
-                                          HeadersVisibility="Column">
-                                    <DataGrid.Columns>
-                                        <DataGridTextColumn Header="寄存器" Binding="{Binding Name}" Width="110" />
-                                        <DataGridTextColumn Header="值" Binding="{Binding Value}" Width="*">
-                                            <DataGridTextColumn.ElementStyle>
-                                                <Style TargetType="TextBlock">
-                                                    <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
-                                                    <Style.Triggers>
-                                                        <DataTrigger Binding="{Binding Changed}" Value="True">
-                                                            <Setter Property="Foreground" Value="{StaticResource ErrorBrush}" />
-                                                            <Setter Property="FontWeight" Value="SemiBold" />
-                                                        </DataTrigger>
-                                                    </Style.Triggers>
-                                                </Style>
-                                            </DataGridTextColumn.ElementStyle>
-                                        </DataGridTextColumn>
-                                    </DataGrid.Columns>
-                                </DataGrid>
-
-                                <TextBlock Grid.Row="2"
-                                           Text="标志"
-                                           FontSize="13"
-                                           FontWeight="SemiBold"
-                                           Margin="0,8,0,4" />
-
-                                <ItemsControl x:Name="FlagsGrid" Grid.Row="3">
-                                    <ItemsControl.ItemsPanel>
-                                        <ItemsPanelTemplate>
-                                            <UniformGrid Columns="3" />
-                                        </ItemsPanelTemplate>
-                                    </ItemsControl.ItemsPanel>
-                                    <ItemsControl.ItemTemplate>
-                                        <DataTemplate>
-                                            <Border Margin="0,0,6,4"
-                                                    Padding="6,2"
-                                                    Background="{StaticResource SurfaceRaisedBrush}"
-                                                    BorderBrush="{StaticResource BorderBrush}"
-                                                    BorderThickness="1"
-                                                    CornerRadius="4">
-                                                <Grid>
-                                                    <Grid.ColumnDefinitions>
-                                                        <ColumnDefinition Width="Auto" />
-                                                        <ColumnDefinition Width="*" />
-                                                    </Grid.ColumnDefinitions>
-                                                    <TextBlock Text="{Binding Name}"
-                                                               FontFamily="Cascadia Mono, Consolas"
-                                                               FontWeight="SemiBold"
-                                                               Foreground="{StaticResource MutedBrush}" />
-                                                    <TextBlock Grid.Column="1"
-                                                               Text="{Binding Value}"
-                                                               HorizontalAlignment="Right"
-                                                               Margin="10,0,0,0"
-                                                               FontFamily="Cascadia Mono, Consolas"
-                                                               FontWeight="SemiBold">
-                                                        <TextBlock.Style>
-                                                            <Style TargetType="TextBlock">
-                                                                <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
-                                                                <Style.Triggers>
-                                                                    <DataTrigger Binding="{Binding Changed}" Value="True">
-                                                                        <Setter Property="Foreground" Value="{StaticResource ErrorBrush}" />
-                                                                    </DataTrigger>
-                                                                </Style.Triggers>
-                                                            </Style>
-                                                        </TextBlock.Style>
-                                                    </TextBlock>
-                                                </Grid>
-                                            </Border>
-                                        </DataTemplate>
-                                    </ItemsControl.ItemTemplate>
-                                </ItemsControl>
-                            </Grid>
+                                BorderBrush="{DynamicResource BorderBrush}"
+                                BorderThickness="0,0,0,1"
+                                Padding="6,4">
+                            <StackPanel Orientation="Horizontal">
+                                <Button x:Name="ContinueButton"
+                                        Style="{StaticResource ToolbarButton}"
+                                        Click="ContinueButton_Click"
+                                        IsEnabled="False"
+                                        ToolTip="继续 (F5)">
+                                    <ui:SymbolIcon Symbol="Play20" FontSize="16" Foreground="{DynamicResource AccentBrush}" />
+                                </Button>
+                                <Button x:Name="StepIntoButton"
+                                        Style="{StaticResource ToolbarButton}"
+                                        Click="StepIntoButton_Click"
+                                        IsEnabled="False"
+                                        ToolTip="单步进入 (F11)">
+                                    <ui:SymbolIcon Symbol="ArrowStepIn20" FontSize="16" />
+                                </Button>
+                                <Button x:Name="StepOverButton"
+                                        Style="{StaticResource ToolbarButton}"
+                                        Click="StepOverButton_Click"
+                                        IsEnabled="False"
+                                        Margin="0,0,10,0"
+                                        ToolTip="单步跳过 (F10)">
+                                    <ui:SymbolIcon Symbol="ArrowStepOver20" FontSize="16" />
+                                </Button>
+                                <Button x:Name="CancelButton"
+                                        Style="{StaticResource ToolbarButton}"
+                                        Click="CancelButton_Click"
+                                        IsEnabled="False"
+                                        Margin="0,0,10,0"
+                                        ToolTip="取消当前命令">
+                                    <ui:SymbolIcon Symbol="Stop20" FontSize="16" Foreground="{DynamicResource WarningBrush}" />
+                                </Button>
+                                <Button x:Name="RefreshViewsButton"
+                                        Style="{StaticResource ToolbarButton}"
+                                        Click="RefreshViewsButton_Click"
+                                        IsEnabled="False"
+                                        ToolTip="刷新视图">
+                                    <ui:SymbolIcon Symbol="ArrowClockwise20" FontSize="16" />
+                                </Button>
+                            </StackPanel>
                         </Border>
 
-                        <GridSplitter Grid.Row="1"
+                        <Grid Grid.Row="1">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition x:Name="CpuDisasmColumn" Width="5*" />
+                                <ColumnDefinition Width="5" />
+                                <ColumnDefinition x:Name="CpuRegisterColumn" Width="2*" />
+                            </Grid.ColumnDefinitions>
+
+                            <Grid Grid.Column="0" Margin="8,8,4,4">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="反汇编"
+                                               FontSize="13"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock x:Name="DisassemblyStatusText"
+                                               Grid.Column="1"
+                                               HorizontalAlignment="Right"
+                                               VerticalAlignment="Center"
+                                               Margin="8,0,12,0"
+                                               Foreground="{DynamicResource MutedBrush}" />
+                                    <CheckBox x:Name="FollowRipCheck"
+                                              Grid.Column="2"
+                                              Content="跟随 RIP"
+                                              VerticalAlignment="Center"
+                                              Margin="0,0,12,0" />
+                                    <Button Grid.Column="3"
+                                            Content="RIP"
+                                            Click="RipButton_Click" />
+                                </Grid>
+
+                                <Grid Grid.Row="1" Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="2*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="地址"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,6,0" />
+                                    <TextBox x:Name="DisassemblyAddressBox"
+                                             Grid.Column="1"
+                                             Text="0x0" />
+                                    <TextBlock Grid.Column="2"
+                                               Text="CR3"
+                                               VerticalAlignment="Center"
+                                               Margin="12,0,6,0" />
+                                    <TextBox x:Name="DisassemblyCr3Box"
+                                             Grid.Column="3" />
+                                    <ComboBox x:Name="DisassemblyCountBox"
+                                              Grid.Column="4"
+                                              Width="70"
+                                              Margin="8,0"
+                                              SelectedIndex="1">
+                                        <ComboBoxItem Content="32" Tag="32" />
+                                        <ComboBoxItem Content="64" Tag="64" />
+                                        <ComboBoxItem Content="128" Tag="128" />
+                                    </ComboBox>
+                                    <Button Grid.Column="5"
+                                            Content="上一页"
+                                            Click="DisassemblyPreviousButton_Click" />
+                                    <Button Grid.Column="6"
+                                            Content="下一页"
+                                            Click="DisassemblyNextButton_Click" />
+                                    <Button Grid.Column="7"
+                                            Content="读取"
+                                            Click="DisassemblyReadButton_Click" />
+                                </Grid>
+
+                                <DataGrid x:Name="DisassemblyGrid"
+                                          Grid.Row="2"
+                                          AutoGenerateColumns="False"
+                                          ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                          MouseDoubleClick="DisassemblyGrid_MouseDoubleClick">
+                                    <DataGrid.CellStyle>
+                                        <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
+                                            <Style.Triggers>
+                                                <DataTrigger Binding="{Binding IsCurrent}" Value="True">
+                                                    <Setter Property="Background" Value="{DynamicResource AccentBrush}" />
+                                                    <Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}" />
+                                                    <Setter Property="FontWeight" Value="SemiBold" />
+                                                </DataTrigger>
+                                            </Style.Triggers>
+                                        </Style>
+                                    </DataGrid.CellStyle>
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header=""
+                                                            Binding="{Binding Marker}"
+                                                            Width="36"
+                                                            ElementStyle="{StaticResource DisassemblyCellText}" />
+                                        <DataGridTextColumn Header="地址"
+                                                            Binding="{Binding Address}"
+                                                            Width="Auto"
+                                                            MinWidth="175"
+                                                            ElementStyle="{StaticResource DisassemblyCellText}" />
+                                        <DataGridTextColumn Header="字节"
+                                                            Binding="{Binding Bytes}"
+                                                            Width="Auto"
+                                                            MinWidth="130"
+                                                            ElementStyle="{StaticResource DisassemblyCellText}" />
+                                        <DataGridTextColumn Header="指令"
+                                                            Binding="{Binding Text}"
+                                                            Width="Auto"
+                                                            MinWidth="190"
+                                                            ElementStyle="{StaticResource DisassemblyCellText}" />
+                                        <DataGridTemplateColumn Header="符号" Width="Auto" MinWidth="220">
+                                            <DataGridTemplateColumn.CellTemplate>
+                                                <DataTemplate>
+                                                    <TextBlock Text="{Binding Symbol}"
+                                                               TextTrimming="None"
+                                                               ToolTip="{Binding Symbol}"
+                                                               Style="{StaticResource DisassemblyCellText}" />
+                                                </DataTemplate>
+                                            </DataGridTemplateColumn.CellTemplate>
+                                        </DataGridTemplateColumn>
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+
+                            <GridSplitter Grid.Column="1"
+                                          HorizontalAlignment="Stretch"
+                                          VerticalAlignment="Stretch"
+                                          Background="{DynamicResource BorderBrush}"
+                                          ResizeBehavior="PreviousAndNext"
+                                          ResizeDirection="Columns" />
+
+                            <Grid Grid.Column="2" Margin="4,8,8,4">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition x:Name="StatusRegisterRow" Height="4*" />
+                                    <RowDefinition Height="5" />
+                                    <RowDefinition x:Name="StatusBreakpointRow" Height="2*" />
+                                </Grid.RowDefinitions>
+
+                                <Grid Grid.Row="0">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="Auto" />
+                                    </Grid.RowDefinitions>
+
+                                    <TextBlock Text="寄存器"
+                                               FontSize="13"
+                                               FontWeight="SemiBold"
+                                               Margin="0,0,0,6" />
+
+                                    <DataGrid x:Name="RegisterGrid"
+                                              Grid.Row="1"
+                                              AutoGenerateColumns="False"
+                                              HeadersVisibility="Column">
+                                        <DataGrid.Columns>
+                                            <DataGridTextColumn Header="寄存器" Binding="{Binding Name}" Width="110" />
+                                            <DataGridTextColumn Header="值" Binding="{Binding Value}" Width="*">
+                                                <DataGridTextColumn.ElementStyle>
+                                                    <Style TargetType="TextBlock">
+                                                        <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
+                                                        <Style.Triggers>
+                                                            <DataTrigger Binding="{Binding Changed}" Value="True">
+                                                                <Setter Property="Foreground" Value="{DynamicResource ErrorBrush}" />
+                                                                <Setter Property="FontWeight" Value="SemiBold" />
+                                                            </DataTrigger>
+                                                        </Style.Triggers>
+                                                    </Style>
+                                                </DataGridTextColumn.ElementStyle>
+                                            </DataGridTextColumn>
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+
+                                    <TextBlock Grid.Row="2"
+                                               Text="标志"
+                                               FontSize="13"
+                                               FontWeight="SemiBold"
+                                               Margin="0,6,0,4" />
+
+                                    <ItemsControl x:Name="FlagsGrid" Grid.Row="3">
+                                        <ItemsControl.ItemsPanel>
+                                            <ItemsPanelTemplate>
+                                                <UniformGrid Columns="3" />
+                                            </ItemsPanelTemplate>
+                                        </ItemsControl.ItemsPanel>
+                                        <ItemsControl.ItemTemplate>
+                                            <DataTemplate>
+                                                <Border Margin="0,0,4,4"
+                                                        Padding="6,2"
+                                                        Background="{DynamicResource SurfaceRaisedBrush}"
+                                                        BorderBrush="{DynamicResource BorderBrush}"
+                                                        BorderThickness="1"
+                                                        CornerRadius="4">
+                                                    <Grid>
+                                                        <Grid.ColumnDefinitions>
+                                                            <ColumnDefinition Width="Auto" />
+                                                            <ColumnDefinition Width="*" />
+                                                        </Grid.ColumnDefinitions>
+                                                        <TextBlock Text="{Binding Name}"
+                                                                   FontFamily="Cascadia Mono, Consolas"
+                                                                   FontWeight="SemiBold"
+                                                                   Foreground="{DynamicResource MutedBrush}" />
+                                                        <TextBlock Grid.Column="1"
+                                                                   Text="{Binding Value}"
+                                                                   HorizontalAlignment="Right"
+                                                                   Margin="8,0,0,0"
+                                                                   FontFamily="Cascadia Mono, Consolas"
+                                                                   FontWeight="SemiBold">
+                                                            <TextBlock.Style>
+                                                                <Style TargetType="TextBlock">
+                                                                    <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
+                                                                    <Style.Triggers>
+                                                                        <DataTrigger Binding="{Binding Changed}" Value="True">
+                                                                            <Setter Property="Foreground" Value="{DynamicResource ErrorBrush}" />
+                                                                        </DataTrigger>
+                                                                    </Style.Triggers>
+                                                                </Style>
+                                                            </TextBlock.Style>
+                                                        </TextBlock>
+                                                    </Grid>
+                                                </Border>
+                                            </DataTemplate>
+                                        </ItemsControl.ItemTemplate>
+                                    </ItemsControl>
+                                </Grid>
+
+                                <GridSplitter Grid.Row="1"
+                                              HorizontalAlignment="Stretch"
+                                              VerticalAlignment="Stretch"
+                                              Background="{DynamicResource BorderBrush}"
+                                              ResizeBehavior="PreviousAndNext"
+                                              ResizeDirection="Rows" />
+
+                                <Grid Grid.Row="2">
+                                    <Grid.RowDefinitions>
+                                        <RowDefinition Height="Auto" />
+                                        <RowDefinition Height="*" />
+                                    </Grid.RowDefinitions>
+
+                                    <TextBlock Text="断点"
+                                               FontSize="13"
+                                               FontWeight="SemiBold"
+                                               Margin="0,0,0,6" />
+
+                                    <DataGrid x:Name="BreakpointGrid"
+                                              Grid.Row="1"
+                                              AutoGenerateColumns="False"
+                                              HeadersVisibility="Column">
+                                        <DataGrid.Columns>
+                                            <DataGridTextColumn Header="ID" Binding="{Binding Id}" Width="45" />
+                                            <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="*" />
+                                            <DataGridTextColumn Header="状态" Binding="{Binding Enabled}" Width="55" />
+                                            <DataGridTextColumn Header="暂停" Binding="{Binding Pause}" Width="55" />
+                                        </DataGrid.Columns>
+                                    </DataGrid>
+                                </Grid>
+                            </Grid>
+                        </Grid>
+
+                        <GridSplitter Grid.Row="2"
                                       HorizontalAlignment="Stretch"
                                       VerticalAlignment="Stretch"
-                                      Background="Transparent"
+                                      Background="{DynamicResource BorderBrush}"
                                       ResizeBehavior="PreviousAndNext"
                                       ResizeDirection="Rows" />
 
-                        <Border Grid.Row="2"
-                                Background="{StaticResource SurfaceBrush}"
-                                BorderBrush="{StaticResource BorderBrush}"
-                                BorderThickness="1"
-                                CornerRadius="6"
-                                Padding="10">
-                            <Grid>
+                        <Grid Grid.Row="3">
+                            <Grid.ColumnDefinitions>
+                                <ColumnDefinition x:Name="CpuMemoryColumn" Width="3*" />
+                                <ColumnDefinition Width="5" />
+                                <ColumnDefinition x:Name="CpuStackColumn" Width="2*" />
+                            </Grid.ColumnDefinitions>
+
+                            <Grid Grid.Column="0" Margin="8,4,4,8">
+                                <Grid.RowDefinitions>
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="Auto" />
+                                    <RowDefinition Height="*" />
+                                </Grid.RowDefinitions>
+
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="内存"
+                                               FontSize="13"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock x:Name="MemoryStatusText"
+                                               Grid.Column="1"
+                                               HorizontalAlignment="Right"
+                                               VerticalAlignment="Center"
+                                               Margin="8,0,12,0"
+                                               Foreground="{DynamicResource MutedBrush}" />
+                                    <Button Grid.Column="2"
+                                            Content="刷新"
+                                            Click="MemoryRefreshButton_Click" />
+                                </Grid>
+
+                                <Grid Grid.Row="1" Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="2*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="地址"
+                                               VerticalAlignment="Center"
+                                               Margin="0,0,6,0" />
+                                    <TextBox x:Name="MemoryAddressBox"
+                                             Grid.Column="1"
+                                             Text="0x0" />
+                                    <TextBlock Grid.Column="2"
+                                               Text="CR3"
+                                               VerticalAlignment="Center"
+                                               Margin="12,0,6,0" />
+                                    <TextBox x:Name="MemoryCr3Box"
+                                             Grid.Column="3" />
+                                    <Button Grid.Column="4"
+                                            Content="上一页"
+                                            Click="MemoryPreviousButton_Click" />
+                                    <Button Grid.Column="5"
+                                            Content="下一页"
+                                            Click="MemoryNextButton_Click" />
+                                    <Button Grid.Column="6"
+                                            Content="读取"
+                                            Click="MemoryReadButton_Click" />
+                                </Grid>
+
+                                <DataGrid x:Name="MemoryGrid"
+                                          Grid.Row="2"
+                                          AutoGenerateColumns="False">
+                                    <DataGrid.Columns>
+                                        <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="175" />
+                                        <DataGridTextColumn Header="十六进制" Binding="{Binding Hex}" Width="2*" />
+                                        <DataGridTextColumn Header="ASCII" Binding="{Binding Ascii}" Width="*" />
+                                    </DataGrid.Columns>
+                                </DataGrid>
+                            </Grid>
+
+                            <GridSplitter Grid.Column="1"
+                                          HorizontalAlignment="Stretch"
+                                          VerticalAlignment="Stretch"
+                                          Background="{DynamicResource BorderBrush}"
+                                          ResizeBehavior="PreviousAndNext"
+                                          ResizeDirection="Columns" />
+
+                            <Grid Grid.Column="2" Margin="4,4,8,8">
                                 <Grid.RowDefinitions>
                                     <RowDefinition Height="Auto" />
                                     <RowDefinition Height="*" />
                                 </Grid.RowDefinitions>
 
-                                <TextBlock Text="断点"
-                                           FontSize="14"
-                                           FontWeight="SemiBold"
-                                           Margin="0,0,0,8" />
+                                <Grid Margin="0,0,0,6">
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="Auto" />
+                                        <ColumnDefinition Width="*" />
+                                        <ColumnDefinition Width="Auto" />
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Text="调用栈"
+                                               FontSize="13"
+                                               FontWeight="SemiBold" />
+                                    <TextBlock x:Name="StackStatusText"
+                                               Grid.Column="1"
+                                               HorizontalAlignment="Right"
+                                               VerticalAlignment="Center"
+                                               Margin="8,0,12,0"
+                                               Foreground="{DynamicResource MutedBrush}" />
+                                    <Button Grid.Column="2"
+                                            Content="刷新"
+                                            Click="RefreshStackButton_Click" />
+                                </Grid>
 
-                                <DataGrid x:Name="BreakpointGrid"
+                                <DataGrid x:Name="StackGrid"
                                           Grid.Row="1"
                                           AutoGenerateColumns="False"
-                                          HeadersVisibility="Column">
+                                          MouseDoubleClick="StackGrid_MouseDoubleClick">
                                     <DataGrid.Columns>
-                                        <DataGridTextColumn Header="ID" Binding="{Binding Id}" Width="45" />
-                                        <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="170" />
-                                        <DataGridTextColumn Header="状态" Binding="{Binding Enabled}" Width="55" />
-                                        <DataGridTextColumn Header="暂停" Binding="{Binding Pause}" Width="55" />
+                                        <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="40" />
+                                        <DataGridTextColumn Header="Child-SP" Binding="{Binding ChildSp}" Width="140" />
+                                        <DataGridTextColumn Header="返回地址" Binding="{Binding ReturnAddress}" Width="140" />
+                                        <DataGridTextColumn Header="调用位置" Binding="{Binding Symbol}" Width="*" />
                                     </DataGrid.Columns>
                                 </DataGrid>
                             </Grid>
-                        </Border>
+                        </Grid>
                     </Grid>
-                </TabItem>
+                </Border>
+            </TabItem>
 
             <TabItem Header="模块" Tag="modules">
                     <Border Margin="0,6,0,0"
-                            Background="{StaticResource SurfaceBrush}"
-                            BorderBrush="{StaticResource BorderBrush}"
+                            Background="{DynamicResource SurfaceBrush}"
+                            BorderBrush="{DynamicResource BorderBrush}"
                             BorderThickness="1"
                             CornerRadius="6"
                             Padding="10">
@@ -410,6 +759,7 @@
                                     <ColumnDefinition Width="Auto" />
                                     <ColumnDefinition Width="*" />
                                     <ColumnDefinition Width="Auto" />
+                                    <ColumnDefinition Width="Auto" />
                                 </Grid.ColumnDefinitions>
 
                                 <TextBlock Text="模块"
@@ -420,8 +770,14 @@
                                            HorizontalAlignment="Right"
                                            VerticalAlignment="Center"
                                            Margin="8,0,12,0"
-                                           Foreground="{StaticResource MutedBrush}" />
-                                <Button Grid.Column="2"
+                                           Foreground="{DynamicResource MutedBrush}" />
+                                <Button x:Name="LoadSymbolsButton"
+                                        Grid.Column="2"
+                                        Content="加载符号"
+                                        Click="LoadSymbolsButton_Click"
+                                        IsEnabled="False"
+                                        ToolTip="下载并加载模块符号。" />
+                                <Button Grid.Column="3"
                                         Content="刷新"
                                         Click="RefreshModulesButton_Click" />
                             </Grid>
@@ -452,8 +808,8 @@
                         </Grid.RowDefinitions>
 
                         <Border Grid.Row="0"
-                                Background="{StaticResource SurfaceBrush}"
-                                BorderBrush="{StaticResource BorderBrush}"
+                                Background="{DynamicResource SurfaceBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}"
                                 BorderThickness="1"
                                 CornerRadius="6"
                                 Padding="10">
@@ -478,7 +834,7 @@
                                                Text="过滤"
                                                VerticalAlignment="Center"
                                                Margin="12,0,6,0"
-                                               Foreground="{StaticResource MutedBrush}" />
+                                               Foreground="{DynamicResource MutedBrush}" />
                                     <TextBox x:Name="ProcessFilterBox"
                                              Grid.Column="2"
                                              Width="160"
@@ -489,7 +845,7 @@
                                                HorizontalAlignment="Right"
                                                VerticalAlignment="Center"
                                                Margin="8,0,12,0"
-                                               Foreground="{StaticResource MutedBrush}" />
+                                               Foreground="{DynamicResource MutedBrush}" />
                                     <Button Grid.Column="4"
                                             Content="刷新"
                                             Click="RefreshProcessesButton_Click" />
@@ -518,8 +874,8 @@
                                       ResizeDirection="Rows" />
 
                         <Border Grid.Row="2"
-                                Background="{StaticResource SurfaceBrush}"
-                                BorderBrush="{StaticResource BorderBrush}"
+                                Background="{DynamicResource SurfaceBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}"
                                 BorderThickness="1"
                                 CornerRadius="6"
                                 Padding="10">
@@ -543,7 +899,7 @@
                                                Text="过滤"
                                                VerticalAlignment="Center"
                                                Margin="12,0,6,0"
-                                               Foreground="{StaticResource MutedBrush}" />
+                                               Foreground="{DynamicResource MutedBrush}" />
                                     <TextBox x:Name="ThreadFilterBox"
                                              Grid.Column="2"
                                              Width="150"
@@ -554,7 +910,7 @@
                                                HorizontalAlignment="Right"
                                                VerticalAlignment="Center"
                                                Margin="8,0,0,0"
-                                               Foreground="{StaticResource MutedBrush}" />
+                                               Foreground="{DynamicResource MutedBrush}" />
                                 </Grid>
 
                                 <DataGrid x:Name="ThreadGrid"
@@ -574,241 +930,6 @@
                     </Grid>
                 </TabItem>
 
-            <TabItem Header="调用栈" Tag="stack">
-                    <Border Margin="0,6,0,0"
-                            Background="{StaticResource SurfaceBrush}"
-                            BorderBrush="{StaticResource BorderBrush}"
-                            BorderThickness="1"
-                            CornerRadius="6"
-                            Padding="10">
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-
-                            <Grid Margin="0,0,0,8">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="调用栈"
-                                           FontSize="14"
-                                           FontWeight="SemiBold" />
-                                <TextBlock x:Name="StackStatusText"
-                                           Grid.Column="1"
-                                           HorizontalAlignment="Right"
-                                           VerticalAlignment="Center"
-                                           Margin="8,0,12,0"
-                                           Foreground="{StaticResource MutedBrush}" />
-                                <Button Grid.Column="2"
-                                        Content="刷新"
-                                        Click="RefreshStackButton_Click" />
-                            </Grid>
-
-                            <DataGrid x:Name="StackGrid"
-                                      Grid.Row="1"
-                                      AutoGenerateColumns="False"
-                                      MouseDoubleClick="StackGrid_MouseDoubleClick">
-                                <DataGrid.Columns>
-                                    <DataGridTextColumn Header="#" Binding="{Binding Index}" Width="40" />
-                                    <DataGridTextColumn Header="Child-SP" Binding="{Binding ChildSp}" Width="165" />
-                                    <DataGridTextColumn Header="返回地址" Binding="{Binding ReturnAddress}" Width="165" />
-                                    <DataGridTextColumn Header="调用位置" Binding="{Binding Symbol}" Width="*" />
-                                </DataGrid.Columns>
-                            </DataGrid>
-                        </Grid>
-                    </Border>
-                </TabItem>
-
-            <TabItem Header="内存" Tag="memory">
-                    <Border Margin="0,6,0,0"
-                            Background="{StaticResource SurfaceBrush}"
-                            BorderBrush="{StaticResource BorderBrush}"
-                            BorderThickness="1"
-                            CornerRadius="6"
-                            Padding="10">
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-
-                            <Grid Margin="0,0,0,8">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="内存"
-                                           FontSize="14"
-                                           FontWeight="SemiBold" />
-                                <TextBlock x:Name="MemoryStatusText"
-                                           Grid.Column="1"
-                                           HorizontalAlignment="Right"
-                                           VerticalAlignment="Center"
-                                           Margin="8,0,12,0"
-                                           Foreground="{StaticResource MutedBrush}" />
-                                <Button Grid.Column="2"
-                                        Content="刷新"
-                                        Click="MemoryRefreshButton_Click" />
-                            </Grid>
-
-                            <Grid Grid.Row="1" Margin="0,0,0,8">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="2*" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="地址"
-                                           VerticalAlignment="Center"
-                                           Margin="0,0,6,0" />
-                                <TextBox x:Name="MemoryAddressBox"
-                                         Grid.Column="1"
-                                         Text="0x0" />
-                                <TextBlock Grid.Column="2"
-                                           Text="CR3"
-                                           VerticalAlignment="Center"
-                                           Margin="12,0,6,0" />
-                                <TextBox x:Name="MemoryCr3Box"
-                                         Grid.Column="3" />
-                                <Button Grid.Column="4"
-                                        Content="上一页"
-                                        Click="MemoryPreviousButton_Click" />
-                                <Button Grid.Column="5"
-                                        Content="下一页"
-                                        Click="MemoryNextButton_Click" />
-                                <Button Grid.Column="6"
-                                        Content="读取"
-                                        Click="MemoryReadButton_Click" />
-                            </Grid>
-
-                            <DataGrid x:Name="MemoryGrid"
-                                      Grid.Row="2"
-                                      AutoGenerateColumns="False">
-                                <DataGrid.Columns>
-                                    <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="175" />
-                                    <DataGridTextColumn Header="十六进制" Binding="{Binding Hex}" Width="2*" />
-                                    <DataGridTextColumn Header="ASCII" Binding="{Binding Ascii}" Width="*" />
-                                </DataGrid.Columns>
-                            </DataGrid>
-                        </Grid>
-                    </Border>
-                </TabItem>
-
-            <TabItem Header="反汇编" Tag="disassembly">
-                    <Border Margin="0,6,0,0"
-                            Background="{StaticResource SurfaceBrush}"
-                            BorderBrush="{StaticResource BorderBrush}"
-                            BorderThickness="1"
-                            CornerRadius="6"
-                            Padding="10">
-                        <Grid>
-                            <Grid.RowDefinitions>
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="Auto" />
-                                <RowDefinition Height="*" />
-                            </Grid.RowDefinitions>
-
-                            <Grid Margin="0,0,0,8">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="反汇编"
-                                           FontSize="14"
-                                           FontWeight="SemiBold" />
-                                <TextBlock x:Name="DisassemblyStatusText"
-                                           Grid.Column="1"
-                                           HorizontalAlignment="Right"
-                                           VerticalAlignment="Center"
-                                           Margin="8,0,12,0"
-                                           Foreground="{StaticResource MutedBrush}" />
-                                <CheckBox x:Name="FollowRipCheck"
-                                          Grid.Column="2"
-                                          Content="跟随 RIP"
-                                          VerticalAlignment="Center"
-                                          Margin="0,0,12,0" />
-                                <Button Grid.Column="3"
-                                        Content="RIP"
-                                        Click="RipButton_Click" />
-                            </Grid>
-
-                            <Grid Grid.Row="1" Margin="0,0,0,8">
-                                <Grid.ColumnDefinitions>
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="2*" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="*" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="Auto" />
-                                    <ColumnDefinition Width="Auto" />
-                                </Grid.ColumnDefinitions>
-                                <TextBlock Text="地址"
-                                           VerticalAlignment="Center"
-                                           Margin="0,0,6,0" />
-                                <TextBox x:Name="DisassemblyAddressBox"
-                                         Grid.Column="1"
-                                         Text="0x0" />
-                                <TextBlock Grid.Column="2"
-                                           Text="CR3"
-                                           VerticalAlignment="Center"
-                                           Margin="12,0,6,0" />
-                                <TextBox x:Name="DisassemblyCr3Box"
-                                         Grid.Column="3" />
-                                <ComboBox x:Name="DisassemblyCountBox"
-                                          Grid.Column="4"
-                                          Width="70"
-                                          Margin="8,0"
-                                          SelectedIndex="1">
-                                    <ComboBoxItem Content="32" Tag="32" />
-                                    <ComboBoxItem Content="64" Tag="64" />
-                                    <ComboBoxItem Content="128" Tag="128" />
-                                </ComboBox>
-                                <Button Grid.Column="5"
-                                        Content="上一页"
-                                        Click="DisassemblyPreviousButton_Click" />
-                                <Button Grid.Column="6"
-                                        Content="下一页"
-                                        Click="DisassemblyNextButton_Click" />
-                                <Button Grid.Column="7"
-                                        Content="读取"
-                                        Click="DisassemblyReadButton_Click" />
-                            </Grid>
-
-                            <DataGrid x:Name="DisassemblyGrid"
-                                      Grid.Row="2"
-                                      AutoGenerateColumns="False"
-                                      ScrollViewer.HorizontalScrollBarVisibility="Auto"
-                                      MouseDoubleClick="DisassemblyGrid_MouseDoubleClick">
-                                <DataGrid.Columns>
-                                    <DataGridTextColumn Header="地址" Binding="{Binding Address}" Width="Auto" MinWidth="175" />
-                                    <DataGridTextColumn Header="字节" Binding="{Binding Bytes}" Width="Auto" MinWidth="130" />
-                                    <DataGridTextColumn Header="指令" Binding="{Binding Text}" Width="Auto" MinWidth="190" />
-                                    <DataGridTemplateColumn Header="符号" Width="Auto" MinWidth="220">
-                                        <DataGridTemplateColumn.CellTemplate>
-                                            <DataTemplate>
-                                                <TextBlock Text="{Binding Symbol}"
-                                                           TextTrimming="None"
-                                                           ToolTip="{Binding Symbol}" />
-                                            </DataTemplate>
-                                        </DataGridTemplateColumn.CellTemplate>
-                                    </DataGridTemplateColumn>
-                                </DataGrid.Columns>
-                            </DataGrid>
-                        </Grid>
-                    </Border>
-                </TabItem>
-
             <TabItem Header="实时 trace" Tag="trace">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
@@ -818,8 +939,8 @@
                             <RowDefinition Height="Auto" />
                         </Grid.RowDefinitions>
 
-                        <Border Background="{StaticResource SurfaceBrush}"
-                                BorderBrush="{StaticResource BorderBrush}"
+                        <Border Background="{DynamicResource SurfaceBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}"
                                 BorderThickness="1"
                                 CornerRadius="6"
                                 Padding="10">
@@ -848,7 +969,7 @@
                                     <TextBlock Text="采样"
                                                VerticalAlignment="Center"
                                                Margin="4,0,6,0"
-                                               Foreground="{StaticResource MutedBrush}" />
+                                               Foreground="{DynamicResource MutedBrush}" />
                                     <ComboBox x:Name="TraceSampleBox"
                                               Width="76"
                                               SelectedIndex="1"
@@ -864,7 +985,7 @@
 
                                 <TextBlock Margin="0,8,0,0"
                                            TextWrapping="Wrap"
-                                           Foreground="{StaticResource WarningBrush}"
+                                           Foreground="{DynamicResource WarningBrush}"
                                            Text="事件模式会改变客户退出时序，可能被检测。DurationTsc 当前未采样，延迟直方图显示为不可用。" />
                             </StackPanel>
                         </Border>
@@ -873,13 +994,13 @@
                                    Grid.Row="1"
                                    Margin="2,8,2,0"
                                    TextWrapping="Wrap"
-                                   Foreground="{StaticResource ErrorBrush}"
+                                   Foreground="{DynamicResource ErrorBrush}"
                                    Visibility="Collapsed" />
 
                         <Border Grid.Row="2"
                                 Margin="0,8,0,0"
-                                Background="{StaticResource SurfaceBrush}"
-                                BorderBrush="{StaticResource BorderBrush}"
+                                Background="{DynamicResource SurfaceBrush}"
+                                BorderBrush="{DynamicResource BorderBrush}"
                                 BorderThickness="1"
                                 CornerRadius="6"
                                 ClipToBounds="True">
@@ -893,7 +1014,7 @@
                                    Margin="2,8,2,0"
                                    Text="实时 trace 未连接"
                                    TextWrapping="Wrap"
-                                   Foreground="{StaticResource MutedBrush}" />
+                                   Foreground="{DynamicResource MutedBrush}" />
                     </Grid>
                 </TabItem>
         </TabControl>
@@ -901,8 +1022,8 @@
         <Border Grid.Row="3"
                 Margin="12,0,12,10"
                 Padding="10,6"
-                Background="{StaticResource SurfaceBrush}"
-                BorderBrush="{StaticResource BorderBrush}"
+                Background="{DynamicResource SurfaceBrush}"
+                BorderBrush="{DynamicResource BorderBrush}"
                 BorderThickness="1"
                 CornerRadius="6">
             <Grid>
@@ -914,10 +1035,10 @@
                     <ColumnDefinition Width="Auto" />
                 </Grid.ColumnDefinitions>
 
-                <TextBlock x:Name="StatusText" Text="未连接" Foreground="{StaticResource AccentBrush}" />
-                <TextBlock x:Name="PausedText" Grid.Column="1" Text="—" Margin="18,0,0,0" Foreground="{StaticResource MutedBrush}" />
-                <TextBlock x:Name="Cr3Text" Grid.Column="2" Text="CR3 —" Margin="18,0,0,0" Foreground="{StaticResource MutedBrush}" />
-                <TextBlock x:Name="VersionText" Grid.Column="4" Text="版本 —" Foreground="{StaticResource MutedBrush}" />
+                <TextBlock x:Name="StatusText" Text="未连接" Foreground="{DynamicResource AccentBrush}" />
+                <TextBlock x:Name="PausedText" Grid.Column="1" Text="—" Margin="18,0,0,0" Foreground="{DynamicResource MutedBrush}" />
+                <TextBlock x:Name="Cr3Text" Grid.Column="2" Text="CR3 —" Margin="18,0,0,0" Foreground="{DynamicResource MutedBrush}" />
+                <TextBlock x:Name="VersionText" Grid.Column="4" Text="版本 —" Foreground="{DynamicResource MutedBrush}" />
             </Grid>
         </Border>
     </Grid>

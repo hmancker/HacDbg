@@ -100,6 +100,11 @@ internal static class GuiTheme
             return;
         }
 
+        //
+        // A resource dictionary freezes the brush. StaticResource keeps that
+        // frozen instance, so a later replacement would leave the old color
+        // on screen. Callers use DynamicResource and pick up the new brush.
+        //
         if (brush.IsFrozen)
         {
             resources[key] = new SolidColorBrush(color);

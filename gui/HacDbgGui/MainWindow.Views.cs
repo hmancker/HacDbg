@@ -730,27 +730,32 @@ public partial class MainWindow
         DisassemblyStatusText.Text = status.Truncated != 0
             ? $"{count} 条，已截断"
             : $"{count} 条";
-        SelectPausedInstruction();
+        MarkCurrentInstruction();
     }
 
-    private void SelectPausedInstruction()
+    private void MarkCurrentInstruction()
     {
-        if (_pausedNow == false || _lastPausedRip == 0)
-        {
-            return;
-        }
+        ulong rip = _pausedNow ? _lastPausedRip : 0;
+        DisassemblyRow? current = null;
 
-        for (int index = 0; index < _disassembly.Count; index++)
+        foreach (DisassemblyRow row in _disassembly)
         {
-            if (_disassembly[index].AddressValue != _lastPausedRip)
+            bool isCurrent = rip != 0 && row.AddressValue == rip;
+            row.IsCurrent = isCurrent;
+
+            if (isCurrent)
             {
-                continue;
+                current = row;
             }
+        }
 
-            DisassemblyGrid.SelectedIndex = index;
-            DisassemblyGrid.ScrollIntoView(_disassembly[index]);
+        if (current is null)
+        {
             return;
         }
+
+        DisassemblyGrid.SelectedItem = current;
+        DisassemblyGrid.ScrollIntoView(current);
     }
 
     private void PollResolve()
@@ -881,7 +886,7 @@ public partial class MainWindow
             return;
         }
 
-        ActivateDocument("memory");
+        ActivateDocument("disassembly");
         MemoryAddressBox.Text = $"0x{address:X16}";
         MemoryCr3Box.Text = cr3 == 0 ? string.Empty : $"0x{cr3:X16}";
         RequestMemoryPage(address, cr3);
@@ -894,6 +899,7 @@ public partial class MainWindow
         if (RefreshViewsButton.IsEnabled != canRefresh)
         {
             RefreshViewsButton.IsEnabled = canRefresh;
+            RefreshViewsMenuItem.IsEnabled = canRefresh;
         }
 
         if (paused == false)
@@ -907,6 +913,7 @@ public partial class MainWindow
             _pausedNow = false;
             _pausedCr3 = 0;
             _lastPausedRip = 0;
+            MarkCurrentInstruction();
             return;
         }
 
@@ -931,7 +938,10 @@ public partial class MainWindow
         if (rip != 0 && (enteredPause || FollowRipCheck.IsChecked == true))
         {
             OpenDisassemblyAt(rip, _pausedCr3);
+            return;
         }
+
+        MarkCurrentInstruction();
     }
 
     private void LoadSymbolsButton_Click(object sender, RoutedEventArgs e)
@@ -1279,8 +1289,10 @@ internal sealed class MemoryRow
     public string Ascii { get; }
 }
 
-internal sealed class DisassemblyRow
+internal sealed class DisassemblyRow : INotifyPropertyChanged
 {
+    private bool _isCurrent;
+
     public DisassemblyRow(string address, string bytes, string text, string symbol, ulong addressValue)
     {
         Address = address;
@@ -1295,6 +1307,26 @@ internal sealed class DisassemblyRow
     public string Text { get; }
     public string Symbol { get; }
     public ulong AddressValue { get; }
+
+    public bool IsCurrent
+    {
+        get => _isCurrent;
+        set
+        {
+            if (_isCurrent == value)
+            {
+                return;
+            }
+
+            _isCurrent = value;
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(IsCurrent)));
+            PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Marker)));
+        }
+    }
+
+    public string Marker => _isCurrent ? "►" : string.Empty;
+
+    public event PropertyChangedEventHandler? PropertyChanged;
 }
 
 internal sealed class MemoryPage

@@ -75,6 +75,94 @@
                 </Setter>
             </Style>
 
+            <Style x:Key="ToolbarButton" TargetType="{x:Type Button}" BasedOn="{StaticResource {x:Type Button}}">
+                <Setter Property="Width" Value="34" />
+                <Setter Property="Height" Value="30" />
+                <Setter Property="Padding" Value="0" />
+                <Setter Property="Margin" Value="0,0,2,0" />
+                <Setter Property="ToolTipService.ShowOnDisabled" Value="True" />
+            </Style>
+
+            <Style TargetType="{x:Type Menu}">
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
+            </Style>
+
+            <Style x:Key="MenuSeparator" TargetType="{x:Type Separator}">
+                <Setter Property="Margin" Value="4,4" />
+                <Setter Property="Background" Value="{DynamicResource BorderBrush}" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="{x:Type Separator}">
+                            <Border Height="1" Background="{TemplateBinding Background}" />
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
+            <Style TargetType="{x:Type MenuItem}">
+                <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
+                <Setter Property="Background" Value="Transparent" />
+                <Setter Property="Padding" Value="10,5" />
+                <Setter Property="Cursor" Value="Hand" />
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="{x:Type MenuItem}">
+                            <Grid>
+                                <Border x:Name="ItemBorder"
+                                        Background="{TemplateBinding Background}"
+                                        Padding="{TemplateBinding Padding}"
+                                        CornerRadius="4">
+                                    <Grid>
+                                        <Grid.ColumnDefinitions>
+                                            <ColumnDefinition Width="*" />
+                                            <ColumnDefinition Width="Auto" />
+                                        </Grid.ColumnDefinitions>
+                                        <ContentPresenter ContentSource="Header"
+                                                          RecognizesAccessKey="True"
+                                                          VerticalAlignment="Center" />
+                                        <TextBlock Grid.Column="1"
+                                                   Margin="28,0,0,0"
+                                                   VerticalAlignment="Center"
+                                                   Text="{TemplateBinding InputGestureText}"
+                                                   Foreground="{DynamicResource MutedBrush}" />
+                                    </Grid>
+                                </Border>
+                                <Popup x:Name="Popup"
+                                       PlacementTarget="{Binding RelativeSource={RelativeSource TemplatedParent}}"
+                                       Placement="Bottom"
+                                       IsOpen="{TemplateBinding IsSubmenuOpen}"
+                                       StaysOpen="False"
+                                       AllowsTransparency="True"
+                                       Focusable="False"
+                                       PopupAnimation="Fade">
+                                    <Border Background="{DynamicResource SurfaceRaisedBrush}"
+                                            BorderBrush="{DynamicResource BorderBrush}"
+                                            BorderThickness="1"
+                                            Padding="4"
+                                            MinWidth="220"
+                                            CornerRadius="6">
+                                        <StackPanel IsItemsHost="True"
+                                                    KeyboardNavigation.DirectionalNavigation="Cycle" />
+                                    </Border>
+                                </Popup>
+                            </Grid>
+                            <ControlTemplate.Triggers>
+                                <Trigger Property="Role" Value="SubmenuHeader">
+                                    <Setter TargetName="Popup" Property="Placement" Value="Right" />
+                                </Trigger>
+                                <Trigger Property="IsHighlighted" Value="True">
+                                    <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource SurfaceBrush}" />
+                                </Trigger>
+                                <Trigger Property="IsEnabled" Value="False">
+                                    <Setter Property="Opacity" Value="0.45" />
+                                </Trigger>
+                            </ControlTemplate.Triggers>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+
             <Style TargetType="{x:Type TabControl}">
                 <Setter Property="Background" Value="Transparent" />
                 <Setter Property="BorderThickness" Value="0" />
@@ -148,6 +236,13 @@
                 <Setter Property="CaretBrush" Value="{DynamicResource AccentBrush}" />
                 <Setter Property="SelectionBrush" Value="{DynamicResource AccentPressedBrush}" />
                 <Setter Property="SelectionTextBrush" Value="{DynamicResource AccentTextBrush}" />
+                <Style.Triggers>
+                    <Trigger Property="IsEnabled" Value="False">
+                        <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+                        <Setter Property="Foreground" Value="{DynamicResource MutedBrush}" />
+                        <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
+                    </Trigger>
+                </Style.Triggers>
             </Style>
 
             <Style TargetType="{x:Type DataGrid}">
@@ -184,6 +279,11 @@
                 <Setter Property="BorderThickness" Value="0,0,0,1" />
                 <Setter Property="Padding" Value="8,6" />
                 <Setter Property="HorizontalContentAlignment" Value="Left" />
+            </Style>
+
+            <Style x:Key="DisassemblyCellText" TargetType="TextBlock">
+                <Setter Property="Foreground" Value="{Binding Foreground, RelativeSource={RelativeSource AncestorType=DataGridCell}}" />
+                <Setter Property="VerticalAlignment" Value="Center" />
             </Style>
 
             <Style TargetType="{x:Type DataGridCell}">

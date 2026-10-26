@@ -61,7 +61,8 @@ public partial class MainWindow
         {
             CommandOutput.Foreground = foreground;
         }
-        ThemeButton.Content = GuiTheme.IsLight ? "暗色主题" : "亮色主题";
+        ThemeMenuItem.Header = GuiTheme.IsLight ? "暗色主题" : "亮色主题";
+        RefreshCapturedThemeBrushes();
         _searchColorizer.RefreshBrushes();
         CommandOutput.TextArea.TextView.Redraw();
         TraceViewHost.ApplyTheme();

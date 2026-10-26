@@ -6,10 +6,16 @@ namespace HacDbgGui;
 
 internal sealed class CommandOutputColorizer : DocumentColorizingTransformer
 {
-    private readonly Brush _errorBrush;
-    private readonly Brush _warningBrush;
+    private Brush _errorBrush;
+    private Brush _warningBrush;
 
     public CommandOutputColorizer(Brush errorBrush, Brush warningBrush)
+    {
+        _errorBrush = errorBrush;
+        _warningBrush = warningBrush;
+    }
+
+    public void Refresh(Brush errorBrush, Brush warningBrush)
     {
         _errorBrush = errorBrush;
         _warningBrush = warningBrush;
