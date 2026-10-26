@@ -25,6 +25,13 @@
 #define PHYSICAL_TRANSITION_PFN    0xFFFFFFFFFull
 #define PHYSICAL_CR4_LA57          (1ull << 12)
 #define PHYSICAL_REGION_SHIFT      30
+//
+// Windows x64 maps ntoskrnl in the 512 GiB region at VA
+// 0xFFFFF80000000000. That is PML4 index 0x1F0. Five-level paging reaches
+// that PML4 through PML5 index 0x1FF.
+//
+#define PHYSICAL_KERNEL_IMAGE_INDEX 0x1F0ull
+#define PHYSICAL_KERNEL_PML5_INDEX   0x1FFull
 
 typedef struct _PHYSICAL_RANGE
 {
@@ -957,7 +964,28 @@ PhysicalMemoryWalk(
             return PHYSICAL_WALK_MAPPED;
         }
 
-        table = entry & PHYSICAL_PTE_FRAME;
+        //
+        // 下一级表必须在 RAM 里。帧不在 RAM 中时不能继续走，否则会把非法
+        // 物理地址送进临时映射。1 GiB 以上的缺失交给调用方改用其它内核目录。
+        //
+        {
+            UINT64 nextTable = entry & PHYSICAL_PTE_FRAME;
+            UINT64 available = 0;
+
+            if (PhysicalMemoryFindRange(nextTable, &available) == FALSE)
+            {
+                PhysicalAddress->Value = 0;
+
+                if (shift >= PHYSICAL_REGION_SHIFT)
+                {
+                    return PHYSICAL_WALK_MISSING_REGION;
+                }
+
+                return PHYSICAL_WALK_READ_FAILED;
+            }
+
+            table = nextTable;
+        }
     }
 
     offset = VirtualAddress.Value & 0xfffull;
@@ -976,16 +1004,15 @@ PhysicalMemoryIsKernelAddress(
 }
 
 static BOOLEAN
-PhysicalMemoryKernelDirectoryKnown(
-    _In_ UINT64 Cr3
+PhysicalMemoryHasKernelDirectory(
+    VOID
     )
 {
-    UINT64 directory = Cr3 & PHYSICAL_PTE_FRAME;
     ULONG index;
 
     for (index = 0; index < HACDBG_KERNEL_DIRECTORY_SLOTS; index++)
     {
-        if ((UINT64)g_KernelDirectories[index] == directory)
+        if (g_KernelDirectories[index] != 0)
         {
             return TRUE;
         }
@@ -1038,8 +1065,66 @@ PhysicalMemoryLogWalkFailure(
             return;
         }
 
+        {
+            UINT64 nextTable = entry & PHYSICAL_PTE_FRAME;
+            UINT64 available = 0;
+
+            if (PhysicalMemoryFindRange(nextTable, &available) == FALSE)
+            {
+                HACDBG_LOG("HacDbg: Err, VA walk frame is not RAM level=%u cr3=0x%I64x va=0x%I64x "
+                         "frame=0x%I64x.\n",
+                         level, Cr3, VirtualAddress.Value, nextTable);
+                return;
+            }
+
+            table = nextTable;
+        }
+    }
+}
+
+BOOLEAN
+PhysicalMemoryMapsKernelImage(
+    _In_ UINT64 Cr3
+    )
+{
+    UINT64 table = Cr3 & PHYSICAL_PTE_FRAME;
+    UINT64 entry = 0;
+    GUEST_PHYSICAL_ADDRESS entryAddress;
+
+    if (table == 0)
+    {
+        return FALSE;
+    }
+
+    if (g_FiveLevelPaging != FALSE)
+    {
+        entryAddress = HacDbgGuestPhysicalAddress(table + (PHYSICAL_KERNEL_PML5_INDEX * sizeof(UINT64)));
+
+        //
+        // INVARIANT: table is the guest CR3 page. It is RAM and is read
+        // through the temporary map, not through a guest-visible host alias.
+        //
+        if (PhysicalMemoryRead(entryAddress, &entry, sizeof(entry)) != sizeof(entry) ||
+            (entry & PHYSICAL_PTE_PRESENT) == 0)
+        {
+            return FALSE;
+        }
+
         table = entry & PHYSICAL_PTE_FRAME;
     }
+
+    entryAddress = HacDbgGuestPhysicalAddress(table + (PHYSICAL_KERNEL_IMAGE_INDEX * sizeof(UINT64)));
+
+    //
+    // INVARIANT: entryAddress is one slot in the guest page-table page
+    // selected above. A not-present slot is a KPTI user directory.
+    //
+    if (PhysicalMemoryRead(entryAddress, &entry, sizeof(entry)) != sizeof(entry))
+    {
+        return FALSE;
+    }
+
+    return (entry & PHYSICAL_PTE_PRESENT) != 0;
 }
 
 // 按 CR3 遍历四/五级页表。内核半区的 PML4/PDPT 缺失时，改用其它 CPL 0 目录。
@@ -1079,12 +1164,13 @@ GuestVirtualToPhysical(
 
     //
     // 系统进程的内核目录没有会话空间。win32k 的 PML4E 在那里是 0。
-    // 只对已记下的内核目录、并且缺的是 1 GiB 以上的区域才改用其它目录。
-    // 用户地址和已经不在内存里的页不改目录，避免读到另一个进程的页。
+    // KPTI 用户目录的内核映像槽也是 0。这两种缺失都是 1 GiB 以上的区域，
+    // 改用已经记下的内核目录。用户地址和已经不在内存里的页不改目录，
+    // 避免读到另一个进程的页。
     //
     if (status != PHYSICAL_WALK_MISSING_REGION ||
         PhysicalMemoryIsKernelAddress(VirtualAddress.Value) == FALSE ||
-        PhysicalMemoryKernelDirectoryKnown(primary) == FALSE)
+        PhysicalMemoryHasKernelDirectory() == FALSE)
     {
         PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
         return FALSE;

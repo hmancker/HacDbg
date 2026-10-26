@@ -46,6 +46,26 @@ PhysicalMemorySetGuestRunning(
     _In_ BOOLEAN Active
     );
 
+BOOLEAN
+/**
+ * @brief Reports whether a directory maps the Windows kernel image region.
+ *
+ * @param Cr3 Guest CR3. PCID and the no-flush bit are ignored.
+ *
+ * @return TRUE when the kernel image page-table slot is present.
+ *
+ * @details Windows places ntoskrnl in the 512 GiB region at
+ * 0xFFFFF80000000000, PML4 index 0x1F0. A KPTI user directory leaves that
+ * slot empty. Five-level paging checks PML5 index 0x1FF first.
+ *
+ * @warning A failed physical read is reported as FALSE. The caller must keep
+ * the previously accepted directory. Do not call above DISPATCH_LEVEL: the
+ * temporary map rejects that IRQL.
+ */
+PhysicalMemoryMapsKernelImage(
+    _In_ UINT64 Cr3
+    );
+
 VOID
 /**
  * @brief Records a kernel page-table root observed at CPL 0.
@@ -54,7 +74,8 @@ VOID
  *
  * @details The system process directory does not map session space. A later
  * kernel-address walk that misses in the caller's directory tries the
- * directories recorded here.
+ * directories recorded here. The caller must reject a directory that does
+ * not map the kernel image region before calling this function.
  */
 PhysicalMemoryRememberKernelDirectory(
     _In_ UINT64 Cr3

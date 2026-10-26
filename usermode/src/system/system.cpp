@@ -338,6 +338,11 @@ static std::vector<std::uint8_t> dump_kernel_module(const std::uint64_t module_b
 		*failed_sections_out = 0;
 	}
 
+	if (module_base_address == 0)
+	{
+		return {};
+	}
+
 	std::uint64_t bytes_read = 0;
 
 	while (bytes_read < headers_size)
@@ -595,6 +600,19 @@ static t read_kernel_virtual_memory(const std::uint64_t address)
 	return buffer;
 }
 
+static std::uint8_t read_kernel_qword(const std::uint64_t address, std::uint64_t* const value)
+{
+	if (value == nullptr || address == 0)
+	{
+		return 0;
+	}
+
+	*value = 0;
+
+	return static_cast<std::uint8_t>(
+		hypercall::read_guest_virtual_memory(value, address, sys::current_cr3, sizeof(*value)) == sizeof(*value));
+}
+
 static std::wstring read_unicode_string(const std::uint64_t address)
 {
 	const auto length = read_kernel_virtual_memory<std::uint16_t>(address);
@@ -644,21 +662,46 @@ std::uint8_t sys::kernel::parse_modules()
 	std::uint32_t incomplete_modules = 0;
 	std::string incomplete_module_names;
 
+	constexpr std::uint32_t max_modules = 4096;
 	const std::uint64_t start_entry = ps_loaded_module_list;
+	std::uint64_t current_entry = 0;
+	std::uint32_t walked = 0;
 
-	auto current_entry = read_kernel_virtual_memory<std::uint64_t>(start_entry); // flink
-
-	while (current_entry != start_entry)
+	if (read_kernel_qword(start_entry, &current_entry) == 0 || current_entry == 0)
 	{
-		const kernel_module_t kernel_module = {};
+		LOG_ERR("kernel module list head read failed: list=0x{:x} cr3=0x{:x}",
+		        start_entry, sys::current_cr3);
 
-		const auto module_base_address = read_kernel_virtual_memory<std::uint64_t>(current_entry + 0x30); // DllBase
+		return 0;
+	}
+
+	while (current_entry != start_entry && current_entry != 0 && walked < max_modules)
+	{
+		std::uint64_t module_base_address = 0;
+		std::uint64_t next_entry = 0;
+
+		walked++;
+
+		if (read_kernel_qword(current_entry + 0x30, &module_base_address) == 0 ||
+		    read_kernel_qword(current_entry, &next_entry) == 0)
+		{
+			LOG_ERR("kernel module list entry read failed: entry=0x{:x} cr3=0x{:x}",
+			        current_entry, sys::current_cr3);
+
+			break;
+		}
+
 		const auto module_size = read_kernel_virtual_memory<std::uint32_t>(current_entry + 0x40); // SizeOfImage
 		const std::wstring module_path = read_unicode_string(current_entry + 0x48); // FullDllName
 		const std::string module_name = user::to_string(read_unicode_string(current_entry + 0x58)); // BaseDllName
 
 		// current_entry must not be accessed after this point in this iteration
-		current_entry = read_kernel_virtual_memory<std::uint64_t>(current_entry); // flink
+		current_entry = next_entry;
+
+		if (module_base_address == 0)
+		{
+			continue;
+		}
 
 		if (modules_list.contains(module_name))
 		{
@@ -698,6 +741,11 @@ std::uint8_t sys::kernel::parse_modules()
 		}
 
 		add_module_to_list(module_name, module_dump, module_base_address, module_size);
+	}
+
+	if (walked >= max_modules && current_entry != start_entry && current_entry != 0)
+	{
+		LOG_ERR("kernel module list walk stopped after {} entries", max_modules);
 	}
 
 	if (incomplete_modules != 0)

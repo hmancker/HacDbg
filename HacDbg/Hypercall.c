@@ -34,6 +34,7 @@
 #define HACDBG_LOG_POPPED_FIVE  5
 #define HACDBG_LOG_POPPED_THREE 3
 #define HACDBG_LOG_POPPED_ONE   1
+#define HACDBG_COPY_FAILURE_LOG_LIMIT 64
 
 C_ASSERT(sizeof(hypercall_info_t) == sizeof(UINT64));
 C_ASSERT(sizeof(trap_frame_log_t) == 0xb8);
@@ -53,6 +54,7 @@ static UINT64 g_BreakpointOwnerRsp;
 static UINT64 g_BreakpointOwnerCr3;
 static HACDBG_SPIN_LOCK g_BreakpointLock;
 static UINT64 g_KernelCr3;
+static volatile LONG g_VirtualCopyFailureLogCount;
 
 //
 // 记录内核页表根。三环 CPUID 退出时的客户 CR3 在 KPTI 下是用户目录，
@@ -66,11 +68,34 @@ HypercallNoteKernelCr3(
 {
     UINT64 directory = Cr3 & HACDBG_CR3_MASK;
 
-    if (directory != 0)
+    if (directory == 0 || directory == g_KernelCr3)
     {
-        g_KernelCr3 = directory;
-        PhysicalMemoryRememberKernelDirectory(directory);
+        return;
     }
+
+    //
+    // VM-exit does not load host CR8, so this runs at the guest IRQL. The
+    // image-slot read uses the temporary map, which stops above
+    // DISPATCH_LEVEL. Skip the directory until an exit at DISPATCH_LEVEL or
+    // below can check it. Do not log: the virtualization IPI exits at
+    // HIGH_LEVEL and would otherwise report every new kernel CR3.
+    //
+    if (KeGetCurrentIrql() > DISPATCH_LEVEL)
+    {
+        return;
+    }
+
+    //
+    // INVARIANT: directory is a guest CR3 page. The kernel image slot is
+    // read through the temporary RAM map and is not a guest-visible host page.
+    //
+    if (PhysicalMemoryMapsKernelImage(directory) == FALSE)
+    {
+        return;
+    }
+
+    g_KernelCr3 = directory;
+    PhysicalMemoryRememberKernelDirectory(directory);
 }
 
 static VOID
@@ -366,7 +391,8 @@ HypercallCopyVirtual(
             GuestVirtualToPhysical(sourceCr3, HacDbgGuestVirtualAddress(sourceVa + copied),
                                    &sourcePhysical, &sourceAbsent) == FALSE)
         {
-            if (destinationAbsent == FALSE && sourceAbsent == FALSE)
+            if (destinationAbsent == FALSE && sourceAbsent == FALSE &&
+                InterlockedIncrement(&g_VirtualCopyFailureLogCount) <= HACDBG_COPY_FAILURE_LOG_LIMIT)
             {
                 HACDBG_LOG("HacDbg: Err, virtual copy translation failed dest_cr3=0x%I64x dest_va=0x%I64x "
                          "src_cr3=0x%I64x src_va=0x%I64x\n",
