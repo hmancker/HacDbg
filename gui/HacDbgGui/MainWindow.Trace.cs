@@ -10,12 +10,28 @@ namespace HacDbgGui;
 
 public partial class MainWindow
 {
+    private const int TraceActivePollMilliseconds = 33;
+    private const int TraceIdlePollMilliseconds = 250;
+
     private DispatcherTimer? _traceTimer;
     private ulong _lastTraceSequence;
     private bool _tracePollFaulted;
     private bool _traceDeviceError;
     private bool _traceSupported;
+    private bool _traceCapturing;
+    private bool _tracePageVisible;
+    private bool _traceStatusTextValid;
+    private int _appliedTraceControlFlags = -1;
     private uint _traceAttachmentGeneration;
+    private uint _shownTraceCapturing;
+    private uint _shownTraceEventsEnabled;
+    private uint _shownTraceSampleRate;
+    private uint _shownTraceCpuCount;
+    private uint _shownTraceEventCount;
+    private ulong _shownTraceTotalExits;
+    private ulong _shownTraceDropped;
+    private ulong _shownTraceTsc;
+    private ulong _shownTraceSequence;
 
     private void InitializeTrace()
     {
@@ -31,9 +47,16 @@ public partial class MainWindow
             return;
         }
 
+        //
+        // A visible trace page, or an active capture, stays on the 33 ms
+        // cadence. A hidden stopped trace does not need to wake the UI thread
+        // that often. Opening the page reads once immediately.
+        //
+        TraceStatusText.IsVisibleChanged += TracePage_IsVisibleChanged;
+        _tracePageVisible = TraceStatusText.IsVisible;
         _traceTimer = new DispatcherTimer
         {
-            Interval = TimeSpan.FromMilliseconds(33)
+            Interval = DesiredTraceInterval()
         };
         _traceTimer.Tick += TraceTimer_Tick;
         _traceTimer.Start();
@@ -41,19 +64,68 @@ public partial class MainWindow
 
     private void StopTracePolling()
     {
-        _traceTimer?.Stop();
-        _traceTimer = null;
+        TraceStatusText.IsVisibleChanged -= TracePage_IsVisibleChanged;
+
+        if (_traceTimer is not null)
+        {
+            _traceTimer.Stop();
+            _traceTimer.Tick -= TraceTimer_Tick;
+            _traceTimer = null;
+        }
+    }
+
+    private void TracePage_IsVisibleChanged(object sender, DependencyPropertyChangedEventArgs e)
+    {
+        _tracePageVisible = e.NewValue is true;
+        ApplyTracePollInterval();
+
+        if (_tracePageVisible)
+        {
+            TraceTimer_Tick(sender, EventArgs.Empty);
+        }
+    }
+
+    private TimeSpan DesiredTraceInterval()
+    {
+        int milliseconds = _started && (_traceCapturing || _tracePageVisible)
+            ? TraceActivePollMilliseconds
+            : TraceIdlePollMilliseconds;
+        return TimeSpan.FromMilliseconds(milliseconds);
+    }
+
+    private void ApplyTracePollInterval()
+    {
+        if (_traceTimer is null)
+        {
+            return;
+        }
+
+        TimeSpan desired = DesiredTraceInterval();
+
+        if (_traceTimer.Interval != desired)
+        {
+            _traceTimer.Interval = desired;
+        }
     }
 
     private void TraceTimer_Tick(object? sender, EventArgs e)
     {
         if (_core is null || _started == false)
         {
-            if (_traceSupported)
+            if (_traceSupported || _traceCapturing)
             {
                 _traceSupported = false;
+                _traceCapturing = false;
+                _traceStatusTextValid = false;
+                _appliedTraceControlFlags = -1;
                 UpdateTraceControls(null);
-                TraceStatusText.Text = "实时 trace 未连接";
+
+                if (TraceStatusText.Text != "实时 trace 未连接")
+                {
+                    TraceStatusText.Text = "实时 trace 未连接";
+                }
+
+                ApplyTracePollInterval();
             }
 
             return;
@@ -66,20 +138,41 @@ public partial class MainWindow
                 return;
             }
 
-            UpdateTraceState(status);
+            bool capturing = status.Supported != 0 && status.Capturing != 0;
 
-            if (TraceViewHost.AttachmentGeneration != _traceAttachmentGeneration)
+            if (capturing != _traceCapturing)
+            {
+                _traceCapturing = capturing;
+                ApplyTracePollInterval();
+            }
+
+            bool pageVisible = TraceStatusText.IsVisible;
+
+            if (pageVisible != _tracePageVisible)
+            {
+                _tracePageVisible = pageVisible;
+                ApplyTracePollInterval();
+            }
+
+            if (pageVisible && TraceViewHost.AttachmentGeneration != _traceAttachmentGeneration)
             {
                 _traceAttachmentGeneration = TraceViewHost.AttachmentGeneration;
                 _lastTraceSequence = 0;
+                _appliedTraceControlFlags = -1;
             }
 
-            if (status.Supported != 0 && status.Capturing != 0)
+            if (pageVisible || status.Supported == 0)
+            {
+                UpdateTraceState(status);
+            }
+
+            if (capturing)
             {
                 _core.RequestTraceRead();
             }
 
-            if (status.Supported != 0 &&
+            if (pageVisible &&
+                status.Supported != 0 &&
                 status.SnapshotSequence != 0 &&
                 status.SnapshotSequence != _lastTraceSequence &&
                 TraceViewHost.IsAttached &&
@@ -90,6 +183,8 @@ public partial class MainWindow
                 {
                     TraceViewHost.PublishSnapshot();
                     _lastTraceSequence = status.SnapshotSequence;
+                    _appliedTraceControlFlags = -1;
+                    UpdateTraceControls(status);
                 }
             }
 
@@ -119,6 +214,7 @@ public partial class MainWindow
                 TraceStatusText.Text = unsupportedText;
             }
 
+            _traceStatusTextValid = false;
             SetTraceError("当前驱动不支持实时 trace。加载带 trace 数据面的 1.1.0 或更新驱动后再试。");
             UpdateTraceControls(status);
             _traceSupported = false;
@@ -143,21 +239,46 @@ public partial class MainWindow
             }
         }
 
-        string mode = status.Capturing == 0
-            ? "已停止"
-            : status.EventsEnabled != 0
-                ? "事件模式"
-                : "计数模式";
+        bool statusUnchanged = _traceStatusTextValid &&
+                               status.Capturing == _shownTraceCapturing &&
+                               status.EventsEnabled == _shownTraceEventsEnabled &&
+                               status.SampleRate == _shownTraceSampleRate &&
+                               status.CpuCount == _shownTraceCpuCount &&
+                               status.SnapshotEventCount == _shownTraceEventCount &&
+                               status.TotalExits == _shownTraceTotalExits &&
+                               status.DroppedEvents == _shownTraceDropped &&
+                               status.CapturedTsc == _shownTraceTsc &&
+                               status.SnapshotSequence == _shownTraceSequence;
 
-        string statusText =
-            $"{mode} · 采样 {status.SampleRate} · CPU {status.CpuCount} · " +
-            $"退出 {status.TotalExits:N0} · 丢弃 {status.DroppedEvents:N0} · " +
-            $"事件 {status.SnapshotEventCount} · TSC 0x{status.CapturedTsc:X16} · " +
-            $"快照 #{status.SnapshotSequence} · 33 ms 轮询 / 60 fps 渲染";
-
-        if (TraceStatusText.Text != statusText)
+        if (statusUnchanged == false)
         {
-            TraceStatusText.Text = statusText;
+            _traceStatusTextValid = true;
+            _shownTraceCapturing = status.Capturing;
+            _shownTraceEventsEnabled = status.EventsEnabled;
+            _shownTraceSampleRate = status.SampleRate;
+            _shownTraceCpuCount = status.CpuCount;
+            _shownTraceEventCount = status.SnapshotEventCount;
+            _shownTraceTotalExits = status.TotalExits;
+            _shownTraceDropped = status.DroppedEvents;
+            _shownTraceTsc = status.CapturedTsc;
+            _shownTraceSequence = status.SnapshotSequence;
+
+            string mode = status.Capturing == 0
+                ? "已停止"
+                : status.EventsEnabled != 0
+                    ? "事件模式"
+                    : "计数模式";
+
+            string statusText =
+                $"{mode} · 采样 {status.SampleRate} · CPU {status.CpuCount} · " +
+                $"退出 {status.TotalExits:N0} · 丢弃 {status.DroppedEvents:N0} · " +
+                $"事件 {status.SnapshotEventCount} · TSC 0x{status.CapturedTsc:X16} · " +
+                $"快照 #{status.SnapshotSequence} · {TraceActivePollMilliseconds} ms 轮询 / 60 fps 渲染";
+
+            if (TraceStatusText.Text != statusText)
+            {
+                TraceStatusText.Text = statusText;
+            }
         }
 
         UpdateTraceControls(status);
@@ -169,7 +290,14 @@ public partial class MainWindow
         bool canControl = supported && _traceDeviceError == false;
         bool capturing = supported && status is { Capturing: not 0 };
         bool hasSnapshot = canControl && status is { SnapshotSequence: not 0 } && _lastTraceSequence != 0;
+        int flags = (canControl ? 1 : 0) | (capturing ? 2 : 0) | (hasSnapshot ? 4 : 0);
 
+        if (flags == _appliedTraceControlFlags)
+        {
+            return;
+        }
+
+        _appliedTraceControlFlags = flags;
         TraceCountersButton.IsEnabled = canControl;
         TraceEventsButton.IsEnabled = canControl;
         TraceStopButton.IsEnabled = capturing;

@@ -1,7 +1,6 @@
 using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
-using System.Globalization;
 using System.Security.Principal;
 using System.Text;
 using System.Windows;
@@ -10,6 +9,7 @@ using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
 using HacDbgGui.Interop;
+using ICSharpCode.AvalonEdit.Rendering;
 using Wpf.Ui.Controls;
 
 namespace HacDbgGui;
@@ -45,12 +45,22 @@ public partial class MainWindow : FluentWindow
     private bool _startInProgress;
     private bool _closePending;
     private int _historyIndex;
-    private string _breakpointSignature = string.Empty;
+    private const int MaximumBreakpoints = 64;
+    private const int VersionByteCount = 32;
+
     private readonly ulong[] _lastRegisterValues = new ulong[RegisterNames.Length];
     private readonly bool[] _lastRegisterKnown = new bool[RegisterNames.Length];
+    private readonly HacDbgCoreBreakpoint[] _lastBreakpoints = new HacDbgCoreBreakpoint[MaximumBreakpoints];
+    private readonly byte[] _shownUserVersion = new byte[VersionByteCount];
+    private readonly byte[] _shownDriverVersion = new byte[VersionByteCount];
+    private int _lastBreakpointCount;
     private bool _lastRegistersPaused;
     private bool _lastRegisterSnapshotKnown;
     private bool _versionWarningReported;
+    private bool _shownVersionBytesValid;
+    private bool _shownCr3Paused;
+    private bool _shownCommandControlsRunning;
+    private ulong _shownCr3;
 
     public MainWindow()
     {
@@ -166,6 +176,13 @@ public partial class MainWindow : FluentWindow
             }
 
             _started = true;
+            ApplyTracePollInterval();
+
+            if (_tracePageVisible)
+            {
+                TraceTimer_Tick(this, EventArgs.Empty);
+            }
+
             StatusText.Text = "已连接";
             CommandInput.IsEnabled = true;
             CommandInput.Focus();
@@ -226,8 +243,14 @@ public partial class MainWindow : FluentWindow
 
     private void DrainOutput()
     {
+        if (_pendingOutput.IsEmpty)
+        {
+            return;
+        }
+
         StringBuilder builder = new();
         bool closeRequested = false;
+        bool follow = OutputIsNearEnd();
         int processed = 0;
 
         while (processed < 500 && _pendingOutput.TryDequeue(out OutputRecord record))
@@ -265,6 +288,7 @@ public partial class MainWindow : FluentWindow
                 case 5:
                     builder.Clear();
                     CommandOutput.Clear();
+                    follow = true;
                     break;
 
                 case 6:
@@ -276,14 +300,42 @@ public partial class MainWindow : FluentWindow
         if (builder.Length != 0)
         {
             CommandOutput.AppendText(builder.ToString());
-            CommandOutput.ScrollToEnd();
             TrimLog();
+
+            //
+            // ScrollToEnd lays out the viewport. Skip it when the user has
+            // moved away from the end, so a large dump can be copied.
+            //
+            if (follow)
+            {
+                CommandOutput.ScrollToEnd();
+            }
         }
 
         if (closeRequested)
         {
             Close();
         }
+    }
+
+    private bool OutputIsNearEnd()
+    {
+        TextView view = CommandOutput.TextArea.TextView;
+
+        if (view.ActualHeight <= 1)
+        {
+            return true;
+        }
+
+        double lineHeight = view.DefaultLineHeight;
+
+        if (lineHeight < 1)
+        {
+            lineHeight = 16;
+        }
+
+        double remaining = view.DocumentHeight - view.VerticalOffset - view.ActualHeight;
+        return remaining <= lineHeight * 2;
     }
 
     private static void AppendLine(StringBuilder builder, string text)
@@ -318,24 +370,49 @@ public partial class MainWindow : FluentWindow
         StatusText.Text = state.Initialized == 0 ? "未连接" : (running ? "已连接" : "已停止");
         PausedText.Text = state.Initialized == 0 ? "—" : (paused ? "已暂停" : "运行中");
 
-        string userVersion = DecodeVersion(state.UserVersion);
-        string driverVersion = DecodeVersion(state.DriverVersion);
-        VersionText.Text = driverVersion.Length == 0
-            ? $"usermode {userVersion} / hypervisor —"
-            : $"usermode {userVersion} / hypervisor {driverVersion}";
-        UpdateVersionWarning(state, userVersion, driverVersion);
+        if (_shownVersionBytesValid == false ||
+            SameVersionBytes(state.UserVersion, _shownUserVersion) == false ||
+            SameVersionBytes(state.DriverVersion, _shownDriverVersion) == false)
+        {
+            RememberVersionBytes(state.UserVersion, _shownUserVersion);
+            RememberVersionBytes(state.DriverVersion, _shownDriverVersion);
+            _shownVersionBytesValid = true;
+            string userVersion = DecodeVersion(state.UserVersion);
+            string driverVersion = DecodeVersion(state.DriverVersion);
+            VersionText.Text = driverVersion.Length == 0
+                ? $"usermode {userVersion} / hypervisor —"
+                : $"usermode {userVersion} / hypervisor {driverVersion}";
+            UpdateVersionWarning(state, userVersion, driverVersion);
+        }
 
-        Cr3Text.Text = paused ? $"CR3 {state.Registers.Cr3:X16}" : "CR3 —";
+        if (paused)
+        {
+            if (_shownCr3Paused == false || state.Registers.Cr3 != _shownCr3)
+            {
+                _shownCr3 = state.Registers.Cr3;
+                _shownCr3Paused = true;
+                Cr3Text.Text = $"CR3 {_shownCr3:X16}";
+            }
+        }
+        else if (_shownCr3Paused)
+        {
+            _shownCr3Paused = false;
+            Cr3Text.Text = "CR3 —";
+        }
 
         UpdateRegisters(state, paused);
         UpdateBreakpoints(state);
         UpdateStructuredState(state, paused);
 
-        CommandInput.IsEnabled = running;
-        ContinueButton.IsEnabled = running;
-        StepIntoButton.IsEnabled = running;
-        StepOverButton.IsEnabled = running;
-        CancelButton.IsEnabled = running;
+        if (running != _shownCommandControlsRunning)
+        {
+            _shownCommandControlsRunning = running;
+            CommandInput.IsEnabled = running;
+            ContinueButton.IsEnabled = running;
+            StepIntoButton.IsEnabled = running;
+            StepOverButton.IsEnabled = running;
+            CancelButton.IsEnabled = running;
+        }
     }
 
     private void UpdateVersionWarning(HacDbgCoreState state, string userVersion, string driverVersion)
@@ -379,113 +456,126 @@ public partial class MainWindow : FluentWindow
 
     private void UpdateRegisters(HacDbgCoreState state, bool paused)
     {
-        ulong[] values =
+        if (paused == false)
         {
-            state.Registers.Rax, state.Registers.Rcx, state.Registers.Rdx, state.Registers.Rbx,
-            state.Registers.Rsp, state.Registers.Rbp, state.Registers.Rsi, state.Registers.Rdi,
-            state.Registers.R8, state.Registers.R9, state.Registers.R10, state.Registers.R11,
-            state.Registers.R12, state.Registers.R13, state.Registers.R14, state.Registers.R15,
-            state.Registers.Rip, state.Registers.Rflags, state.Registers.Cr3
-        };
+            if (_lastRegistersPaused == false)
+            {
+                return;
+            }
 
-        bool rflagsKnown = paused && state.Registers.RflagsKnown != 0;
-        bool[] known = new bool[values.Length];
+            for (int index = 0; index < _registers.Count; index++)
+            {
+                _registers[index].Value = "—";
+                _registers[index].Changed = false;
+            }
 
-        for (int index = 0; index < known.Length; index++)
-        {
-            known[index] = index == 17 ? rflagsKnown : paused;
+            for (int index = 0; index < _flags.Count; index++)
+            {
+                _flags[index].Value = "—";
+                _flags[index].Changed = false;
+            }
+
+            Array.Clear(_lastRegisterValues);
+            Array.Clear(_lastRegisterKnown);
+            _lastRegisterSnapshotKnown = false;
+            _lastRegistersPaused = false;
+            return;
         }
 
-        bool snapshotChanged = false;
+        bool rflagsKnown = state.Registers.RflagsKnown != 0;
+        bool snapshotChanged = _lastRegisterSnapshotKnown == false;
 
-        if (paused == true)
+        if (snapshotChanged == false)
         {
-            if (_lastRegisterSnapshotKnown == false)
+            for (int index = 0; index < RegisterNames.Length; index++)
             {
-                snapshotChanged = true;
-            }
-            else
-            {
-                for (int index = 0; index < values.Length; index++)
+                bool known = index == 17 ? rflagsKnown : true;
+
+                if (known != _lastRegisterKnown[index] ||
+                    (known && ReadRegister(state.Registers, index) != _lastRegisterValues[index]))
                 {
-                    if (known[index] != _lastRegisterKnown[index] ||
-                        (known[index] == true && values[index] != _lastRegisterValues[index]))
-                    {
-                        snapshotChanged = true;
-                        break;
-                    }
+                    snapshotChanged = true;
+                    break;
                 }
             }
         }
 
-        bool markChanges = paused && _lastRegistersPaused && _lastRegisterSnapshotKnown && snapshotChanged;
+        if (snapshotChanged == false)
+        {
+            return;
+        }
+
+        bool markChanges = _lastRegistersPaused && _lastRegisterSnapshotKnown;
+        ulong previousRflags = _lastRegisterValues[17];
+        bool previousRflagsKnown = _lastRegisterKnown[17];
 
         for (int index = 0; index < _registers.Count; index++)
         {
-            _registers[index].Value = known[index] == true ? $"0x{values[index]:X16}" : "—";
+            bool known = index == 17 ? rflagsKnown : true;
+            ulong value = ReadRegister(state.Registers, index);
+            bool changed = markChanges && known && _lastRegisterKnown[index] &&
+                           value != _lastRegisterValues[index];
+            _registers[index].Changed = changed;
 
-            if (paused == false)
+            if (known == false)
             {
-                _registers[index].Changed = false;
+                _registers[index].Value = "—";
             }
-            else if (snapshotChanged == true)
+            else if (changed || known != _lastRegisterKnown[index] || value != _lastRegisterValues[index])
             {
-                _registers[index].Changed = markChanges && known[index] && _lastRegisterKnown[index] &&
-                                           values[index] != _lastRegisterValues[index];
+                _registers[index].Value = $"0x{value:X16}";
             }
+
+            _lastRegisterValues[index] = value;
+            _lastRegisterKnown[index] = known;
         }
-
-        ulong previousRflags = _lastRegisterValues[17];
-        bool previousRflagsKnown = _lastRegisterKnown[17];
 
         for (int index = 0; index < Flags.Length; index++)
         {
             FlagRow flag = _flags[index];
             int bit = Flags[index].Bit;
 
-            if (paused == false)
+            if (rflagsKnown == false)
             {
                 flag.Value = "—";
                 flag.Changed = false;
                 continue;
             }
 
-            if (rflagsKnown == false)
-            {
-                flag.Value = "—";
-
-                if (snapshotChanged == true)
-                {
-                    flag.Changed = false;
-                }
-
-                continue;
-            }
-
             ulong value = (state.Registers.Rflags >> bit) & 1;
-            flag.Value = value.ToString(CultureInfo.InvariantCulture);
-
-            if (snapshotChanged == true)
-            {
-                flag.Changed = markChanges && previousRflagsKnown &&
-                               ((previousRflags >> bit) & 1) != value;
-            }
+            flag.Value = value == 0 ? "0" : "1";
+            flag.Changed = markChanges && previousRflagsKnown && ((previousRflags >> bit) & 1) != value;
         }
 
-        if (paused == true)
+        _lastRegisterSnapshotKnown = true;
+        _lastRegistersPaused = true;
+    }
+
+    private static ulong ReadRegister(in HacDbgCoreRegisters registers, int index)
+    {
+        return index switch
         {
-            Array.Copy(values, _lastRegisterValues, values.Length);
-            Array.Copy(known, _lastRegisterKnown, known.Length);
-            _lastRegisterSnapshotKnown = true;
-        }
-        else
-        {
-            Array.Clear(_lastRegisterValues);
-            Array.Clear(_lastRegisterKnown);
-            _lastRegisterSnapshotKnown = false;
-        }
-
-        _lastRegistersPaused = paused;
+            0 => registers.Rax,
+            1 => registers.Rcx,
+            2 => registers.Rdx,
+            3 => registers.Rbx,
+            4 => registers.Rsp,
+            5 => registers.Rbp,
+            6 => registers.Rsi,
+            7 => registers.Rdi,
+            8 => registers.R8,
+            9 => registers.R9,
+            10 => registers.R10,
+            11 => registers.R11,
+            12 => registers.R12,
+            13 => registers.R13,
+            14 => registers.R14,
+            15 => registers.R15,
+            16 => registers.Rip,
+            17 => registers.Rflags,
+            18 => registers.Cr3,
+            _ => 0
+        };
     }
 
     private void ClearRegisterChangeMarks()
@@ -503,37 +593,76 @@ public partial class MainWindow : FluentWindow
 
     private void UpdateBreakpoints(HacDbgCoreState state)
     {
-        StringBuilder signature = new();
+        HacDbgCoreBreakpoint[]? breakpoints = state.Breakpoints;
+        int available = breakpoints?.Length ?? 0;
+        int count = (int)Math.Min(state.BreakpointCount, (uint)available);
 
-        for (int index = 0; index < state.BreakpointCount && index < state.Breakpoints.Length; index++)
+        if (count > _lastBreakpoints.Length)
         {
-            HacDbgCoreBreakpoint breakpoint = state.Breakpoints[index];
-            signature.Append(breakpoint.Id).Append(':')
-                .Append(breakpoint.Address).Append(':')
-                .Append(breakpoint.Cr3).Append(':')
-                .Append(breakpoint.Enabled).Append(':')
-                .Append(breakpoint.PausesThread).Append('|');
+            count = _lastBreakpoints.Length;
         }
 
-        string nextSignature = signature.ToString();
-
-        if (nextSignature == _breakpointSignature)
+        if (count == _lastBreakpointCount && SameBreakpoints(breakpoints, count))
         {
             return;
         }
 
-        _breakpointSignature = nextSignature;
+        _lastBreakpointCount = count;
         _breakpoints.Clear();
 
-        for (int index = 0; index < state.BreakpointCount && index < state.Breakpoints.Length; index++)
+        for (int index = 0; index < count; index++)
         {
-            HacDbgCoreBreakpoint breakpoint = state.Breakpoints[index];
+            HacDbgCoreBreakpoint breakpoint = breakpoints![index];
+            _lastBreakpoints[index] = breakpoint;
             _breakpoints.Add(new BreakpointRow(
                 breakpoint.Id.ToString(),
                 $"0x{breakpoint.Address:X16}",
                 breakpoint.Enabled != 0 ? "e" : "d",
                 breakpoint.PausesThread != 0 ? "pause" : ""));
         }
+    }
+
+    private bool SameBreakpoints(HacDbgCoreBreakpoint[]? breakpoints, int count)
+    {
+        if (breakpoints is null)
+        {
+            return count == 0;
+        }
+
+        for (int index = 0; index < count; index++)
+        {
+            HacDbgCoreBreakpoint next = breakpoints[index];
+            HacDbgCoreBreakpoint previous = _lastBreakpoints[index];
+
+            if (next.Id != previous.Id ||
+                next.Address != previous.Address ||
+                next.Cr3 != previous.Cr3 ||
+                next.Enabled != previous.Enabled ||
+                next.PausesThread != previous.PausesThread)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static bool SameVersionBytes(byte[]? next, byte[] shown)
+    {
+        return next is not null &&
+               next.Length == shown.Length &&
+               next.AsSpan().SequenceEqual(shown);
+    }
+
+    private static void RememberVersionBytes(byte[]? next, byte[] shown)
+    {
+        if (next is null || next.Length != shown.Length)
+        {
+            Array.Clear(shown);
+            return;
+        }
+
+        next.CopyTo(shown, 0);
     }
 
     private static string DecodeVersion(byte[]? bytes)

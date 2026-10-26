@@ -20,6 +20,9 @@ public partial class MainWindow
     private string _completionToken = string.Empty;
     private int _completionPollGeneration;
     private bool _applyingCompletion;
+    private const int SearchStatusQuietMilliseconds = 200;
+
+    private DispatcherTimer? _searchStatusTimer;
     private int _searchCurrentOffset = -1;
     private int _searchMatchCount;
 
@@ -35,6 +38,7 @@ public partial class MainWindow
     {
         GuiTheme.Changed -= OnGuiThemeChanged;
         CommandOutput.Document.Changed -= CommandOutput_DocumentChanged;
+        StopSearchStatusTimer();
         _completionPollGeneration++;
     }
 
@@ -155,6 +159,7 @@ public partial class MainWindow
     private void CloseCommandSearch()
     {
         CommandSearchBar.Visibility = Visibility.Collapsed;
+        StopSearchStatusTimer();
         _searchColorizer.Query = string.Empty;
         _searchColorizer.CurrentOffset = -1;
         _searchCurrentOffset = -1;
@@ -294,14 +299,75 @@ public partial class MainWindow
             return;
         }
 
-        if (_searchCurrentOffset >= CommandOutput.Document.TextLength)
+        int oldLength = CommandOutput.Document.TextLength - e.InsertionLength + e.RemovalLength;
+        bool appendOnly = e.RemovalLength == 0 && e.Offset == oldLength;
+
+        if (e.Offset == 0 && e.RemovalLength > 0 && _searchCurrentOffset >= 0)
+        {
+            if (_searchCurrentOffset < e.RemovalLength)
+            {
+                _searchCurrentOffset = -1;
+            }
+            else
+            {
+                _searchCurrentOffset -= e.RemovalLength;
+            }
+
+            _searchColorizer.CurrentOffset = _searchCurrentOffset;
+        }
+        else if (_searchCurrentOffset >= CommandOutput.Document.TextLength)
         {
             _searchCurrentOffset = -1;
             _searchColorizer.CurrentOffset = -1;
         }
 
+        if (appendOnly)
+        {
+            ScheduleSearchStatus();
+            return;
+        }
+
         UpdateSearchStatus(CommandSearchBox.Text);
         CommandOutput.TextArea.TextView.Redraw();
+    }
+
+    private void ScheduleSearchStatus()
+    {
+        if (_searchStatusTimer is null)
+        {
+            _searchStatusTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromMilliseconds(SearchStatusQuietMilliseconds)
+            };
+            _searchStatusTimer.Tick += SearchStatusTimer_Tick;
+        }
+
+        _searchStatusTimer.Stop();
+        _searchStatusTimer.Start();
+    }
+
+    private void SearchStatusTimer_Tick(object? sender, EventArgs e)
+    {
+        _searchStatusTimer?.Stop();
+
+        if (CommandSearchBar.Visibility != Visibility.Visible || string.IsNullOrEmpty(CommandSearchBox.Text))
+        {
+            return;
+        }
+
+        UpdateSearchStatus(CommandSearchBox.Text);
+    }
+
+    private void StopSearchStatusTimer()
+    {
+        if (_searchStatusTimer is null)
+        {
+            return;
+        }
+
+        _searchStatusTimer.Stop();
+        _searchStatusTimer.Tick -= SearchStatusTimer_Tick;
+        _searchStatusTimer = null;
     }
 
     private void CommandInput_TextChanged(object sender, TextChangedEventArgs e)

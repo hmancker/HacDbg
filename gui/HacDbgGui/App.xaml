@@ -107,6 +107,10 @@
                 <Setter Property="SelectionUnit" Value="FullRow" />
                 <Setter Property="FontFamily" Value="Cascadia Mono, Consolas" />
                 <Setter Property="FontSize" Value="12" />
+                <Setter Property="EnableRowVirtualization" Value="True" />
+                <Setter Property="EnableColumnVirtualization" Value="False" />
+                <Setter Property="VirtualizingPanel.IsVirtualizing" Value="True" />
+                <Setter Property="VirtualizingPanel.VirtualizationMode" Value="Recycling" />
             </Style>
 
             <Style TargetType="{x:Type DataGridColumnHeader}">

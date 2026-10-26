@@ -111,19 +111,26 @@ public partial class MainWindow
 
         bool active = progress.Active != 0;
 
-        if (active == false && _symbolLoadWasActive == true)
-        {
-            RequestModules();
-        }
-
-        _symbolLoadWasActive = active;
-        SymbolProgressPanel.Visibility = active ? Visibility.Visible : Visibility.Collapsed;
-        LoadSymbolsButton.IsEnabled = _started && active == false;
-
         if (active == false)
         {
+            if (_symbolLoadWasActive)
+            {
+                _symbolLoadWasActive = false;
+                RequestModules();
+                SymbolProgressPanel.Visibility = Visibility.Collapsed;
+            }
+
+            if (LoadSymbolsButton.IsEnabled != _started)
+            {
+                LoadSymbolsButton.IsEnabled = _started;
+            }
+
             return;
         }
+
+        _symbolLoadWasActive = true;
+        SymbolProgressPanel.Visibility = Visibility.Visible;
+        LoadSymbolsButton.IsEnabled = false;
 
         SymbolProgressBar.Maximum = Math.Max(progress.Total, 1u);
         SymbolProgressBar.IsIndeterminate = progress.Total <= 1;
@@ -861,7 +868,12 @@ public partial class MainWindow
 
     private void UpdateStructuredState(HacDbgCoreState state, bool paused)
     {
-        RefreshViewsButton.IsEnabled = _started && state.Running != 0;
+        bool canRefresh = _started && state.Running != 0;
+
+        if (RefreshViewsButton.IsEnabled != canRefresh)
+        {
+            RefreshViewsButton.IsEnabled = canRefresh;
+        }
 
         if (paused == false)
         {
