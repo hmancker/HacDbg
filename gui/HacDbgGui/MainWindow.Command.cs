@@ -3,8 +3,6 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Threading;
-using AvalonDock.Themes;
-using AvalonDock.Themes.VS2013.Themes;
 using HacDbgGui.Interop;
 using Wpf.Ui.Appearance;
 using ICSharpCode.AvalonEdit.Document;
@@ -49,8 +47,6 @@ public partial class MainWindow
             ApplicationThemeManager.Apply(this);
         }
 
-        DockManager.Theme = GuiTheme.IsLight ? new Vs2013LightTheme() : new Vs2013DarkTheme();
-        RefreshDockChrome();
         if (TryFindResource("WindowBackgroundBrush") is Brush windowBrush)
         {
             Background = windowBrush;
@@ -69,26 +65,6 @@ public partial class MainWindow
         _searchColorizer.RefreshBrushes();
         CommandOutput.TextArea.TextView.Redraw();
         TraceViewHost.ApplyTheme();
-    }
-
-    private void RefreshDockChrome()
-    {
-        SetDockBrush(ResourceKeys.Background, "SurfaceColor");
-        SetDockBrush(ResourceKeys.PanelBorderBrush, "BorderColor");
-        SetDockBrush(ResourceKeys.TabBackground, "WindowBackgroundColor");
-        SetDockBrush(ResourceKeys.DocumentWellTabSelectedActiveBackground, "SurfaceRaisedColor");
-        SetDockBrush(ResourceKeys.DocumentWellTabSelectedActiveText, "ForegroundColor");
-        SetDockBrush(ResourceKeys.DocumentWellTabSelectedInactiveBackground, "SurfaceColor");
-        SetDockBrush(ResourceKeys.DocumentWellTabSelectedInactiveText, "MutedColor");
-        SetDockBrush(ResourceKeys.DocumentWellTabUnselectedBackground, "WindowBackgroundColor");
-        SetDockBrush(ResourceKeys.DocumentWellTabUnselectedText, "MutedColor");
-        SetDockBrush(ResourceKeys.DocumentWellTabUnselectedHoveredBackground, "SurfaceRaisedColor");
-        SetDockBrush(ResourceKeys.DocumentWellTabUnselectedHoveredText, "ForegroundColor");
-    }
-
-    private void SetDockBrush(object key, string colorKey)
-    {
-        DockManager.Resources[key] = new SolidColorBrush(GuiTheme.ReadColor(colorKey, Colors.Transparent));
     }
 
     private void ThemeButton_Click(object sender, RoutedEventArgs e)
@@ -143,6 +119,7 @@ public partial class MainWindow
     {
         CloseCompletion();
         CommandSearchBar.Visibility = Visibility.Visible;
+        ActivateDocument("command");
 
         if (CommandOutput.SelectionLength > 0 &&
             CommandOutput.SelectionLength <= 200 &&
@@ -151,9 +128,15 @@ public partial class MainWindow
             CommandSearchBox.Text = CommandOutput.SelectedText;
         }
 
-        CommandSearchBox.Focus();
-        CommandSearchBox.SelectAll();
-        RefreshSearch(selectNearest: _searchCurrentOffset < 0);
+        bool selectNearest = _searchCurrentOffset < 0;
+        Dispatcher.BeginInvoke(
+            new Action(() =>
+            {
+                CommandSearchBox.Focus();
+                CommandSearchBox.SelectAll();
+                RefreshSearch(selectNearest: selectNearest);
+            }),
+            DispatcherPriority.Input);
     }
 
     private void CloseCommandSearch()

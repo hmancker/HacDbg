@@ -421,6 +421,17 @@ public partial class MainWindow
 
     private void FocusCommandInput()
     {
+        ActivateDocument("command");
+        Dispatcher.BeginInvoke(new Action(FocusCommandInputNow), DispatcherPriority.Input);
+    }
+
+    private void FocusCommandInputNow()
+    {
+        if (ActiveDocumentId() != "command")
+        {
+            return;
+        }
+
         Activate();
         FocusManager.SetFocusedElement(this, CommandInput);
         CommandInput.Focus();

@@ -61,6 +61,7 @@ public partial class MainWindow : FluentWindow
     private bool _shownCr3Paused;
     private bool _shownCommandControlsRunning;
     private ulong _shownCr3;
+    private bool _outputNearEnd = true;
 
     public MainWindow()
     {
@@ -88,7 +89,8 @@ public partial class MainWindow : FluentWindow
         RegisterGrid.ItemsSource = _registers;
         FlagsGrid.ItemsSource = _flags;
         BreakpointGrid.ItemsSource = _breakpoints;
-        InitializeDockLayout();
+        CommandOutput.TextArea.TextView.ScrollOffsetChanged += (_, _) => RememberOutputNearEnd();
+        InitializeViewLayout();
         InitializeStructuredViews();
         InitializeTrace();
         InitializeCommandChrome();
@@ -289,6 +291,7 @@ public partial class MainWindow : FluentWindow
                     builder.Clear();
                     CommandOutput.Clear();
                     follow = true;
+                    _outputNearEnd = true;
                     break;
 
                 case 6:
@@ -306,7 +309,7 @@ public partial class MainWindow : FluentWindow
             // ScrollToEnd lays out the viewport. Skip it when the user has
             // moved away from the end, so a large dump can be copied.
             //
-            if (follow)
+            if (follow && CommandOutput.IsVisible)
             {
                 CommandOutput.ScrollToEnd();
             }
@@ -320,11 +323,22 @@ public partial class MainWindow : FluentWindow
 
     private bool OutputIsNearEnd()
     {
+        RememberOutputNearEnd();
+        return _outputNearEnd;
+    }
+
+    private void RememberOutputNearEnd()
+    {
         TextView view = CommandOutput.TextArea.TextView;
 
-        if (view.ActualHeight <= 1)
+        //
+        // A hidden command tab reports no viewport. Keep the last visible
+        // position so output that arrives on another tab does not pull the
+        // user back to the end after they scrolled away.
+        //
+        if (CommandOutput.IsVisible == false || view.ActualHeight <= 1)
         {
-            return true;
+            return;
         }
 
         double lineHeight = view.DefaultLineHeight;
@@ -335,7 +349,7 @@ public partial class MainWindow : FluentWindow
         }
 
         double remaining = view.DocumentHeight - view.VerticalOffset - view.ActualHeight;
-        return remaining <= lineHeight * 2;
+        _outputNearEnd = remaining <= lineHeight * 2;
     }
 
     private static void AppendLine(StringBuilder builder, string text)
@@ -868,7 +882,7 @@ public partial class MainWindow : FluentWindow
 
     private void ResetLayoutButton_Click(object sender, RoutedEventArgs e)
     {
-        ResetDockLayout();
+        ResetViewLayout();
     }
 
     private void MainWindow_Closing(object? sender, CancelEventArgs e)

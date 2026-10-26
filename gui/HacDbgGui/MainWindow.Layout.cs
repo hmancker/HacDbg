@@ -3,13 +3,17 @@ using System.IO;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
-using AvalonDock.Layout;
-using AvalonDock.Serializer.Xml;
+using System.Windows.Threading;
 
 namespace HacDbgGui;
 
 public partial class MainWindow
 {
+    //
+    // Ctrl+1 through Ctrl+7 and the trace renderer document actions use this
+    // order. The command tab is a peer in the tab strip, but it is not one of
+    // these slots.
+    //
     private static readonly (string ContentId, string Title)[] DefaultDockDocuments =
     {
         ("status", "状态"),
@@ -26,33 +30,18 @@ public partial class MainWindow
         WriteIndented = true
     };
 
-    private const double DefaultDocumentPaneWidth = 640;
-
-    private readonly Dictionary<string, object> _dockContentById = new(StringComparer.Ordinal);
     private readonly List<(DataGridColumn Column, DataGridLength Width)> _defaultColumnWidths = new();
     private bool _guiStateRestored;
 
     private static string SettingsDirectory =>
         Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HacDbg");
 
-    private static string DockLayoutPath => Path.Combine(SettingsDirectory, "layout.xml");
-
     private static string GuiSettingsPath => Path.Combine(SettingsDirectory, "gui-settings.json");
 
-    private void InitializeDockLayout()
+    private void InitializeViewLayout()
     {
-        foreach (LayoutDocument document in EnumerateDockDocuments())
-        {
-            if (string.IsNullOrEmpty(document.ContentId) || document.Content is null)
-            {
-                continue;
-            }
-
-            _dockContentById.TryAdd(document.ContentId, document.Content);
-        }
-
         CaptureDefaultColumnWidths();
-        ApplyDockDocumentPolicy();
+        ViewTabs.SelectionChanged += ViewTabs_SelectionChanged;
     }
 
     private void RestoreGuiState()
@@ -67,10 +56,8 @@ public partial class MainWindow
 
         GuiTheme.Apply(GuiTheme.IsLightName(settings.Theme));
         ApplyWindowSettings(settings);
-        ApplyCommandPaneWidth(settings);
         ApplyTraceSampleRate(settings.TraceSampleRate);
         FollowRipCheck.IsChecked = settings.FollowRip;
-        LoadDockLayout();
 
         string activeDocument = settings.ActiveDocument ?? "status";
 
@@ -82,176 +69,89 @@ public partial class MainWindow
 
     private void SaveGuiState()
     {
-        SaveDockLayout();
         SaveGuiSettings();
     }
 
     private bool ActivateDocument(string contentId)
     {
-        LayoutDocument? document = FindDockDocument(contentId);
-
-        if (document is null)
+        foreach (object item in ViewTabs.Items)
         {
-            return false;
-        }
-
-        if (document.Parent is LayoutDocumentPane pane)
-        {
-            int index = pane.Children.IndexOf(document);
-
-            if (index >= 0)
+            if (item is TabItem tab &&
+                tab.Tag is string tag &&
+                string.Equals(tag, contentId, StringComparison.Ordinal))
             {
-                pane.SelectedContentIndex = index;
+                ViewTabs.SelectedItem = tab;
+                return true;
             }
         }
 
-        document.IsSelected = true;
-        document.IsActive = true;
-
-        if (document.Content is not null)
-        {
-            DockManager.ActiveContent = document.Content;
-        }
-
-        return true;
+        return false;
     }
 
     private void CycleDocument(int direction)
     {
-        List<LayoutDocument> documents = EnumerateDockDocuments().ToList();
+        int count = ViewTabs.Items.Count;
 
-        if (documents.Count == 0)
+        if (count == 0)
         {
             return;
         }
 
-        int current = documents.FindIndex(document => document.IsActive);
+        int current = ViewTabs.SelectedIndex;
 
         if (current < 0)
         {
             current = 0;
         }
 
-        int next = (current + direction + documents.Count) % documents.Count;
-        string? contentId = documents[next].ContentId;
-
-        if (string.IsNullOrEmpty(contentId) == false)
-        {
-            ActivateDocument(contentId);
-        }
-    }
-
-    private LayoutDocument? FindDockDocument(string contentId)
-    {
-        return EnumerateDockDocuments().FirstOrDefault(
-            document => string.Equals(document.ContentId, contentId, StringComparison.Ordinal));
-    }
-
-    private IEnumerable<LayoutDocument> EnumerateDockDocuments()
-    {
-        LayoutRoot? layout = DockManager.Layout;
-
-        return layout is null
-            ? Array.Empty<LayoutDocument>()
-            : layout.Descendents().OfType<LayoutDocument>();
+        ViewTabs.SelectedIndex = (current + direction + count) % count;
     }
 
     private string ActiveDocumentId()
     {
-        LayoutContent? active = DockManager.Layout?.Descendents()
-            .OfType<LayoutContent>()
-            .FirstOrDefault(document => document.IsActive);
-
-        if (active?.ContentId is { Length: > 0 } activeId)
+        if (ViewTabs.SelectedItem is TabItem tab &&
+            tab.Tag is string tag &&
+            string.IsNullOrEmpty(tag) == false)
         {
-            return activeId;
-        }
-
-        object? activeContent = DockManager.ActiveContent;
-
-        if (activeContent is not null)
-        {
-            foreach ((string contentId, object content) in _dockContentById)
-            {
-                if (ReferenceEquals(content, activeContent))
-                {
-                    return contentId;
-                }
-            }
+            return tag;
         }
 
         return "status";
     }
 
-    private void LoadDockLayout()
+    private void ViewTabs_SelectionChanged(object sender, SelectionChangedEventArgs e)
     {
-        if (File.Exists(DockLayoutPath) == false)
+        if (ReferenceEquals(e.Source, ViewTabs) == false)
         {
             return;
         }
 
-        try
+        if (ActiveDocumentId() != "command")
         {
-            DetachDockContents();
-
-            HashSet<string> restored = new(StringComparer.Ordinal);
-            XmlLayoutSerializer serializer = new(DockManager);
-            serializer.LayoutSerializationCallback += (_, args) =>
-            {
-                string? contentId = args.Model.ContentId;
-
-                if (contentId is not null &&
-                    restored.Add(contentId) &&
-                    _dockContentById.TryGetValue(contentId, out object? content))
-                {
-                    args.Content = content;
-                    return;
-                }
-
-                args.Cancel = true;
-            };
-
-            using FileStream stream = File.OpenRead(DockLayoutPath);
-            serializer.Deserialize(stream);
-            EnsureDockDocuments();
-            ApplyDockDocumentPolicy();
+            CloseCompletion();
+            return;
         }
-        catch (Exception error)
+
+        if (_outputNearEnd == false || CommandSearchBar.Visibility == Visibility.Visible)
         {
-            GuiDiagnostics.WriteException("dock layout load", error);
-            AppendWarning($"布局文件读取失败，已恢复默认布局：{error.Message}");
-            BuildDefaultDockLayout();
+            return;
+        }
+
+        Dispatcher.BeginInvoke(new Action(ScrollCommandOutputToEnd), DispatcherPriority.Loaded);
+    }
+
+    private void ScrollCommandOutputToEnd()
+    {
+        if (ActiveDocumentId() == "command" && _outputNearEnd && CommandOutput.IsVisible)
+        {
+            CommandOutput.ScrollToEnd();
         }
     }
 
-    private void SaveDockLayout()
+    private void ResetViewLayout()
     {
-        try
-        {
-            Directory.CreateDirectory(SettingsDirectory);
-
-            string temporaryPath = DockLayoutPath + ".tmp";
-            XmlLayoutSerializer serializer = new(DockManager);
-
-            using (FileStream stream = new(temporaryPath, FileMode.Create, FileAccess.Write, FileShare.None))
-            {
-                serializer.Serialize(stream);
-                stream.Flush(flushToDisk: true);
-            }
-
-            File.Move(temporaryPath, DockLayoutPath, overwrite: true);
-        }
-        catch (Exception error)
-        {
-            GuiDiagnostics.WriteException("dock layout save", error);
-        }
-    }
-
-    private void ResetDockLayout()
-    {
-        BuildDefaultDockLayout();
+        ActivateDocument("status");
         RestoreDefaultPaneSizes();
-        SaveDockLayout();
         SaveGuiSettings();
         AppendInfo("layout reset to defaults");
     }
@@ -280,7 +180,6 @@ public partial class MainWindow
 
     private void RestoreDefaultPaneSizes()
     {
-        RightPanelColumn.Width = new GridLength(DefaultDocumentPaneWidth);
         StatusRegisterRow.Height = new GridLength(4, GridUnitType.Star);
         StatusBreakpointRow.Height = new GridLength(2, GridUnitType.Star);
         ProcessListRow.Height = new GridLength(3, GridUnitType.Star);
@@ -290,128 +189,6 @@ public partial class MainWindow
         {
             column.Width = width;
         }
-    }
-
-    private void BuildDefaultDockLayout()
-    {
-        DetachDockContents();
-
-        LayoutRoot root = new();
-        LayoutPanel panel = new()
-        {
-            Orientation = Orientation.Horizontal
-        };
-        LayoutDocumentPane pane = new();
-
-        panel.Children.Add(pane);
-        root.RootPanel = panel;
-
-        foreach ((string contentId, string title) in DefaultDockDocuments)
-        {
-            if (_dockContentById.TryGetValue(contentId, out object? content) == false)
-            {
-                continue;
-            }
-
-            LayoutDocument document = new()
-            {
-                Title = title,
-                ContentId = contentId,
-                Content = content
-            };
-
-            pane.Children.Add(document);
-        }
-
-        DockManager.Layout = root;
-        ApplyDockDocumentPolicy();
-        ActivateDocument("status");
-    }
-
-    private void EnsureDockDocuments()
-    {
-        LayoutDocumentPane? firstPane = DockManager.Layout?.Descendents()
-            .OfType<LayoutDocumentPane>()
-            .FirstOrDefault();
-
-        if (firstPane is null)
-        {
-            throw new InvalidDataException("layout has no document pane");
-        }
-
-        HashSet<string> existing = EnumerateDockDocuments()
-            .Select(document => document.ContentId)
-            .Where(contentId => string.IsNullOrEmpty(contentId) == false)
-            .Cast<string>()
-            .ToHashSet(StringComparer.Ordinal);
-
-        foreach ((string contentId, string title) in DefaultDockDocuments)
-        {
-            if (existing.Contains(contentId) || _dockContentById.TryGetValue(contentId, out object? content) == false)
-            {
-                continue;
-            }
-
-            firstPane.Children.Add(new LayoutDocument
-            {
-                Title = title,
-                ContentId = contentId,
-                Content = content
-            });
-        }
-
-        foreach (LayoutDocument document in EnumerateDockDocuments())
-        {
-            string? contentId = document.ContentId;
-
-            if (contentId is not null)
-            {
-                document.Title = TitleForDocument(contentId) ?? document.Title;
-            }
-        }
-    }
-
-    private void DetachDockContents()
-    {
-        LayoutRoot? layout = DockManager.Layout;
-
-        if (layout is null)
-        {
-            return;
-        }
-
-        foreach (LayoutDocument document in layout.Descendents().OfType<LayoutDocument>())
-        {
-            document.Content = null;
-        }
-    }
-
-    private void ApplyDockDocumentPolicy()
-    {
-        // A floating HwndHost would render above WPF popups, so trace stays docked only.
-        DockManager.AllowFloatingWindows = false;
-        DockManager.ShowNavigator = false;
-        DockManager.DockAllFloatingWindows();
-
-        foreach (LayoutDocument document in EnumerateDockDocuments())
-        {
-            document.CanClose = false;
-            document.CanFloat = false;
-            document.CanMove = true;
-        }
-    }
-
-    private static string? TitleForDocument(string contentId)
-    {
-        foreach ((string id, string title) in DefaultDockDocuments)
-        {
-            if (string.Equals(id, contentId, StringComparison.Ordinal))
-            {
-                return title;
-            }
-        }
-
-        return null;
     }
 
     private GuiSettings LoadGuiSettings()
@@ -461,7 +238,6 @@ public partial class MainWindow
                 Width = double.IsFinite(bounds.Width) ? bounds.Width : null,
                 Height = double.IsFinite(bounds.Height) ? bounds.Height : null,
                 WindowState = WindowState.ToString(),
-                DockPanelWidth = RightPanelColumn.Width.IsAbsolute ? RightPanelColumn.Width.Value : 640,
                 ActiveDocument = ActiveDocumentId(),
                 TraceSampleRate = SelectedTraceSampleRate(),
                 FollowRip = FollowRipCheck.IsChecked == true,
@@ -525,16 +301,6 @@ public partial class MainWindow
         }
     }
 
-    private void ApplyCommandPaneWidth(GuiSettings settings)
-    {
-        if (settings.DockPanelWidth is double width && double.IsFinite(width))
-        {
-            RightPanelColumn.Width = new GridLength(
-                Math.Clamp(width, 360, 2000),
-                GridUnitType.Pixel);
-        }
-    }
-
     private void ApplyTraceSampleRate(uint sampleRate)
     {
         foreach (object item in TraceSampleBox.Items)
@@ -558,7 +324,6 @@ public partial class MainWindow
         public double? Width { get; set; } = 1600;
         public double? Height { get; set; } = 900;
         public string WindowState { get; set; } = "Normal";
-        public double? DockPanelWidth { get; set; } = DefaultDocumentPaneWidth;
         public string ActiveDocument { get; set; } = "status";
         public uint TraceSampleRate { get; set; } = 64;
         public bool FollowRip { get; set; }

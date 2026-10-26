@@ -3,10 +3,7 @@
                  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
                  xmlns:avalonEdit="http://icsharpcode.net/sharpdevelop/avalonedit"
-                 xmlns:avalonDock="https://github.com/Dirkster99/AvalonDock"
                  xmlns:controls="clr-namespace:HacDbgGui.Controls"
-                 xmlns:dockTheme="clr-namespace:AvalonDock.Themes.VS2013.Themes;assembly=AvalonDock.Themes.VS2013"
-                 xmlns:themes="clr-namespace:AvalonDock.Themes;assembly=AvalonDock.Themes.VS2013"
                  Title="HacDbg"
                  Width="1600"
                  Height="900"
@@ -54,7 +51,7 @@
                 <Button x:Name="ResetLayoutButton"
                         Content="重置布局"
                         Click="ResetLayoutButton_Click"
-                        ToolTip="恢复默认单页布局，并把命令台与文档区、状态页、进程页的分隔条以及表格列宽恢复到默认大小。窗口位置和大小不变。" />
+                        ToolTip="回到「状态」标签，并把状态页、进程页的分隔条以及表格列宽恢复到默认大小。窗口位置和大小不变。" />
                 <Button x:Name="SearchButton"
                         Content="搜索 (Ctrl+F)"
                         Click="SearchButton_Click"
@@ -63,7 +60,7 @@
                         Content="亮色主题"
                         Click="ThemeButton_Click"
                         ToolTip="在暗色和亮色主题之间切换，并记住选择。" />
-                <TextBlock Text="Ctrl+Tab 切换视图 · Ctrl+1–7 直达 · Esc 输入命令 · Tab 补全"
+                <TextBlock Text="Ctrl+Tab 切换标签 · Ctrl+1–7 从状态到实时 trace · Esc 回命令台 · Tab 补全"
                            VerticalAlignment="Center"
                            Margin="4,0,0,0"
                            Foreground="{StaticResource MutedBrush}"
@@ -90,34 +87,26 @@
             </WrapPanel>
         </Border>
 
-        <Grid Grid.Row="2" Margin="12,0,12,8">
-            <Grid.ColumnDefinitions>
-                <ColumnDefinition Width="*" />
-                <ColumnDefinition Width="6" />
-                <ColumnDefinition x:Name="RightPanelColumn" Width="640" />
-            </Grid.ColumnDefinitions>
-
-            <Border Grid.Column="0"
-                    Background="{StaticResource SurfaceBrush}"
-                    BorderBrush="{StaticResource BorderBrush}"
-                    BorderThickness="1"
-                    CornerRadius="6"
-                    Padding="10">
-                <Grid>
-                    <Grid.RowDefinitions>
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="Auto" />
-                        <RowDefinition Height="*" />
-                        <RowDefinition Height="Auto" />
-                    </Grid.RowDefinitions>
-
-                    <TextBlock Text="命令台"
-                               FontSize="14"
-                               FontWeight="SemiBold"
-                               Margin="0,0,0,8" />
+        <TabControl x:Name="ViewTabs"
+                    Grid.Row="2"
+                    Margin="12,0,12,8"
+                    KeyboardNavigation.ControlTabNavigation="None"
+                    SelectedIndex="1">
+            <TabItem Header="命令台" Tag="command">
+                <Border Background="{StaticResource SurfaceBrush}"
+                        BorderBrush="{StaticResource BorderBrush}"
+                        BorderThickness="1"
+                        CornerRadius="6"
+                        Padding="10">
+                    <Grid>
+                        <Grid.RowDefinitions>
+                            <RowDefinition Height="Auto" />
+                            <RowDefinition Height="*" />
+                            <RowDefinition Height="Auto" />
+                        </Grid.RowDefinitions>
 
                     <Grid x:Name="CommandSearchBar"
-                          Grid.Row="1"
+                          Grid.Row="0"
                           Margin="0,0,0,8"
                           Visibility="Collapsed">
                         <Grid.ColumnDefinitions>
@@ -152,7 +141,7 @@
                     </Grid>
 
                     <avalonEdit:TextEditor x:Name="CommandOutput"
-                                           Grid.Row="2"
+                                           Grid.Row="1"
                                            IsReadOnly="True"
                                            ShowLineNumbers="False"
                                            WordWrap="False"
@@ -165,7 +154,7 @@
                                            HorizontalScrollBarVisibility="Auto"
                                            VerticalScrollBarVisibility="Auto" />
 
-                    <Grid Grid.Row="3" Margin="0,8,0,0">
+                    <Grid Grid.Row="2" Margin="0,8,0,0">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="*" />
@@ -257,61 +246,10 @@
                         </Popup>
                     </Grid>
                 </Grid>
-            </Border>
+                </Border>
+            </TabItem>
 
-            <GridSplitter Grid.Column="1"
-                          HorizontalAlignment="Stretch"
-                          VerticalAlignment="Stretch"
-                          Background="Transparent"
-                          ResizeBehavior="PreviousAndNext"
-                          ResizeDirection="Columns" />
-
-            <avalonDock:DockingManager x:Name="DockManager"
-                                       Grid.Column="2"
-                                       Background="{StaticResource SurfaceBrush}"
-                                       Foreground="{StaticResource ForegroundBrush}"
-                                       FontFamily="Segoe UI Variable Text, Segoe UI"
-                                       AllowFloatingWindows="False"
-                                       AllowMixedOrientation="True"
-                                       IsVirtualizingAnchorable="True"
-                                       IsVirtualizingDocument="True"
-                                       ShowNavigator="False"
-                                       GridSplitterWidth="6">
-                <avalonDock:DockingManager.Theme>
-                    <themes:Vs2013DarkTheme />
-                </avalonDock:DockingManager.Theme>
-                <avalonDock:DockingManager.Resources>
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.Background}"
-                                     Color="{DynamicResource SurfaceColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.PanelBorderBrush}"
-                                     Color="{DynamicResource BorderColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.TabBackground}"
-                                     Color="{DynamicResource WindowBackgroundColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabSelectedActiveBackground}"
-                                     Color="{DynamicResource SurfaceRaisedColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabSelectedActiveText}"
-                                     Color="{DynamicResource ForegroundColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabSelectedInactiveBackground}"
-                                     Color="{DynamicResource SurfaceColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabSelectedInactiveText}"
-                                     Color="{DynamicResource MutedColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabUnselectedBackground}"
-                                     Color="{DynamicResource WindowBackgroundColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabUnselectedText}"
-                                     Color="{DynamicResource MutedColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabUnselectedHoveredBackground}"
-                                     Color="{DynamicResource SurfaceRaisedColor}" />
-                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabUnselectedHoveredText}"
-                                     Color="{DynamicResource ForegroundColor}" />
-                </avalonDock:DockingManager.Resources>
-                <avalonDock:LayoutRoot>
-                    <avalonDock:LayoutPanel Orientation="Horizontal">
-                        <avalonDock:LayoutDocumentPane>
-                <avalonDock:LayoutDocument x:Name="StatusTab"
-                                           Title="状态"
-                                           ContentId="status"
-                                           CanClose="False"
-                                           CanFloat="False">
+            <TabItem Header="状态" Tag="status">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
                             <RowDefinition x:Name="StatusRegisterRow" Height="4*" />
@@ -452,13 +390,9 @@
                             </Grid>
                         </Border>
                     </Grid>
-                </avalonDock:LayoutDocument>
+                </TabItem>
 
-                <avalonDock:LayoutDocument x:Name="ModulesTab"
-                                           Title="模块"
-                                           ContentId="modules"
-                                           CanClose="False"
-                                           CanFloat="False">
+            <TabItem Header="模块" Tag="modules">
                     <Border Margin="0,6,0,0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
@@ -507,13 +441,9 @@
                             </DataGrid>
                         </Grid>
                     </Border>
-                </avalonDock:LayoutDocument>
+                </TabItem>
 
-                <avalonDock:LayoutDocument x:Name="ProcessesTab"
-                                           Title="进程 / 线程"
-                                           ContentId="processes"
-                                           CanClose="False"
-                                           CanFloat="False">
+            <TabItem Header="进程 / 线程" Tag="processes">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
                             <RowDefinition x:Name="ProcessListRow" Height="3*" />
@@ -642,13 +572,9 @@
                             </Grid>
                         </Border>
                     </Grid>
-                </avalonDock:LayoutDocument>
+                </TabItem>
 
-                <avalonDock:LayoutDocument x:Name="StackTab"
-                                           Title="调用栈"
-                                           ContentId="stack"
-                                           CanClose="False"
-                                           CanFloat="False">
+            <TabItem Header="调用栈" Tag="stack">
                     <Border Margin="0,6,0,0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
@@ -694,13 +620,9 @@
                             </DataGrid>
                         </Grid>
                     </Border>
-                </avalonDock:LayoutDocument>
+                </TabItem>
 
-                <avalonDock:LayoutDocument x:Name="MemoryTab"
-                                           Title="内存"
-                                           ContentId="memory"
-                                           CanClose="False"
-                                           CanFloat="False">
+            <TabItem Header="内存" Tag="memory">
                     <Border Margin="0,6,0,0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
@@ -778,13 +700,9 @@
                             </DataGrid>
                         </Grid>
                     </Border>
-                </avalonDock:LayoutDocument>
+                </TabItem>
 
-                <avalonDock:LayoutDocument x:Name="DisassemblyTab"
-                                           Title="反汇编"
-                                           ContentId="disassembly"
-                                           CanClose="False"
-                                           CanFloat="False">
+            <TabItem Header="反汇编" Tag="disassembly">
                     <Border Margin="0,6,0,0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
@@ -889,13 +807,9 @@
                             </DataGrid>
                         </Grid>
                     </Border>
-                </avalonDock:LayoutDocument>
+                </TabItem>
 
-                <avalonDock:LayoutDocument x:Name="TraceTab"
-                                           Title="实时 trace"
-                                           ContentId="trace"
-                                           CanClose="False"
-                                           CanFloat="False">
+            <TabItem Header="实时 trace" Tag="trace">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -981,12 +895,8 @@
                                    TextWrapping="Wrap"
                                    Foreground="{StaticResource MutedBrush}" />
                     </Grid>
-                </avalonDock:LayoutDocument>
-                        </avalonDock:LayoutDocumentPane>
-                    </avalonDock:LayoutPanel>
-                </avalonDock:LayoutRoot>
-            </avalonDock:DockingManager>
-        </Grid>
+                </TabItem>
+        </TabControl>
 
         <Border Grid.Row="3"
                 Margin="12,0,12,10"
