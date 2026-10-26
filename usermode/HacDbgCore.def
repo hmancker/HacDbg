@@ -31,3 +31,7 @@ EXPORTS
     HacDbgCoreRequestTraceRead
     HacDbgCoreGetTraceStatus
     HacDbgCoreCopyTraceSnapshot
+    HacDbgCoreCompleteCommands
+    HacDbgCoreRequestCompletions
+    HacDbgCoreGetCompletionStatus
+    HacDbgCoreCopyCompletions

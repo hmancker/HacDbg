@@ -3,7 +3,10 @@
                  xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
                  xmlns:ui="http://schemas.lepo.co/wpfui/2022/xaml"
                  xmlns:avalonEdit="http://icsharpcode.net/sharpdevelop/avalonedit"
+                 xmlns:avalonDock="https://github.com/Dirkster99/AvalonDock"
                  xmlns:controls="clr-namespace:HacDbgGui.Controls"
+                 xmlns:dockTheme="clr-namespace:AvalonDock.Themes.VS2013.Themes;assembly=AvalonDock.Themes.VS2013"
+                 xmlns:themes="clr-namespace:AvalonDock.Themes;assembly=AvalonDock.Themes.VS2013"
                  Title="HacDbg"
                  Width="1600"
                  Height="900"
@@ -13,6 +16,10 @@
                  WindowBackdropType="Mica"
                  ExtendsContentIntoTitleBar="True"
                  Background="{StaticResource WindowBackgroundBrush}"
+                 UseLayoutRounding="True"
+                 SnapsToDevicePixels="True"
+                 TextOptions.TextFormattingMode="Display"
+                 TextOptions.TextRenderingMode="ClearType"
                  Loaded="MainWindow_Loaded"
                  Closing="MainWindow_Closing"
                  PreviewKeyDown="MainWindow_PreviewKeyDown">
@@ -33,14 +40,34 @@
                 BorderBrush="{StaticResource BorderBrush}"
                 BorderThickness="1"
                 CornerRadius="6">
-            <StackPanel Orientation="Horizontal">
+            <WrapPanel Orientation="Horizontal">
                 <Button x:Name="ContinueButton" Content="继续 (F5)" Click="ContinueButton_Click" IsEnabled="False" />
                 <Button x:Name="StepIntoButton" Content="单步进入 (F11)" Click="StepIntoButton_Click" IsEnabled="False" />
                 <Button x:Name="StepOverButton" Content="单步跳过 (F10)" Click="StepOverButton_Click" IsEnabled="False" />
                 <Button x:Name="CancelButton" Content="取消当前命令" Click="CancelButton_Click" IsEnabled="False" />
                 <Button x:Name="LoadSymbolsButton" Content="加载符号" Click="LoadSymbolsButton_Click" IsEnabled="False" />
                 <Button x:Name="RefreshViewsButton" Content="刷新视图" Click="RefreshViewsButton_Click" IsEnabled="False" />
-                <Button x:Name="ClearButton" Content="清空输出" Click="ClearButton_Click" />
+                <Button x:Name="ClearButton"
+                        Content="清空输出 (Ctrl+L)"
+                        Click="ClearButton_Click"
+                        ToolTip="清空命令台输出，不改变寄存器、断点或客户状态。" />
+                <Button x:Name="ResetLayoutButton"
+                        Content="重置布局"
+                        Click="ResetLayoutButton_Click"
+                        ToolTip="把所有文档恢复到默认的单页选项卡布局并立即保存。" />
+                <Button x:Name="SearchButton"
+                        Content="搜索 (Ctrl+F)"
+                        Click="SearchButton_Click"
+                        ToolTip="在命令台输出中查找。F3 下一个，Shift+F3 上一个。" />
+                <Button x:Name="ThemeButton"
+                        Content="亮色主题"
+                        Click="ThemeButton_Click"
+                        ToolTip="在暗色和亮色主题之间切换，并记住选择。" />
+                <TextBlock Text="Ctrl+Tab 切换视图 · Ctrl+1–7 直达 · Esc 输入命令 · Tab 补全"
+                           VerticalAlignment="Center"
+                           Margin="4,0,0,0"
+                           Foreground="{StaticResource MutedBrush}"
+                           FontSize="12" />
                 <StackPanel x:Name="SymbolProgressPanel"
                             Orientation="Horizontal"
                             VerticalAlignment="Center"
@@ -60,14 +87,14 @@
                                VerticalAlignment="Center"
                                Foreground="{StaticResource MutedBrush}" />
                 </StackPanel>
-            </StackPanel>
+            </WrapPanel>
         </Border>
 
         <Grid Grid.Row="2" Margin="12,0,12,8">
             <Grid.ColumnDefinitions>
                 <ColumnDefinition Width="*" />
                 <ColumnDefinition Width="6" />
-                <ColumnDefinition Width="640" />
+                <ColumnDefinition x:Name="RightPanelColumn" Width="640" />
             </Grid.ColumnDefinitions>
 
             <Border Grid.Column="0"
@@ -79,6 +106,7 @@
                 <Grid>
                     <Grid.RowDefinitions>
                         <RowDefinition Height="Auto" />
+                        <RowDefinition Height="Auto" />
                         <RowDefinition Height="*" />
                         <RowDefinition Height="Auto" />
                     </Grid.RowDefinitions>
@@ -88,8 +116,43 @@
                                FontWeight="SemiBold"
                                Margin="0,0,0,8" />
 
+                    <Grid x:Name="CommandSearchBar"
+                          Grid.Row="1"
+                          Margin="0,0,0,8"
+                          Visibility="Collapsed">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="Auto" />
+                            <ColumnDefinition Width="88" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+
+                        <TextBox x:Name="CommandSearchBox"
+                                 ToolTip="在命令台输出中查找，不区分大小写。"
+                                 KeyDown="CommandSearchBox_KeyDown"
+                                 TextChanged="CommandSearchBox_TextChanged" />
+                        <Button Grid.Column="1"
+                                Content="上一个"
+                                Click="CommandSearchPrevious_Click"
+                                ToolTip="Shift+F3" />
+                        <Button Grid.Column="2"
+                                Content="下一个"
+                                Click="CommandSearchNext_Click"
+                                ToolTip="F3" />
+                        <TextBlock x:Name="CommandSearchStatus"
+                                   Grid.Column="3"
+                                   Margin="0,0,8,0"
+                                   VerticalAlignment="Center"
+                                   Foreground="{DynamicResource MutedBrush}"
+                                   TextTrimming="CharacterEllipsis" />
+                        <Button Grid.Column="4"
+                                Content="关闭"
+                                Click="CommandSearchClose_Click" />
+                    </Grid>
+
                     <avalonEdit:TextEditor x:Name="CommandOutput"
-                                           Grid.Row="1"
+                                           Grid.Row="2"
                                            IsReadOnly="True"
                                            ShowLineNumbers="False"
                                            WordWrap="False"
@@ -102,7 +165,7 @@
                                            HorizontalScrollBarVisibility="Auto"
                                            VerticalScrollBarVisibility="Auto" />
 
-                    <Grid Grid.Row="2" Margin="0,8,0,0">
+                    <Grid Grid.Row="3" Margin="0,8,0,0">
                         <Grid.ColumnDefinitions>
                             <ColumnDefinition Width="Auto" />
                             <ColumnDefinition Width="*" />
@@ -119,8 +182,79 @@
                                  FontFamily="Cascadia Mono, Consolas"
                                  FontSize="13"
                                  IsEnabled="False"
+                                 ToolTip="Tab 补全当前命令，点击列表中的一项即可填入。上下键切换历史，Enter 执行。"
                                  KeyDown="CommandInput_KeyDown"
-                                 PreviewKeyDown="CommandInput_PreviewKeyDown" />
+                                 PreviewKeyDown="CommandInput_PreviewKeyDown"
+                                 TextChanged="CommandInput_TextChanged" />
+
+                        <Popup x:Name="CompletionPopup"
+                               PlacementTarget="{Binding ElementName=CommandInput}"
+                               Placement="Top"
+                               VerticalOffset="-4"
+                               StaysOpen="True"
+                               AllowsTransparency="True"
+                               PopupAnimation="None">
+                            <Border Background="{DynamicResource SurfaceRaisedBrush}"
+                                    BorderBrush="{DynamicResource BorderBrush}"
+                                    BorderThickness="1"
+                                    CornerRadius="6"
+                                    Padding="4"
+                                    MinWidth="{Binding ActualWidth, ElementName=CommandInput}"
+                                    MaxWidth="560">
+                                <ListBox x:Name="CompletionList"
+                                         MaxHeight="240"
+                                         BorderThickness="0"
+                                         Background="Transparent"
+                                         Foreground="{DynamicResource ForegroundBrush}"
+                                         FontFamily="Cascadia Mono, Consolas"
+                                         FontSize="13"
+                                         ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                         ScrollViewer.CanContentScroll="True"
+                                         PreviewMouseLeftButtonUp="CompletionList_PreviewMouseLeftButtonUp">
+                                    <ListBox.ItemTemplate>
+                                        <DataTemplate>
+                                            <TextBlock Text="{Binding Text}"
+                                                       Foreground="{Binding Foreground, RelativeSource={RelativeSource AncestorType=ListBoxItem}}" />
+                                        </DataTemplate>
+                                    </ListBox.ItemTemplate>
+                                    <ListBox.ItemContainerStyle>
+                                        <Style TargetType="ListBoxItem">
+                                            <Setter Property="Padding" Value="8,4" />
+                                            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+                                            <Setter Property="Cursor" Value="Hand" />
+                                            <Setter Property="Focusable" Value="False" />
+                                            <Setter Property="IsEnabled" Value="{Binding CanSelect}" />
+                                            <Setter Property="Template">
+                                                <Setter.Value>
+                                                    <ControlTemplate TargetType="ListBoxItem">
+                                                        <Border x:Name="ItemBorder"
+                                                                Background="{TemplateBinding Background}"
+                                                                Padding="{TemplateBinding Padding}"
+                                                                CornerRadius="4">
+                                                            <ContentPresenter />
+                                                        </Border>
+                                                        <ControlTemplate.Triggers>
+                                                            <Trigger Property="IsMouseOver" Value="True">
+                                                                <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource AccentPressedBrush}" />
+                                                                <Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}" />
+                                                            </Trigger>
+                                                            <Trigger Property="IsSelected" Value="True">
+                                                                <Setter TargetName="ItemBorder" Property="Background" Value="{DynamicResource AccentBrush}" />
+                                                                <Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}" />
+                                                            </Trigger>
+                                                            <Trigger Property="IsEnabled" Value="False">
+                                                                <Setter Property="Foreground" Value="{DynamicResource MutedBrush}" />
+                                                                <Setter Property="Cursor" Value="Arrow" />
+                                                            </Trigger>
+                                                        </ControlTemplate.Triggers>
+                                                    </ControlTemplate>
+                                                </Setter.Value>
+                                            </Setter>
+                                        </Style>
+                                    </ListBox.ItemContainerStyle>
+                                </ListBox>
+                            </Border>
+                        </Popup>
                     </Grid>
                 </Grid>
             </Border>
@@ -132,12 +266,52 @@
                           ResizeBehavior="PreviousAndNext"
                           ResizeDirection="Columns" />
 
-            <TabControl x:Name="ViewTabs"
-                        Grid.Column="2"
-                        Margin="0,8,0,0"
-                        Background="Transparent"
-                        BorderThickness="0">
-                <TabItem x:Name="StatusTab" Header="状态">
+            <avalonDock:DockingManager x:Name="DockManager"
+                                       Grid.Column="2"
+                                       Background="{StaticResource SurfaceBrush}"
+                                       Foreground="{StaticResource ForegroundBrush}"
+                                       FontFamily="Segoe UI Variable Text, Segoe UI"
+                                       AllowFloatingWindows="False"
+                                       AllowMixedOrientation="True"
+                                       IsVirtualizingAnchorable="True"
+                                       IsVirtualizingDocument="True"
+                                       ShowNavigator="False"
+                                       GridSplitterWidth="6">
+                <avalonDock:DockingManager.Theme>
+                    <themes:Vs2013DarkTheme />
+                </avalonDock:DockingManager.Theme>
+                <avalonDock:DockingManager.Resources>
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.Background}"
+                                     Color="{DynamicResource SurfaceColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.PanelBorderBrush}"
+                                     Color="{DynamicResource BorderColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.TabBackground}"
+                                     Color="{DynamicResource WindowBackgroundColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabSelectedActiveBackground}"
+                                     Color="{DynamicResource SurfaceRaisedColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabSelectedActiveText}"
+                                     Color="{DynamicResource ForegroundColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabSelectedInactiveBackground}"
+                                     Color="{DynamicResource SurfaceColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabSelectedInactiveText}"
+                                     Color="{DynamicResource MutedColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabUnselectedBackground}"
+                                     Color="{DynamicResource WindowBackgroundColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabUnselectedText}"
+                                     Color="{DynamicResource MutedColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabUnselectedHoveredBackground}"
+                                     Color="{DynamicResource SurfaceRaisedColor}" />
+                    <SolidColorBrush x:Key="{x:Static dockTheme:ResourceKeys.DocumentWellTabUnselectedHoveredText}"
+                                     Color="{DynamicResource ForegroundColor}" />
+                </avalonDock:DockingManager.Resources>
+                <avalonDock:LayoutRoot>
+                    <avalonDock:LayoutPanel Orientation="Horizontal">
+                        <avalonDock:LayoutDocumentPane>
+                <avalonDock:LayoutDocument x:Name="StatusTab"
+                                           Title="状态"
+                                           ContentId="status"
+                                           CanClose="False"
+                                           CanFloat="False">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="4*" />
@@ -278,9 +452,13 @@
                             </Grid>
                         </Border>
                     </Grid>
-                </TabItem>
+                </avalonDock:LayoutDocument>
 
-                <TabItem x:Name="ModulesTab" Header="模块">
+                <avalonDock:LayoutDocument x:Name="ModulesTab"
+                                           Title="模块"
+                                           ContentId="modules"
+                                           CanClose="False"
+                                           CanFloat="False">
                     <Border Margin="0,6,0,0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
@@ -329,9 +507,13 @@
                             </DataGrid>
                         </Grid>
                     </Border>
-                </TabItem>
+                </avalonDock:LayoutDocument>
 
-                <TabItem x:Name="ProcessesTab" Header="进程 / 线程">
+                <avalonDock:LayoutDocument x:Name="ProcessesTab"
+                                           Title="进程 / 线程"
+                                           ContentId="processes"
+                                           CanClose="False"
+                                           CanFloat="False">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="3*" />
@@ -460,9 +642,13 @@
                             </Grid>
                         </Border>
                     </Grid>
-                </TabItem>
+                </avalonDock:LayoutDocument>
 
-                <TabItem x:Name="StackTab" Header="调用栈">
+                <avalonDock:LayoutDocument x:Name="StackTab"
+                                           Title="调用栈"
+                                           ContentId="stack"
+                                           CanClose="False"
+                                           CanFloat="False">
                     <Border Margin="0,6,0,0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
@@ -508,9 +694,13 @@
                             </DataGrid>
                         </Grid>
                     </Border>
-                </TabItem>
+                </avalonDock:LayoutDocument>
 
-                <TabItem x:Name="MemoryTab" Header="内存">
+                <avalonDock:LayoutDocument x:Name="MemoryTab"
+                                           Title="内存"
+                                           ContentId="memory"
+                                           CanClose="False"
+                                           CanFloat="False">
                     <Border Margin="0,6,0,0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
@@ -588,9 +778,13 @@
                             </DataGrid>
                         </Grid>
                     </Border>
-                </TabItem>
+                </avalonDock:LayoutDocument>
 
-                <TabItem x:Name="DisassemblyTab" Header="反汇编">
+                <avalonDock:LayoutDocument x:Name="DisassemblyTab"
+                                           Title="反汇编"
+                                           ContentId="disassembly"
+                                           CanClose="False"
+                                           CanFloat="False">
                     <Border Margin="0,6,0,0"
                             Background="{StaticResource SurfaceBrush}"
                             BorderBrush="{StaticResource BorderBrush}"
@@ -695,9 +889,13 @@
                             </DataGrid>
                         </Grid>
                     </Border>
-                </TabItem>
+                </avalonDock:LayoutDocument>
 
-                <TabItem x:Name="TraceTab" Header="实时 trace">
+                <avalonDock:LayoutDocument x:Name="TraceTab"
+                                           Title="实时 trace"
+                                           ContentId="trace"
+                                           CanClose="False"
+                                           CanFloat="False">
                     <Grid Margin="0,6,0,0">
                         <Grid.RowDefinitions>
                             <RowDefinition Height="Auto" />
@@ -783,8 +981,11 @@
                                    TextWrapping="Wrap"
                                    Foreground="{StaticResource MutedBrush}" />
                     </Grid>
-                </TabItem>
-            </TabControl>
+                </avalonDock:LayoutDocument>
+                        </avalonDock:LayoutDocumentPane>
+                    </avalonDock:LayoutPanel>
+                </avalonDock:LayoutRoot>
+            </avalonDock:DockingManager>
         </Grid>
 
         <Border Grid.Row="3"

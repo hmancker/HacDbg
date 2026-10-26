@@ -38,11 +38,21 @@ extern "C"
  */
 typedef enum _HACDBG_TRACE_ACTION
 {
-    HacDbgTraceActionContinue = 1,
-    HacDbgTraceActionStepInto = 2,
-    HacDbgTraceActionStepOver = 3,
-    HacDbgTraceActionFocusCommand = 4,
-    HacDbgTraceActionDeviceError = 5
+    HacDbgTraceActionContinue         = 1,
+    HacDbgTraceActionStepInto         = 2,
+    HacDbgTraceActionStepOver         = 3,
+    HacDbgTraceActionFocusCommand     = 4,
+    HacDbgTraceActionDeviceError      = 5,
+    HacDbgTraceActionNextDocument     = 6,
+    HacDbgTraceActionPreviousDocument = 7,
+    HacDbgTraceActionClearOutput      = 8,
+    HacDbgTraceActionDocument1        = 9,
+    HacDbgTraceActionDocument2        = 10,
+    HacDbgTraceActionDocument3        = 11,
+    HacDbgTraceActionDocument4        = 12,
+    HacDbgTraceActionDocument5        = 13,
+    HacDbgTraceActionDocument6        = 14,
+    HacDbgTraceActionDocument7        = 15
 } HACDBG_TRACE_ACTION;
 
 /**

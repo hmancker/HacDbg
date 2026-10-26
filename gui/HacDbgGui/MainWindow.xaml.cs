@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Globalization;
+using System.Security.Principal;
 using System.Text;
 using System.Windows;
 using System.Windows.Controls;
@@ -34,6 +35,9 @@ public partial class MainWindow : FluentWindow
     private readonly ObservableCollection<FlagRow> _flags = new();
     private readonly ObservableCollection<BreakpointRow> _breakpoints = new();
     private readonly List<string> _history = new();
+    private readonly Brush _errorBrush;
+    private readonly Brush _warningBrush;
+    private readonly Brush _mutedBrush;
 
     private HacDbgCore? _core;
     private DispatcherTimer? _timer;
@@ -46,17 +50,20 @@ public partial class MainWindow : FluentWindow
     private readonly bool[] _lastRegisterKnown = new bool[RegisterNames.Length];
     private bool _lastRegistersPaused;
     private bool _lastRegisterSnapshotKnown;
+    private bool _versionWarningReported;
 
     public MainWindow()
     {
         InitializeComponent();
 
-        SolidColorBrush errorBrush = TryFindResource("ErrorBrush") as SolidColorBrush ??
-                                     new SolidColorBrush(Color.FromRgb(0xFF, 0x7B, 0x72));
-        SolidColorBrush warningBrush = TryFindResource("WarningBrush") as SolidColorBrush ??
-                                       new SolidColorBrush(Color.FromRgb(0xE3, 0xB3, 0x41));
+        _errorBrush = TryFindResource("ErrorBrush") as SolidColorBrush ??
+                      new SolidColorBrush(Color.FromRgb(0xFF, 0x7B, 0x72));
+        _warningBrush = TryFindResource("WarningBrush") as SolidColorBrush ??
+                        new SolidColorBrush(Color.FromRgb(0xE3, 0xB3, 0x41));
+        _mutedBrush = TryFindResource("MutedBrush") as SolidColorBrush ??
+                      new SolidColorBrush(Color.FromRgb(0x8B, 0x98, 0xA5));
         CommandOutput.TextArea.TextView.LineTransformers.Add(
-            new CommandOutputColorizer(errorBrush, warningBrush));
+            new CommandOutputColorizer(_errorBrush, _warningBrush));
 
         foreach (string name in RegisterNames)
         {
@@ -71,8 +78,10 @@ public partial class MainWindow : FluentWindow
         RegisterGrid.ItemsSource = _registers;
         FlagsGrid.ItemsSource = _flags;
         BreakpointGrid.ItemsSource = _breakpoints;
+        InitializeDockLayout();
         InitializeStructuredViews();
         InitializeTrace();
+        InitializeCommandChrome();
     }
 
     private async void MainWindow_Loaded(object sender, RoutedEventArgs e)
@@ -81,6 +90,8 @@ public partial class MainWindow : FluentWindow
         {
             return;
         }
+
+        RestoreGuiState();
 
         _timer = new DispatcherTimer
         {
@@ -93,10 +104,12 @@ public partial class MainWindow : FluentWindow
         if (App.StartWithoutCore)
         {
             StatusText.Text = "UI only";
+            GuiDiagnostics.Write("startup", "started with --no-connect");
             Focus();
             return;
         }
 
+        GuiDiagnostics.Write("startup", "connecting to HacDbgCore");
         await StartCoreAsync();
     }
 
@@ -107,9 +120,19 @@ public partial class MainWindow : FluentWindow
 
         try
         {
+            if (IsAdministrator() == false)
+            {
+                AppendError("GUI 未以管理员身份运行，无法连接驱动。请从 UAC 提示中允许提权后重试。");
+                GuiDiagnostics.Write("core start", "process is not elevated");
+                StatusText.Text = "未连接";
+                return;
+            }
+
             if (HacDbgCore.ValidateAbi() == false)
             {
-                AppendError("core API or structure layout mismatch");
+                AppendError("HacDbgCore.dll 的核心 ABI 或结构布局与 GUI 不匹配，请使用同一版本重新构建。");
+                GuiDiagnostics.Write("core start", "core ABI mismatch");
+                StatusText.Text = "未连接";
                 return;
             }
 
@@ -119,12 +142,14 @@ public partial class MainWindow : FluentWindow
                 {
                     _traceDeviceError = true;
                     SetTraceError("HacDbgTrace.dll ABI 不匹配，实时 trace 已禁用。");
+                    GuiDiagnostics.Write("trace start", "trace ABI mismatch");
                 }
             }
             catch (Exception error)
             {
                 _traceDeviceError = true;
                 SetTraceError($"HacDbgTrace.dll 无法加载: {error.Message}");
+                GuiDiagnostics.WriteException("trace start", error);
             }
 
             HacDbgCore core = new(OnCoreOutput);
@@ -134,7 +159,8 @@ public partial class MainWindow : FluentWindow
 
             if (status != 0)
             {
-                AppendError($"core start failed (status {status})");
+                AppendError(DescribeCoreStartFailure(status));
+                GuiDiagnostics.Write("core start", $"status {status}");
                 StatusText.Text = "未连接";
                 return;
             }
@@ -145,20 +171,24 @@ public partial class MainWindow : FluentWindow
             CommandInput.Focus();
             RequestModules();
             RequestProcesses();
+            GuiDiagnostics.Write("core start", "connected");
         }
         catch (DllNotFoundException)
         {
-            AppendError("HacDbgCore.dll is missing from the application directory");
+            AppendError("缺少 HacDbgCore.dll；请把完整的发布目录一起复制。");
+            GuiDiagnostics.Write("core start", "HacDbgCore.dll not found");
             StatusText.Text = "未连接";
         }
         catch (BadImageFormatException)
         {
-            AppendError("HacDbgCore.dll has the wrong architecture or is not a valid DLL");
+            AppendError("HacDbgCore.dll 的体系结构不匹配或文件无效；GUI 必须是 x64。");
+            GuiDiagnostics.Write("core start", "HacDbgCore.dll has an invalid image format");
             StatusText.Text = "未连接";
         }
         catch (Exception error)
         {
-            AppendError(error.Message);
+            GuiDiagnostics.WriteException("core start exception", error);
+            AppendError($"连接失败：{error.Message}");
             StatusText.Text = "未连接";
         }
         finally
@@ -175,6 +205,7 @@ public partial class MainWindow : FluentWindow
     private void Timer_Tick(object? sender, EventArgs e)
     {
         DrainOutput();
+        PollCompletions();
 
         if (_started == false || _core is null)
         {
@@ -292,6 +323,7 @@ public partial class MainWindow : FluentWindow
         VersionText.Text = driverVersion.Length == 0
             ? $"usermode {userVersion} / hypervisor —"
             : $"usermode {userVersion} / hypervisor {driverVersion}";
+        UpdateVersionWarning(state, userVersion, driverVersion);
 
         Cr3Text.Text = paused ? $"CR3 {state.Registers.Cr3:X16}" : "CR3 —";
 
@@ -304,6 +336,45 @@ public partial class MainWindow : FluentWindow
         StepIntoButton.IsEnabled = running;
         StepOverButton.IsEnabled = running;
         CancelButton.IsEnabled = running;
+    }
+
+    private void UpdateVersionWarning(HacDbgCoreState state, string userVersion, string driverVersion)
+    {
+        bool versionMismatch = userVersion.Length != 0 &&
+                               driverVersion.Length != 0 &&
+                               string.Equals(userVersion, driverVersion, StringComparison.Ordinal) == false;
+        bool hypercallMismatch = state.Initialized != 0 &&
+                                 state.HypercallAbiVersion != HacDbgCore.ExpectedHypercallAbiVersion;
+
+        if (versionMismatch || hypercallMismatch)
+        {
+            VersionText.Foreground = _warningBrush;
+
+            if (_versionWarningReported == false)
+            {
+                _versionWarningReported = true;
+
+                if (versionMismatch)
+                {
+                    AppendWarning(
+                        $"usermode {userVersion} 与 hypervisor {driverVersion} 版本不一致，" +
+                        "部分功能可能不可用；请使用同一次构建的程序和驱动。");
+                    GuiDiagnostics.Write("version", $"usermode {userVersion}, hypervisor {driverVersion}");
+                }
+
+                if (hypercallMismatch)
+                {
+                    AppendWarning(
+                        $"hypercall ABI {state.HypercallAbiVersion} 与 GUI 期望的 " +
+                        $"{HacDbgCore.ExpectedHypercallAbiVersion} 不一致。");
+                    GuiDiagnostics.Write("version", $"hypercall ABI {state.HypercallAbiVersion}");
+                }
+            }
+
+            return;
+        }
+
+        VersionText.Foreground = _mutedBrush;
     }
 
     private void UpdateRegisters(HacDbgCoreState state, bool paused)
@@ -520,6 +591,23 @@ public partial class MainWindow : FluentWindow
         CommandOutput.ScrollToEnd();
     }
 
+    private void AppendWarning(string message)
+    {
+        CommandOutput.AppendText($"warn, {message}\n");
+        CommandOutput.ScrollToEnd();
+    }
+
+    private void AppendInfo(string message)
+    {
+        CommandOutput.AppendText($"{message}\n");
+        CommandOutput.ScrollToEnd();
+    }
+
+    internal void ReportUnhandledException(Exception error)
+    {
+        AppendError($"界面发生未处理异常：{error.Message}。详细日志：{GuiDiagnostics.LogPath}");
+    }
+
     private void CommandInput_KeyDown(object sender, KeyEventArgs e)
     {
         if (e.Key != Key.Enter)
@@ -535,38 +623,7 @@ public partial class MainWindow : FluentWindow
 
     private void CommandInput_PreviewKeyDown(object sender, KeyEventArgs e)
     {
-        if (e.Key != Key.Up && e.Key != Key.Down)
-        {
-            return;
-        }
-
-        if (_history.Count == 0)
-        {
-            e.Handled = true;
-            return;
-        }
-
-        if (e.Key == Key.Up)
-        {
-            if (_historyIndex > 0)
-            {
-                _historyIndex--;
-            }
-
-            CommandInput.Text = _history[_historyIndex];
-        }
-        else
-        {
-            if (_historyIndex < _history.Count)
-            {
-                _historyIndex++;
-            }
-
-            CommandInput.Text = _historyIndex == _history.Count ? string.Empty : _history[_historyIndex];
-        }
-
-        CommandInput.CaretIndex = CommandInput.Text.Length;
-        e.Handled = true;
+        HandleCommandInputKey(e);
     }
 
     private void ContinueButton_Click(object sender, RoutedEventArgs e)
@@ -592,21 +649,84 @@ public partial class MainWindow : FluentWindow
     private void MainWindow_PreviewKeyDown(object sender, KeyEventArgs e)
     {
         Key key = e.Key == Key.System ? e.SystemKey : e.Key;
+        ModifierKeys modifiers = Keyboard.Modifiers;
+        bool control = (modifiers & ModifierKeys.Control) != 0;
+        bool shift = (modifiers & ModifierKeys.Shift) != 0;
+
+        if (HandleSearchShortcut(key, control, shift))
+        {
+            e.Handled = true;
+            return;
+        }
+
+        if (control && key == Key.L)
+        {
+            e.Handled = true;
+            CloseCompletion();
+            CommandOutput.Clear();
+            return;
+        }
+
+        if (control && key == Key.Tab)
+        {
+            e.Handled = true;
+            CloseCompletion();
+            CycleDocument(shift ? -1 : 1);
+            return;
+        }
+
+        if (control && key >= Key.D1 && key <= Key.D7)
+        {
+            int index = (int)key - (int)Key.D1;
+
+            if (index >= 0 && index < DefaultDockDocuments.Length)
+            {
+                e.Handled = true;
+                CloseCompletion();
+                ActivateDocument(DefaultDockDocuments[index].ContentId);
+            }
+
+            return;
+        }
+
+        if (control && key >= Key.NumPad1 && key <= Key.NumPad7)
+        {
+            int index = (int)key - (int)Key.NumPad1;
+
+            if (index >= 0 && index < DefaultDockDocuments.Length)
+            {
+                e.Handled = true;
+                CloseCompletion();
+                ActivateDocument(DefaultDockDocuments[index].ContentId);
+            }
+
+            return;
+        }
+
+        if (key == Key.Escape && CommandInput.IsKeyboardFocusWithin == false)
+        {
+            e.Handled = true;
+            FocusCommandInput();
+            return;
+        }
 
         switch (key)
         {
             case Key.F5:
                 e.Handled = true;
+                CloseCompletion();
                 ExecuteCommand("g");
                 break;
 
             case Key.F10:
                 e.Handled = true;
+                CloseCompletion();
                 ExecuteCommand("p");
                 break;
 
             case Key.F11:
                 e.Handled = true;
+                CloseCompletion();
                 ExecuteCommand("t");
                 break;
         }
@@ -615,6 +735,11 @@ public partial class MainWindow : FluentWindow
     private void ClearButton_Click(object sender, RoutedEventArgs e)
     {
         CommandOutput.Clear();
+    }
+
+    private void ResetLayoutButton_Click(object sender, RoutedEventArgs e)
+    {
+        ResetDockLayout();
     }
 
     private void MainWindow_Closing(object? sender, CancelEventArgs e)
@@ -626,6 +751,8 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
+        ReleaseCommandChrome();
+        SaveGuiState();
         _timer?.Stop();
         _timer = null;
         StopTracePolling();
@@ -633,6 +760,26 @@ public partial class MainWindow : FluentWindow
         _core?.Dispose();
         _core = null;
         _started = false;
+    }
+
+    private static bool IsAdministrator()
+    {
+        using WindowsIdentity identity = WindowsIdentity.GetCurrent();
+        WindowsPrincipal principal = new(identity);
+        return principal.IsInRole(WindowsBuiltInRole.Administrator);
+    }
+
+    private static string DescribeCoreStartFailure(uint status)
+    {
+        return status switch
+        {
+            HacDbgCore.StatusArgument => "核心启动参数无效。请使用完整发布目录重新运行。",
+            HacDbgCore.StatusState => "核心处于无效状态，无法启动调试会话。",
+            HacDbgCore.StatusDriver =>
+                "未连接到 HacDbg 驱动。请先加载与 GUI 同版本的驱动，并确认进程具有管理员权限。",
+            HacDbgCore.StatusException => "核心启动时发生内部异常。请查看 GUI 日志和驱动调试输出。",
+            _ => $"核心启动失败 (status {status})。"
+        };
     }
 
     private readonly record struct OutputRecord(uint Kind, string Text);

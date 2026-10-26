@@ -10835,7 +10835,7 @@ static const char* debugger_command_names[] = {
 	"r", "rgpm", "rgvm", "rkh", "t", "tc", "tct", "tt", "u", "version", "wgpm", "wgvm", "x",
 };
 
-static void collect_completions(const std::string& token, std::vector<std::string>& matches)
+void commands::collect_completions(const std::string& token, std::vector<std::string>& matches)
 {
 	matches.clear();
 	const std::size_t bang = token.find('!');
@@ -10942,7 +10942,7 @@ static std::uint8_t apply_completion(std::string& line, std::size_t& cursor)
 	const std::size_t token_stop = token_end == std::string::npos ? line.size() : token_end;
 	const std::string token = line.substr(token_begin, token_stop - token_begin);
 	std::vector<std::string> matches = {};
-	collect_completions(token, matches);
+	commands::collect_completions(token, matches);
 
 	if (matches.empty() == true)
 	{

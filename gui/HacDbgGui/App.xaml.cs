@@ -1,6 +1,6 @@
 using System.Windows;
+using System.Windows.Threading;
 using HacDbgGui.Interop;
-using Wpf.Ui.Appearance;
 
 namespace HacDbgGui;
 
@@ -27,7 +27,48 @@ public partial class App : Application
             return;
         }
 
-        ApplicationThemeManager.Apply(ApplicationTheme.Dark);
+        GuiDiagnostics.Initialize();
+        DispatcherUnhandledException += App_DispatcherUnhandledException;
+        AppDomain.CurrentDomain.UnhandledException += AppDomain_UnhandledException;
+        TaskScheduler.UnobservedTaskException += TaskScheduler_UnobservedTaskException;
+        GuiTheme.Apply(GuiTheme.ReadSavedIsLight());
         base.OnStartup(e);
+    }
+
+    private void App_DispatcherUnhandledException(object sender, DispatcherUnhandledExceptionEventArgs e)
+    {
+        GuiDiagnostics.WriteException("dispatcher", e.Exception);
+
+        if (MainWindow is HacDbgGui.MainWindow mainWindow)
+        {
+            try
+            {
+                mainWindow.ReportUnhandledException(e.Exception);
+            }
+            catch (Exception reportError)
+            {
+                GuiDiagnostics.WriteException("dispatcher report", reportError);
+            }
+
+            e.Handled = true;
+        }
+    }
+
+    private static void AppDomain_UnhandledException(object sender, UnhandledExceptionEventArgs e)
+    {
+        if (e.ExceptionObject is Exception error)
+        {
+            GuiDiagnostics.WriteException("appdomain", error);
+        }
+        else
+        {
+            GuiDiagnostics.Write("appdomain", "unhandled non-exception failure");
+        }
+    }
+
+    private static void TaskScheduler_UnobservedTaskException(object? sender, UnobservedTaskExceptionEventArgs e)
+    {
+        GuiDiagnostics.WriteException("unobserved task", e.Exception);
+        e.SetObserved();
     }
 }

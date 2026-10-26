@@ -58,6 +58,53 @@ namespace
 
 		if (trace != nullptr && message == WM_KEYDOWN)
 		{
+			const bool control = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+			const bool shift = (GetKeyState(VK_SHIFT) & 0x8000) != 0;
+
+			if (control)
+			{
+				switch (wparam)
+				{
+				case VK_TAB:
+					trace_invoke_action(trace, shift ? HacDbgTraceActionPreviousDocument
+					                                 : HacDbgTraceActionNextDocument);
+					return 0;
+
+				case 'L':
+					trace_invoke_action(trace, HacDbgTraceActionClearOutput);
+					return 0;
+
+				case '1':
+				case '2':
+				case '3':
+				case '4':
+				case '5':
+				case '6':
+				case '7':
+					trace_invoke_action(
+						trace,
+						static_cast<uint32_t>(HacDbgTraceActionDocument1) +
+							(static_cast<uint32_t>(wparam) - '1'));
+					return 0;
+
+				case VK_NUMPAD1:
+				case VK_NUMPAD2:
+				case VK_NUMPAD3:
+				case VK_NUMPAD4:
+				case VK_NUMPAD5:
+				case VK_NUMPAD6:
+				case VK_NUMPAD7:
+					trace_invoke_action(
+						trace,
+						static_cast<uint32_t>(HacDbgTraceActionDocument1) +
+							(static_cast<uint32_t>(wparam) - VK_NUMPAD1));
+					return 0;
+
+				default:
+					break;
+				}
+			}
+
 			switch (wparam)
 			{
 			case VK_F5:
@@ -71,6 +118,18 @@ namespace
 			case VK_F11:
 				trace_invoke_action(trace, HacDbgTraceActionStepInto);
 				return 0;
+
+			case VK_ESCAPE:
+				// Let ImGui close popups or edit text before returning focus to WPF.
+				if (ImGui::GetCurrentContext() != nullptr &&
+				    ImGui::GetIO().WantTextInput == false &&
+				    ImGui::IsPopupOpen(nullptr,
+				                       ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel) == false)
+				{
+					trace_invoke_action(trace, HacDbgTraceActionFocusCommand);
+					return 0;
+				}
+				break;
 
 			default:
 				break;

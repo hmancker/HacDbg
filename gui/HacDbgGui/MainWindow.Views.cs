@@ -840,7 +840,7 @@ public partial class MainWindow
             return;
         }
 
-        ViewTabs.SelectedItem = DisassemblyTab;
+        ActivateDocument("disassembly");
         DisassemblyAddressBox.Text = $"0x{address:X16}";
         DisassemblyCr3Box.Text = cr3 == 0 ? string.Empty : $"0x{cr3:X16}";
         RequestDisassemblyPage(address, cr3, true);
@@ -853,7 +853,7 @@ public partial class MainWindow
             return;
         }
 
-        ViewTabs.SelectedItem = MemoryTab;
+        ActivateDocument("memory");
         MemoryAddressBox.Text = $"0x{address:X16}";
         MemoryCr3Box.Text = cr3 == 0 ? string.Empty : $"0x{cr3:X16}";
         RequestMemoryPage(address, cr3);

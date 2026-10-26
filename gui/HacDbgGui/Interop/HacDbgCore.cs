@@ -1,4 +1,5 @@
 using System.Runtime.InteropServices;
+using System.Text;
 
 namespace HacDbgGui.Interop;
 
@@ -206,8 +207,31 @@ internal struct HacDbgCoreTraceStatus
     public uint Reserved;
 }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct HacDbgCoreCompletion
+{
+    [MarshalAs(UnmanagedType.ByValArray, SizeConst = 512)]
+    public byte[] Text;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct HacDbgCoreCompletionStatus
+{
+    public ulong RequestId;
+    public ulong CompletedRequestId;
+    public uint Pending;
+    public uint Failed;
+    public uint Count;
+    public uint Total;
+}
+
 internal sealed class HacDbgCore : IDisposable
 {
+    public const uint StatusArgument = 1;
+    public const uint StatusState = 2;
+    public const uint StatusDriver = 3;
+    public const uint StatusException = 4;
+    public const uint ExpectedHypercallAbiVersion = 1;
     public const uint ViewModules = 0;
     public const uint ViewProcesses = 1;
     public const uint ViewThreads = 2;
@@ -225,6 +249,10 @@ internal sealed class HacDbgCore : IDisposable
     public const uint StructureResolvedAddress = 7;
     public const uint StructureTraceStatus = 8;
     public const uint StructureTraceSnapshot = 9;
+    public const uint StructureCompletion = 10;
+    public const uint StructureCompletionStatus = 11;
+    public const int MaxCompletions = 128;
+    public const int CompletionSize = 512;
     public const int MaxModules = 512;
     public const int MaxProcesses = 512;
     public const int MaxThreads = 512;
@@ -274,7 +302,7 @@ internal sealed class HacDbgCore : IDisposable
         static bool Matches<T>(uint structure) where T : struct =>
             GetStructureSize(structure) == (uint)Marshal.SizeOf<T>();
 
-        return ApiVersion == 3 &&
+        return ApiVersion == 4 &&
                StateSize == (uint)Marshal.SizeOf<HacDbgCoreState>() &&
                Matches<HacDbgCoreViewStatus>(StructureViewStatus) &&
                Matches<HacDbgCoreModule>(StructureModule) &&
@@ -285,7 +313,9 @@ internal sealed class HacDbgCore : IDisposable
                Matches<HacDbgCoreInstruction>(StructureInstruction) &&
                Matches<HacDbgCoreResolvedAddress>(StructureResolvedAddress) &&
                Matches<HacDbgCoreTraceStatus>(StructureTraceStatus) &&
-               GetStructureSize(StructureTraceSnapshot) == TraceSnapshotSize;
+               GetStructureSize(StructureTraceSnapshot) == TraceSnapshotSize &&
+               Matches<HacDbgCoreCompletion>(StructureCompletion) &&
+               Matches<HacDbgCoreCompletionStatus>(StructureCompletionStatus);
     }
 
     public uint Start() => NativeMethods.HacDbgCoreStart(_handle);
@@ -349,6 +379,79 @@ internal sealed class HacDbgCore : IDisposable
 
     public uint CopyTraceSnapshot(IntPtr snapshot) =>
         NativeMethods.HacDbgCoreCopyTraceSnapshot(_handle, snapshot);
+
+    public static uint CompleteCommands(string token, out string[] matches)
+    {
+        matches = Array.Empty<string>();
+        HacDbgCoreCompletion[] items = NewCompletionBuffer(MaxCompletions);
+        uint status = NativeMethods.HacDbgCoreCompleteCommands(token, items, (uint)items.Length, out uint count);
+
+        if (status == 0)
+        {
+            matches = DecodeCompletions(items, count);
+        }
+
+        return status;
+    }
+
+    public ulong RequestCompletions(string token) => NativeMethods.HacDbgCoreRequestCompletions(_handle, token);
+
+    public uint GetCompletionStatus(out HacDbgCoreCompletionStatus status) =>
+        NativeMethods.HacDbgCoreGetCompletionStatus(_handle, out status);
+
+    public uint CopyCompletions(ulong requestId, uint count, out string[] matches)
+    {
+        matches = Array.Empty<string>();
+
+        if (count == 0)
+        {
+            return 0;
+        }
+
+        uint capacity = Math.Min(count, (uint)MaxCompletions);
+        HacDbgCoreCompletion[] items = NewCompletionBuffer(capacity);
+        uint status = NativeMethods.HacDbgCoreCopyCompletions(_handle, requestId, items, capacity, out uint copied);
+
+        if (status == 0)
+        {
+            matches = DecodeCompletions(items, copied);
+        }
+
+        return status;
+    }
+
+    private static HacDbgCoreCompletion[] NewCompletionBuffer(uint capacity)
+    {
+        HacDbgCoreCompletion[] items = new HacDbgCoreCompletion[capacity];
+
+        for (int index = 0; index < items.Length; index++)
+        {
+            items[index].Text = new byte[CompletionSize];
+        }
+
+        return items;
+    }
+
+    private static string[] DecodeCompletions(HacDbgCoreCompletion[] items, uint count)
+    {
+        int length = (int)Math.Min(count, (uint)items.Length);
+        string[] matches = new string[length];
+
+        for (int index = 0; index < length; index++)
+        {
+            byte[] bytes = items[index].Text ?? Array.Empty<byte>();
+            int textLength = Array.IndexOf(bytes, (byte)0);
+
+            if (textLength < 0)
+            {
+                textLength = bytes.Length;
+            }
+
+            matches[index] = Encoding.UTF8.GetString(bytes, 0, textLength);
+        }
+
+        return matches;
+    }
 
     public void Dispose()
     {
@@ -478,5 +581,28 @@ internal sealed class HacDbgCore : IDisposable
 
         [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
         internal static extern uint HacDbgCoreCopyTraceSnapshot(IntPtr core, IntPtr snapshot);
+
+        [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern uint HacDbgCoreCompleteCommands(
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string token,
+            [Out] HacDbgCoreCompletion[] items,
+            uint capacity,
+            out uint count);
+
+        [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern ulong HacDbgCoreRequestCompletions(
+            IntPtr core,
+            [MarshalAs(UnmanagedType.LPUTF8Str)] string token);
+
+        [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern uint HacDbgCoreGetCompletionStatus(IntPtr core, out HacDbgCoreCompletionStatus status);
+
+        [DllImport("HacDbgCore.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+        internal static extern uint HacDbgCoreCopyCompletions(
+            IntPtr core,
+            ulong requestId,
+            [Out] HacDbgCoreCompletion[] items,
+            uint capacity,
+            out uint count);
     }
 }

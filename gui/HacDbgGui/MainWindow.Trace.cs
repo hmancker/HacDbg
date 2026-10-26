@@ -100,6 +100,7 @@ public partial class MainWindow
             if (_tracePollFaulted == false)
             {
                 _tracePollFaulted = true;
+                GuiDiagnostics.WriteException("trace polling", error);
                 SetTraceError($"实时 trace 状态读取失败: {error.Message}");
             }
         }
@@ -300,6 +301,14 @@ public partial class MainWindow
 
     private void TraceViewHost_ActionRequested(object? sender, TraceActionEventArgs e)
     {
+        if (e.Action >= HacDbgTraceNative.ActionDocument1 &&
+            e.Action < HacDbgTraceNative.ActionDocument1 + DefaultDockDocuments.Length)
+        {
+            int index = (int)(e.Action - HacDbgTraceNative.ActionDocument1);
+            ActivateDocument(DefaultDockDocuments[index].ContentId);
+            return;
+        }
+
         switch (e.Action)
         {
             case HacDbgTraceNative.ActionContinue:
@@ -318,8 +327,23 @@ public partial class MainWindow
                 FocusCommandInput();
                 break;
 
+            case HacDbgTraceNative.ActionNextDocument:
+                CycleDocument(1);
+                break;
+
+            case HacDbgTraceNative.ActionPreviousDocument:
+                CycleDocument(-1);
+                break;
+
+            case HacDbgTraceNative.ActionClearOutput:
+                CommandOutput.Clear();
+                break;
+
             case HacDbgTraceNative.ActionDeviceError:
                 _traceDeviceError = true;
+                GuiDiagnostics.Write(
+                    "trace renderer",
+                    $"device error 0x{HacDbgTraceNative.LastError:X8}");
                 SetTraceError(
                     $"trace 渲染器已停止 (0x{HacDbgTraceNative.LastError:X8})。" +
                     "重新打开 GUI 可重建 D3D11 设备。");
@@ -331,6 +355,7 @@ public partial class MainWindow
     private void TraceViewHost_InitializationFailed(string message)
     {
         _traceDeviceError = true;
+        GuiDiagnostics.Write("trace renderer", message);
         SetTraceError(message);
         TraceViewHost.Visibility = Visibility.Collapsed;
     }

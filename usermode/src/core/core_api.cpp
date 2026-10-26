@@ -46,6 +46,13 @@ struct core_view_request_t
 	std::uint8_t pending = 0;
 };
 
+struct core_completion_request_t
+{
+	std::uint64_t id = 0;
+	std::string token = {};
+	std::uint8_t pending = 0;
+};
+
 struct HACDBG_CORE
 {
 	std::mutex command_mutex;
@@ -64,6 +71,11 @@ struct HACDBG_CORE
 	std::array<core_view_request_t, static_cast<std::size_t>(HacDbgViewCount)> view_requests = {};
 	std::array<HACDBG_CORE_VIEW_STATUS, static_cast<std::size_t>(HacDbgViewCount)> view_status = {};
 	std::uint64_t next_view_request_id = 1;
+	core_completion_request_t completion_request = {};
+	HACDBG_CORE_COMPLETION_STATUS completion_status = {};
+	std::vector<std::string> completion_matches = {};
+	std::uint32_t completion_total = 0;
+	std::uint64_t next_completion_request_id = 1;
 
 	HACDBG_CORE_MODULE modules[HACDBG_CORE_MAX_MODULES] = {};
 	std::uint32_t module_count = 0;
@@ -141,6 +153,13 @@ namespace
 		}
 
 		return false;
+	}
+
+	bool has_pending_completion(HACDBG_CORE* const core)
+	{
+		std::lock_guard<std::mutex> lock(core->view_mutex);
+
+		return core->completion_request.pending != 0;
 	}
 
 	bool take_view_request(HACDBG_CORE* const core, core_view_request_t& request_out)
@@ -790,7 +809,8 @@ namespace
 				core->command_ready.wait_for(lock, wait_interval, [core]
 				{
 					return core->running.load() == 0 || core->commands.empty() == false ||
-					       has_pending_view(core) || has_pending_trace(core);
+					       has_pending_view(core) || has_pending_completion(core) ||
+					       has_pending_trace(core);
 				});
 
 				if (core->running.load() == 0)
@@ -825,6 +845,74 @@ namespace
 					output::write(output::kind_t::quit, {});
 					core->running.store(0);
 					break;
+				}
+
+				continue;
+			}
+
+			if (has_pending_completion(core) == true)
+			{
+				std::string token = {};
+				std::uint64_t request_id = 0;
+
+				{
+					std::lock_guard<std::mutex> lock(core->view_mutex);
+
+					if (core->completion_request.pending != 0)
+					{
+						token = core->completion_request.token;
+						request_id = core->completion_request.id;
+						core->completion_request.pending = 0;
+					}
+				}
+
+				if (request_id != 0)
+				{
+					std::vector<std::string> matches = {};
+					std::string error = {};
+
+					try
+					{
+						commands::collect_completions(token, matches);
+					}
+					catch (const std::exception& exception)
+					{
+						error = exception.what();
+					}
+					catch (...)
+					{
+						error = "completion failed";
+					}
+
+					std::lock_guard<std::mutex> lock(core->view_mutex);
+
+					if (core->completion_request.id == request_id)
+					{
+						core->completion_matches.clear();
+						core->completion_total = static_cast<std::uint32_t>(
+							(std::min)(matches.size(), static_cast<std::size_t>(0xffffffffu)));
+
+						for (const std::string& match : matches)
+						{
+							if (core->completion_matches.size() >= HACDBG_CORE_MAX_COMPLETIONS)
+							{
+								break;
+							}
+
+							if (match.size() >= HACDBG_CORE_COMPLETION_SIZE)
+							{
+								continue;
+							}
+
+							core->completion_matches.push_back(match);
+						}
+
+						core->completion_status.CompletedRequestId = request_id;
+						core->completion_status.Pending = core->completion_request.pending;
+						core->completion_status.Failed = error.empty() == true ? 0u : 1u;
+						core->completion_status.Count = static_cast<std::uint32_t>(core->completion_matches.size());
+						core->completion_status.Total = core->completion_total;
+					}
 				}
 
 				continue;
@@ -911,6 +999,12 @@ uint32_t HacDbgCoreStructureSize(const uint32_t structure)
 	case HacDbgStructureTraceSnapshot:
 		return static_cast<uint32_t>(sizeof(HACDBG_TRACE_SNAPSHOT));
 
+	case HacDbgStructureCompletion:
+		return static_cast<uint32_t>(sizeof(HACDBG_CORE_COMPLETION));
+
+	case HacDbgStructureCompletionStatus:
+		return static_cast<uint32_t>(sizeof(HACDBG_CORE_COMPLETION_STATUS));
+
 	default:
 		return 0;
 	}
@@ -983,6 +1077,11 @@ uint32_t HacDbgCoreStart(HACDBG_CORE* const core)
 			core->view_requests = {};
 			core->view_status = {};
 			core->next_view_request_id = 1;
+			core->completion_request = {};
+			core->completion_status = {};
+			core->completion_matches.clear();
+			core->completion_total = 0;
+			core->next_completion_request_id = 1;
 		}
 
 		{
@@ -1095,6 +1194,9 @@ uint32_t HacDbgCoreStop(HACDBG_CORE* const core)
 		{
 			status.Pending = 0;
 		}
+
+		core->completion_request.pending = 0;
+		core->completion_status.Pending = 0;
 	}
 
 	output::set_sink(nullptr, nullptr);
@@ -1547,6 +1649,136 @@ uint32_t HacDbgCoreCopyTraceSnapshot(HACDBG_CORE* const core, HACDBG_TRACE_SNAPS
 	}
 
 	*snapshot_out = core->trace_snapshots[core->trace_snapshot_active];
+
+	return HacDbgCoreStatusOk;
+}
+
+namespace
+{
+	std::uint32_t copy_completion_matches(const std::vector<std::string>& matches,
+	                                      HACDBG_CORE_COMPLETION* const items, const std::uint32_t capacity)
+	{
+		std::uint32_t copied = 0;
+
+		for (const std::string& match : matches)
+		{
+			if (copied >= capacity)
+			{
+				break;
+			}
+
+			if (match.size() >= HACDBG_CORE_COMPLETION_SIZE)
+			{
+				continue;
+			}
+
+			copy_text(items[copied].Text, match);
+			copied += 1;
+		}
+
+		return copied;
+	}
+}
+
+uint32_t HacDbgCoreCompleteCommands(const char* const utf8_token, HACDBG_CORE_COMPLETION* const items,
+                                    const uint32_t capacity, uint32_t* const count_out)
+{
+	if (utf8_token == nullptr || items == nullptr || count_out == nullptr || capacity == 0)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	if (std::strchr(utf8_token, '!') != nullptr)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	try
+	{
+		std::vector<std::string> matches = {};
+		commands::collect_completions(utf8_token, matches);
+		*count_out = copy_completion_matches(matches, items, capacity);
+
+		return HacDbgCoreStatusOk;
+	}
+	catch (const std::exception&)
+	{
+		return HacDbgCoreStatusException;
+	}
+}
+
+uint64_t HacDbgCoreRequestCompletions(HACDBG_CORE* const core, const char* const utf8_token)
+{
+	if (core == nullptr || utf8_token == nullptr || core->running.load() == 0)
+	{
+		return 0;
+	}
+
+	std::uint64_t id = 0;
+
+	try
+	{
+		{
+			std::lock_guard<std::mutex> lock(core->view_mutex);
+
+			if (core->next_completion_request_id == 0)
+			{
+				core->next_completion_request_id = 1;
+			}
+
+			id = core->next_completion_request_id++;
+			core->completion_request.id = id;
+			core->completion_request.token = utf8_token;
+			core->completion_request.pending = 1;
+			core->completion_status.RequestId = id;
+			core->completion_status.Pending = 1;
+			core->completion_status.Failed = 0;
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(core->command_mutex);
+		}
+
+		core->command_ready.notify_one();
+
+		return id;
+	}
+	catch (const std::exception&)
+	{
+		return 0;
+	}
+}
+
+uint32_t HacDbgCoreGetCompletionStatus(HACDBG_CORE* const core, HACDBG_CORE_COMPLETION_STATUS* const status_out)
+{
+	if (core == nullptr || status_out == nullptr)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	std::lock_guard<std::mutex> lock(core->view_mutex);
+	*status_out = core->completion_status;
+
+	return HacDbgCoreStatusOk;
+}
+
+uint32_t HacDbgCoreCopyCompletions(HACDBG_CORE* const core, const uint64_t request_id,
+                                   HACDBG_CORE_COMPLETION* const items, const uint32_t capacity,
+                                   uint32_t* const count_out)
+{
+	if (core == nullptr || items == nullptr || count_out == nullptr || request_id == 0 || capacity == 0)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	std::lock_guard<std::mutex> lock(core->view_mutex);
+
+	if (core->completion_status.Pending != 0 || core->completion_status.CompletedRequestId != request_id)
+	{
+		return HacDbgCoreStatusState;
+	}
+
+	*count_out = copy_completion_matches(core->completion_matches, items, capacity);
 
 	return HacDbgCoreStatusOk;
 }

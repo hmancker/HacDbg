@@ -30,6 +30,10 @@ internal static class HacDbgTraceNative
     public const uint ActionStepOver = 3;
     public const uint ActionFocusCommand = 4;
     public const uint ActionDeviceError = 5;
+    public const uint ActionNextDocument = 6;
+    public const uint ActionPreviousDocument = 7;
+    public const uint ActionClearOutput = 8;
+    public const uint ActionDocument1 = 9;
 
     [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
     internal delegate void ActionCallback(uint action, IntPtr context);

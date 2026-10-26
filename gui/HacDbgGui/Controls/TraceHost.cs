@@ -49,6 +49,17 @@ public sealed class TraceHost : HwndHost
 
     public IntPtr SnapshotBuffer => _snapshotBuffer;
 
+    public void ApplyTheme()
+    {
+        if (_trace == IntPtr.Zero)
+        {
+            return;
+        }
+
+        HacDbgTraceTheme theme = CreateTheme();
+        HacDbgTraceNative.SetTheme(_trace, ref theme);
+    }
+
     public void PublishSnapshot()
     {
         if (_trace != IntPtr.Zero && _snapshotBuffer != IntPtr.Zero)

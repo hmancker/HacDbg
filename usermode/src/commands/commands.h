@@ -122,4 +122,12 @@ namespace commands
 		                         std::string& error_out);
 		std::uint8_t resolve(std::string_view text, resolved_address_t& address_out, std::string& error_out);
 	}
+
+	//
+	// Fills matches for one whitespace-delimited token. A token without '!'
+	// returns command names from the static table. A token with '!' returns
+	// module!symbol names and may use the symbol parser; call that form only
+	// from the core worker.
+	//
+	void collect_completions(const std::string& token, std::vector<std::string>& matches);
 }

@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
     <TargetFramework>net10.0-windows</TargetFramework>
@@ -13,16 +13,27 @@
     <AssemblyName>HacDbgGui</AssemblyName>
     <RootNamespace>HacDbgGui</RootNamespace>
     <Version>1.1.1</Version>
+    <OutputPath>$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgGui\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+    <SelfContained>true</SelfContained>
+    <TrackFileWritesShareableOutsideOfProjectDirectory>true</TrackFileWritesShareableOutsideOfProjectDirectory>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(_IsPublishing)' == 'true'">
+    <OutputPath>$(MSBuildThisFileDirectory)obj\publish-build\$(Configuration)\</OutputPath>
   </PropertyGroup>
   <PropertyGroup Condition="'$(Configuration)' == 'Release'">
-    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
-    <SelfContained>true</SelfContained>
+    <PublishRuntimeIdentifier>win-x64</PublishRuntimeIdentifier>
+    <PublishSelfContained>true</PublishSelfContained>
     <PublishSingleFile>true</PublishSingleFile>
     <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
     <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
   </PropertyGroup>
   <ItemGroup>
     <PackageReference Include="AvalonEdit" Version="6.3.1.120" />
+    <PackageReference Include="Dirkster.AvalonDock" Version="5.0.1" />
+    <PackageReference Include="Dirkster.AvalonDock.Serializer.Xml" Version="5.0.1" />
+    <PackageReference Include="Dirkster.AvalonDock.Themes.VS2013" Version="5.0.1" />
     <PackageReference Include="WPF-UI" Version="4.3.0" />
   </ItemGroup>
   <ItemGroup>
@@ -37,22 +48,27 @@
                       SkipGetTargetFrameworkProperties="true" />
   </ItemGroup>
   <Target Name="CopyNativeCore" AfterTargets="Build">
+    <PropertyGroup>
+      <_NativeDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\.'))</_NativeDir>
+      <_OutDir>$([System.IO.Path]::GetFullPath('$(TargetDir).'))</_OutDir>
+      <_SameNativeDir>$([System.String]::Equals($(_NativeDir), $(_OutDir), StringComparison.OrdinalIgnoreCase))</_SameNativeDir>
+    </PropertyGroup>
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.dll"
           DestinationFolder="$(TargetDir)"
           SkipUnchangedFiles="true"
-          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.dll')" />
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.dll') and '$(_SameNativeDir)' != 'True'" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.pdb"
           DestinationFolder="$(TargetDir)"
           SkipUnchangedFiles="true"
-          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.pdb')" />
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.pdb') and '$(_SameNativeDir)' != 'True'" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.dll"
           DestinationFolder="$(TargetDir)"
           SkipUnchangedFiles="true"
-          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.dll')" />
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.dll') and '$(_SameNativeDir)' != 'True'" />
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.pdb"
           DestinationFolder="$(TargetDir)"
           SkipUnchangedFiles="true"
-          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.pdb')" />
+          Condition="Exists('$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgTrace.pdb') and '$(_SameNativeDir)' != 'True'" />
   </Target>
   <Target Name="CopyRuntimeFilesToPublish" AfterTargets="Publish">
     <Copy SourceFiles="$(MSBuildThisFileDirectory)..\..\build\x64\$(Configuration)\HacDbgCore.dll"

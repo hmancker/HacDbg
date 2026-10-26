@@ -20,26 +20,28 @@
             <Color x:Key="AccentPressedColor">#2E9FD9</Color>
             <Color x:Key="ErrorColor">#FF7B72</Color>
             <Color x:Key="WarningColor">#E3B341</Color>
+            <Color x:Key="AccentTextColor">#081016</Color>
 
-            <SolidColorBrush x:Key="WindowBackgroundBrush" Color="{StaticResource WindowBackgroundColor}" />
-            <SolidColorBrush x:Key="SurfaceBrush" Color="{StaticResource SurfaceColor}" />
-            <SolidColorBrush x:Key="SurfaceRaisedBrush" Color="{StaticResource SurfaceRaisedColor}" />
-            <SolidColorBrush x:Key="BorderBrush" Color="{StaticResource BorderColor}" />
-            <SolidColorBrush x:Key="ForegroundBrush" Color="{StaticResource ForegroundColor}" />
-            <SolidColorBrush x:Key="MutedBrush" Color="{StaticResource MutedColor}" />
-            <SolidColorBrush x:Key="AccentBrush" Color="{StaticResource AccentColor}" />
-            <SolidColorBrush x:Key="AccentPressedBrush" Color="{StaticResource AccentPressedColor}" />
-            <SolidColorBrush x:Key="ErrorBrush" Color="{StaticResource ErrorColor}" />
-            <SolidColorBrush x:Key="WarningBrush" Color="{StaticResource WarningColor}" />
+            <SolidColorBrush x:Key="WindowBackgroundBrush" Color="{DynamicResource WindowBackgroundColor}" />
+            <SolidColorBrush x:Key="SurfaceBrush" Color="{DynamicResource SurfaceColor}" />
+            <SolidColorBrush x:Key="SurfaceRaisedBrush" Color="{DynamicResource SurfaceRaisedColor}" />
+            <SolidColorBrush x:Key="BorderBrush" Color="{DynamicResource BorderColor}" />
+            <SolidColorBrush x:Key="ForegroundBrush" Color="{DynamicResource ForegroundColor}" />
+            <SolidColorBrush x:Key="MutedBrush" Color="{DynamicResource MutedColor}" />
+            <SolidColorBrush x:Key="AccentBrush" Color="{DynamicResource AccentColor}" />
+            <SolidColorBrush x:Key="AccentPressedBrush" Color="{DynamicResource AccentPressedColor}" />
+            <SolidColorBrush x:Key="ErrorBrush" Color="{DynamicResource ErrorColor}" />
+            <SolidColorBrush x:Key="WarningBrush" Color="{DynamicResource WarningColor}" />
+            <SolidColorBrush x:Key="AccentTextBrush" Color="{DynamicResource AccentTextColor}" />
 
             <Style TargetType="{x:Type TextBlock}">
-                <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
             </Style>
 
             <Style TargetType="{x:Type Button}">
-                <Setter Property="Background" Value="{StaticResource SurfaceRaisedBrush}" />
-                <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
-                <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+                <Setter Property="Background" Value="{DynamicResource SurfaceRaisedBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
+                <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
                 <Setter Property="BorderThickness" Value="1" />
                 <Setter Property="Padding" Value="12,6" />
                 <Setter Property="Margin" Value="0,0,8,0" />
@@ -58,11 +60,11 @@
                             </Border>
                             <ControlTemplate.Triggers>
                                 <Trigger Property="IsMouseOver" Value="True">
-                                    <Setter TargetName="Chrome" Property="Background" Value="{StaticResource AccentPressedBrush}" />
+                                    <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource AccentPressedBrush}" />
                                 </Trigger>
                                 <Trigger Property="IsPressed" Value="True">
-                                    <Setter TargetName="Chrome" Property="Background" Value="{StaticResource AccentBrush}" />
-                                    <Setter Property="Foreground" Value="#081016" />
+                                    <Setter TargetName="Chrome" Property="Background" Value="{DynamicResource AccentBrush}" />
+                                    <Setter Property="Foreground" Value="{DynamicResource AccentTextBrush}" />
                                 </Trigger>
                                 <Trigger Property="IsEnabled" Value="False">
                                     <Setter TargetName="Chrome" Property="Opacity" Value="0.45" />
@@ -74,25 +76,26 @@
             </Style>
 
             <Style TargetType="{x:Type TextBox}">
-                <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
-                <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
-                <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+                <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
+                <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
                 <Setter Property="BorderThickness" Value="1" />
                 <Setter Property="Padding" Value="8,5" />
-                <Setter Property="CaretBrush" Value="{StaticResource AccentBrush}" />
-                <Setter Property="SelectionBrush" Value="{StaticResource AccentPressedBrush}" />
+                <Setter Property="CaretBrush" Value="{DynamicResource AccentBrush}" />
+                <Setter Property="SelectionBrush" Value="{DynamicResource AccentPressedBrush}" />
+                <Setter Property="SelectionTextBrush" Value="{DynamicResource AccentTextBrush}" />
             </Style>
 
             <Style TargetType="{x:Type DataGrid}">
-                <Setter Property="Background" Value="{StaticResource SurfaceBrush}" />
-                <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
-                <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+                <Setter Property="Background" Value="{DynamicResource SurfaceBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
+                <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
                 <Setter Property="BorderThickness" Value="0" />
                 <Setter Property="GridLinesVisibility" Value="None" />
-                <Setter Property="RowBackground" Value="{StaticResource SurfaceBrush}" />
-                <Setter Property="AlternatingRowBackground" Value="{StaticResource SurfaceRaisedBrush}" />
-                <Setter Property="HorizontalGridLinesBrush" Value="{StaticResource BorderBrush}" />
-                <Setter Property="VerticalGridLinesBrush" Value="{StaticResource BorderBrush}" />
+                <Setter Property="RowBackground" Value="{DynamicResource SurfaceBrush}" />
+                <Setter Property="AlternatingRowBackground" Value="{DynamicResource SurfaceRaisedBrush}" />
+                <Setter Property="HorizontalGridLinesBrush" Value="{DynamicResource BorderBrush}" />
+                <Setter Property="VerticalGridLinesBrush" Value="{DynamicResource BorderBrush}" />
                 <Setter Property="HeadersVisibility" Value="Column" />
                 <Setter Property="RowHeaderWidth" Value="0" />
                 <Setter Property="IsReadOnly" Value="True" />
@@ -107,9 +110,9 @@
             </Style>
 
             <Style TargetType="{x:Type DataGridColumnHeader}">
-                <Setter Property="Background" Value="{StaticResource SurfaceRaisedBrush}" />
-                <Setter Property="Foreground" Value="{StaticResource MutedBrush}" />
-                <Setter Property="BorderBrush" Value="{StaticResource BorderBrush}" />
+                <Setter Property="Background" Value="{DynamicResource SurfaceRaisedBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource MutedBrush}" />
+                <Setter Property="BorderBrush" Value="{DynamicResource BorderBrush}" />
                 <Setter Property="BorderThickness" Value="0,0,0,1" />
                 <Setter Property="Padding" Value="8,6" />
                 <Setter Property="HorizontalContentAlignment" Value="Left" />
@@ -117,7 +120,7 @@
 
             <Style TargetType="{x:Type DataGridCell}">
                 <Setter Property="Background" Value="Transparent" />
-                <Setter Property="Foreground" Value="{StaticResource ForegroundBrush}" />
+                <Setter Property="Foreground" Value="{DynamicResource ForegroundBrush}" />
                 <Setter Property="BorderThickness" Value="0" />
                 <Setter Property="Padding" Value="8,3" />
             </Style>

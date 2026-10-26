@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define HACDBG_CORE_API_VERSION 3u
+#define HACDBG_CORE_API_VERSION 4u
 #define HACDBG_CORE_MAX_BREAKPOINTS 64u
 #define HACDBG_CORE_VERSION_STRING_SIZE 32u
 #define HACDBG_CORE_MAX_MODULES 512u
@@ -32,6 +32,8 @@ extern "C"
 #define HACDBG_CORE_MESSAGE_SIZE 192u
 #define HACDBG_CORE_STATE_NAME_SIZE 48u
 #define HACDBG_CORE_WAIT_REASON_SIZE 64u
+#define HACDBG_CORE_MAX_COMPLETIONS 128u
+#define HACDBG_CORE_COMPLETION_SIZE 512u
 
 /**
  * @brief Status returned by the GUI core ABI.
@@ -88,7 +90,9 @@ typedef enum _HACDBG_CORE_STRUCTURE
     HacDbgStructureInstruction = 6,
     HacDbgStructureResolvedAddress = 7,
     HacDbgStructureTraceStatus = 8,
-    HacDbgStructureTraceSnapshot = 9
+    HacDbgStructureTraceSnapshot = 9,
+    HacDbgStructureCompletion = 10,
+    HacDbgStructureCompletionStatus = 11
 } HACDBG_CORE_STRUCTURE;
 
 /**
@@ -401,8 +405,78 @@ uint32_t HacDbgCoreGetTraceStatus(HACDBG_CORE* Core, HACDBG_CORE_TRACE_STATUS* S
  */
 uint32_t HacDbgCoreCopyTraceSnapshot(HACDBG_CORE* Core, HACDBG_TRACE_SNAPSHOT* SnapshotOut);
 
+/**
+ * @brief One completion candidate. Text is a NUL-terminated UTF-8 string.
+ */
+typedef struct _HACDBG_CORE_COMPLETION
+{
+    char Text[HACDBG_CORE_COMPLETION_SIZE];
+} HACDBG_CORE_COMPLETION;
+
+/**
+ * @brief Status of the latest completion request.
+ *
+ * @details Count is the number of candidates stored for copying. Total includes
+ * candidates that were not stored because the buffer or text size was exceeded.
+ */
+typedef struct _HACDBG_CORE_COMPLETION_STATUS
+{
+    uint64_t RequestId;
+    uint64_t CompletedRequestId;
+    uint32_t Pending;
+    uint32_t Failed;
+    uint32_t Count;
+    uint32_t Total;
+} HACDBG_CORE_COMPLETION_STATUS;
+
+/**
+ * @brief Fills command-name completions for a token that does not contain '!'.
+ *
+ * @details Safe to call from any thread. It reads only the static command table
+ * and does not enter the driver. A token containing '!' is rejected so symbol
+ * lookup stays on the core worker.
+ *
+ * @param Utf8Token The current command token. An empty token returns every command name.
+ * @param Items Caller-owned array of at least Capacity entries.
+ * @param Capacity Number of entries in Items.
+ * @param CountOut Receives the number of entries written.
+ * @return HacDbgCoreStatusOk, or an error status. CountOut is unchanged on error.
+ */
+uint32_t HacDbgCoreCompleteCommands(const char* Utf8Token, HACDBG_CORE_COMPLETION* Items,
+                                    uint32_t Capacity, uint32_t* CountOut);
+
+/**
+ * @brief Queues symbol or command completion for one token on the core worker.
+ *
+ * @details A newer request replaces an older pending request. The caller copies
+ * the result only after HacDbgCoreGetCompletionStatus reports that request id
+ * as completed. Symbol lookup may use the symbol parser and must not run on
+ * the UI thread; this function only enqueues.
+ *
+ * @return Nonzero request id, or zero when the arguments or core state are invalid.
+ */
+uint64_t HacDbgCoreRequestCompletions(HACDBG_CORE* Core, const char* Utf8Token);
+
+/**
+ * @brief Copies the completion request status without entering the driver.
+ */
+uint32_t HacDbgCoreGetCompletionStatus(HACDBG_CORE* Core, HACDBG_CORE_COMPLETION_STATUS* StatusOut);
+
+/**
+ * @brief Copies candidates for a completed request id.
+ *
+ * @details Returns HacDbgCoreStatusState when RequestId is not the completed
+ * id, or when a newer request is still pending. Names that do not fit in
+ * HACDBG_CORE_COMPLETION_SIZE are omitted from the copy and remain in Total.
+ */
+uint32_t HacDbgCoreCopyCompletions(HACDBG_CORE* Core, uint64_t RequestId,
+                                   HACDBG_CORE_COMPLETION* Items, uint32_t Capacity,
+                                   uint32_t* CountOut);
+
 #ifdef __cplusplus
 }
 
 static_assert(sizeof(HACDBG_CORE_TRACE_STATUS) == 80, "core trace status ABI changed");
+static_assert(sizeof(HACDBG_CORE_COMPLETION) == 512, "core completion ABI changed");
+static_assert(sizeof(HACDBG_CORE_COMPLETION_STATUS) == 32, "core completion status ABI changed");
 #endif
