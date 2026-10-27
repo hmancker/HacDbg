@@ -832,6 +832,18 @@ public partial class MainWindow : FluentWindow
             return;
         }
 
+        //
+        // Symbol download checks the same cancel flag as the stop button.
+        // Ctrl+C is left for copying when no module load is in progress.
+        //
+        if (control && shift == false && key == Key.C && _symbolLoadWasActive)
+        {
+            e.Handled = true;
+            CloseCompletion();
+            _core?.Cancel();
+            return;
+        }
+
         if (control && key == Key.Tab)
         {
             e.Handled = true;
@@ -911,7 +923,7 @@ public partial class MainWindow : FluentWindow
         ActivateDocument("command");
         AppendInfo("F5 继续，F10 单步跳过，F11 单步进入。");
         AppendInfo("Ctrl+Tab 切换标签，Ctrl+1 到 Ctrl+4 从反汇编到实时 trace。");
-        AppendInfo("Esc 回到命令台，Tab 补全，Ctrl+F 搜索，Ctrl+L 清空输出。");
+        AppendInfo("Esc 回到命令台，Tab 补全，Ctrl+F 搜索，Ctrl+L 清空输出。符号加载期间 Ctrl+C 取消。");
     }
 
     private void MainWindow_Closing(object? sender, CancelEventArgs e)

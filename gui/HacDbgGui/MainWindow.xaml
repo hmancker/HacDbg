@@ -81,6 +81,7 @@
                               IsEnabled="False" />
                     <MenuItem x:Name="CancelMenuItem"
                               Header="取消当前命令"
+                              InputGestureText="Ctrl+C"
                               Click="CancelButton_Click"
                               IsEnabled="False" />
                     <Separator Style="{StaticResource MenuSeparator}" />
@@ -325,7 +326,7 @@
                                         Click="CancelButton_Click"
                                         IsEnabled="False"
                                         Margin="0,0,10,0"
-                                        ToolTip="取消当前命令">
+                                        ToolTip="取消当前命令 (Ctrl+C，符号加载期间)">
                                     <ui:SymbolIcon Symbol="Stop20" FontSize="16" Foreground="{DynamicResource WarningBrush}" />
                                 </Button>
                                 <Button x:Name="RefreshViewsButton"
