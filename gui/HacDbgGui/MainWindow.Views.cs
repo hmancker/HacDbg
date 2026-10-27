@@ -13,6 +13,7 @@ namespace HacDbgGui;
 public partial class MainWindow
 {
     private const int MemoryCachePageLimit = 32;
+    private const int MemoryRowBytes = 16;
 
     private readonly ObservableCollection<ModuleRow> _modules = new();
     private readonly ObservableCollection<ProcessRow> _processes = new();
@@ -41,6 +42,9 @@ public partial class MainWindow
     private ulong _disassemblyRequestCr3;
     private ulong _disassemblyLastEnd;
     private MemoryPage? _currentMemoryPage;
+    private ulong _memoryCursor;
+    private int _memoryCursorBytes = 1;
+    private bool _suppressDisassemblyMemorySync;
     private ResolveTarget _resolveTarget;
     private int _disassemblyHistoryIndex = -1;
     private bool _disassemblyRecordPending;
@@ -461,7 +465,7 @@ public partial class MainWindow
         MemoryStatusText.Text = _resolveRequestId == 0 ? "无法排队" : "解析中...";
     }
 
-    private void RequestMemoryPage(ulong address, ulong cr3)
+    private void RequestMemoryPage(ulong address, ulong cr3, int highlightBytes = 1)
     {
         HacDbgCore? core = _core;
 
@@ -470,9 +474,24 @@ public partial class MainWindow
             return;
         }
 
-        ulong page = address & ~0xFFFUL;
-        _memoryRequestId = core.RequestMemory(page, cr3, HacDbgCore.MaxMemoryBytes);
+        _memoryCursor = address;
+        _memoryCursorBytes = highlightBytes < 1 ? 1 : highlightBytes;
+        ulong row = AlignMemoryRow(address);
+        _memoryRequestId = core.RequestMemory(row, cr3, HacDbgCore.MaxMemoryBytes);
         MemoryStatusText.Text = _memoryRequestId == 0 ? "无法排队" : "读取中...";
+    }
+
+    private static ulong AlignMemoryRow(ulong address)
+    {
+        return address & ~(ulong)(MemoryRowBytes - 1);
+    }
+
+    private static bool PageContains(MemoryPage? page, ulong address, ulong cr3)
+    {
+        return page is not null &&
+               page.Cr3 == cr3 &&
+               address >= page.Address &&
+               address - page.Address < (ulong)page.Bytes.Length;
     }
 
     private void PollMemory()
@@ -504,7 +523,12 @@ public partial class MainWindow
         MemoryPage page = new(memory.Address, memory.Cr3, bytes);
         CacheMemoryPage(page);
         ShowMemoryPage(page);
-        MemoryStatusText.Text = $"{memory.BytesValid}/{memory.Requested} 字节 · CR3 0x{memory.Cr3:X16}";
+        MemoryStatusText.Text = FormatMemoryStatus(memory.BytesValid, memory.Requested, memory.Cr3);
+    }
+
+    private string FormatMemoryStatus(uint valid, uint requested, ulong cr3)
+    {
+        return $"{valid}/{requested} 字节 · 0x{_memoryCursor:X16} · CR3 0x{cr3:X16}";
     }
 
     private void CacheMemoryPage(MemoryPage page)
@@ -524,40 +548,79 @@ public partial class MainWindow
         }
     }
 
-    private bool TryShowCachedMemory(ulong address, ulong cr3)
+    private bool TryShowCachedMemory(ulong address, ulong cr3, int highlightBytes)
     {
-        if (_memoryCache.TryGetValue((cr3, address), out MemoryPage? page) == false)
+        if (PageContains(_currentMemoryPage, address, cr3))
         {
-            return false;
+            _memoryCursor = address;
+            _memoryCursorBytes = highlightBytes < 1 ? 1 : highlightBytes;
+            ShowMemoryPage(_currentMemoryPage!);
+            MemoryStatusText.Text = $"缓存 · {FormatMemoryStatus((uint)_currentMemoryPage!.Bytes.Length, (uint)_currentMemoryPage.Bytes.Length, cr3)}";
+
+            return true;
         }
 
-        ShowMemoryPage(page);
+        foreach (MemoryPage page in _memoryCache.Values)
+        {
+            if (PageContains(page, address, cr3) == false)
+            {
+                continue;
+            }
 
-        return true;
+            _memoryCursor = address;
+            _memoryCursorBytes = highlightBytes < 1 ? 1 : highlightBytes;
+            ShowMemoryPage(page);
+            MemoryStatusText.Text = $"缓存 · {FormatMemoryStatus((uint)page.Bytes.Length, (uint)page.Bytes.Length, cr3)}";
+
+            return true;
+        }
+
+        return false;
     }
 
     private void ShowMemoryPage(MemoryPage page)
     {
         _currentMemoryPage = page;
-        MemoryAddressBox.Text = $"0x{page.Address:X16}";
+        MemoryAddressBox.Text = $"0x{_memoryCursor:X16}";
         _memoryRows.Clear();
 
-        for (int offset = 0; offset < page.Bytes.Length; offset += 16)
+        int cursor = _memoryCursor < page.Address || _memoryCursor - page.Address > int.MaxValue
+            ? -1
+            : (int)(_memoryCursor - page.Address);
+        int highlight = _memoryCursorBytes < 1 ? 1 : _memoryCursorBytes;
+
+        for (int offset = 0; offset < page.Bytes.Length; offset += MemoryRowBytes)
         {
-            int count = Math.Min(16, page.Bytes.Length - offset);
+            int count = Math.Min(MemoryRowBytes, page.Bytes.Length - offset);
             StringBuilder hex = new();
             StringBuilder ascii = new();
+            bool inside = false;
 
             for (int index = 0; index < count; index++)
             {
-                byte value = page.Bytes[offset + index];
+                int absolute = offset + index;
+                byte value = page.Bytes[absolute];
+                bool marked = cursor >= 0 && absolute >= cursor && absolute < cursor + highlight;
 
                 if (index != 0)
                 {
                     hex.Append(' ');
                 }
 
+                if (marked && inside == false)
+                {
+                    hex.Append('[');
+                    inside = true;
+                }
+
                 hex.Append(value.ToString("X2", CultureInfo.InvariantCulture));
+
+                if (marked && (index + 1 == count || absolute + 1 >= cursor + highlight))
+                {
+                    hex.Append(']');
+                    inside = false;
+                }
+
                 ascii.Append(value is >= 0x20 and < 0x7F ? (char)value : '.');
             }
 
@@ -566,6 +629,21 @@ public partial class MainWindow
                 hex.ToString(),
                 ascii.ToString()));
         }
+
+        if (cursor < 0 || _memoryRows.Count == 0)
+        {
+            return;
+        }
+
+        int row = (int)(cursor / MemoryRowBytes);
+
+        if (row < 0 || row >= _memoryRows.Count)
+        {
+            return;
+        }
+
+        MemoryGrid.SelectedIndex = row;
+        MemoryGrid.ScrollIntoView(_memoryRows[row]);
     }
 
     private void MoveMemoryPage(int direction)
@@ -576,37 +654,34 @@ public partial class MainWindow
             return;
         }
 
-        ulong address = _currentMemoryPage.Address;
+        ulong address = _memoryCursor;
         ulong cr3 = _currentMemoryPage.Cr3;
+        ulong step = (ulong)Math.Max(_currentMemoryPage.Bytes.Length, MemoryRowBytes);
 
         if (direction < 0)
         {
-            if (address < 0x1000)
+            if (address < step)
             {
                 MemoryStatusText.Text = "已经到地址下限";
                 return;
             }
 
-            address -= 0x1000;
+            address -= step;
         }
         else
         {
-            if (address > ulong.MaxValue - 0x1000)
+            if (address > ulong.MaxValue - step)
             {
                 MemoryStatusText.Text = "已经到地址上限";
                 return;
             }
 
-            address += 0x1000;
+            address += step;
         }
 
-        if (TryShowCachedMemory(address, cr3) == false)
+        if (TryShowCachedMemory(address, cr3, 1) == false)
         {
             RequestMemoryPage(address, cr3);
-        }
-        else
-        {
-            MemoryStatusText.Text = $"缓存页 · CR3 0x{cr3:X16}";
         }
     }
 
@@ -683,6 +758,7 @@ public partial class MainWindow
             return;
         }
 
+        _suppressDisassemblyMemorySync = true;
         _disassembly.Clear();
         ulong firstAddress = 0;
         ulong lastEnd = 0;
@@ -707,6 +783,7 @@ public partial class MainWindow
 
         if (count == 0)
         {
+            _suppressDisassemblyMemorySync = false;
             DisassemblyStatusText.Text = "没有可显示的指令";
             return;
         }
@@ -731,6 +808,16 @@ public partial class MainWindow
             ? $"{count} 条，已截断"
             : $"{count} 条";
         MarkCurrentInstruction();
+        _suppressDisassemblyMemorySync = false;
+
+        if (DisassemblyGrid.SelectedItem is DisassemblyRow selected)
+        {
+            ShowMemoryForInstruction(selected);
+        }
+        else if (_disassembly.Count > 0)
+        {
+            ShowMemoryForInstruction(_disassembly[0]);
+        }
     }
 
     private void MarkCurrentInstruction()
@@ -1103,7 +1190,7 @@ public partial class MainWindow
     {
         if (_currentMemoryPage is not null)
         {
-            RequestMemoryPage(_currentMemoryPage.Address, _currentMemoryPage.Cr3);
+            RequestMemoryPage(_memoryCursor, _currentMemoryPage.Cr3, _memoryCursorBytes);
         }
         else
         {
@@ -1124,6 +1211,56 @@ public partial class MainWindow
     private void DisassemblyReadButton_Click(object sender, RoutedEventArgs e)
     {
         RequestDisassemblyFromInput();
+    }
+
+    private void DisassemblyAddressBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter)
+        {
+            return;
+        }
+
+        RequestDisassemblyFromInput();
+        e.Handled = true;
+    }
+
+    private void MemoryAddressBox_KeyDown(object sender, KeyEventArgs e)
+    {
+        if (e.Key != Key.Enter)
+        {
+            return;
+        }
+
+        RequestMemoryFromInput();
+        e.Handled = true;
+    }
+
+    private void DisassemblyGrid_SelectionChanged(object sender, SelectionChangedEventArgs e)
+    {
+        if (_suppressDisassemblyMemorySync)
+        {
+            return;
+        }
+
+        if (DisassemblyGrid.SelectedItem is DisassemblyRow instruction)
+        {
+            ShowMemoryForInstruction(instruction);
+        }
+    }
+
+    private void ShowMemoryForInstruction(DisassemblyRow instruction)
+    {
+        int bytes = instruction.Bytes.Length / 2;
+
+        if (bytes < 1)
+        {
+            bytes = 1;
+        }
+
+        if (TryShowCachedMemory(instruction.AddressValue, _disassemblyRequestCr3, bytes) == false)
+        {
+            RequestMemoryPage(instruction.AddressValue, _disassemblyRequestCr3, bytes);
+        }
     }
 
     private void RipButton_Click(object sender, RoutedEventArgs e)

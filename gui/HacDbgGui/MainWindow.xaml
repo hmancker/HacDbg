@@ -394,7 +394,8 @@
                                                Margin="0,0,6,0" />
                                     <TextBox x:Name="DisassemblyAddressBox"
                                              Grid.Column="1"
-                                             Text="0x0" />
+                                             Text="0x0"
+                                             KeyDown="DisassemblyAddressBox_KeyDown" />
                                     <TextBlock Grid.Column="2"
                                                Text="CR3"
                                                VerticalAlignment="Center"
@@ -425,6 +426,7 @@
                                           Grid.Row="2"
                                           AutoGenerateColumns="False"
                                           ScrollViewer.HorizontalScrollBarVisibility="Auto"
+                                          SelectionChanged="DisassemblyGrid_SelectionChanged"
                                           MouseDoubleClick="DisassemblyGrid_MouseDoubleClick">
                                     <DataGrid.CellStyle>
                                         <Style TargetType="DataGridCell" BasedOn="{StaticResource {x:Type DataGridCell}}">
@@ -662,7 +664,8 @@
                                                Margin="0,0,6,0" />
                                     <TextBox x:Name="MemoryAddressBox"
                                              Grid.Column="1"
-                                             Text="0x0" />
+                                             Text="0x0"
+                                             KeyDown="MemoryAddressBox_KeyDown" />
                                     <TextBlock Grid.Column="2"
                                                Text="CR3"
                                                VerticalAlignment="Center"
