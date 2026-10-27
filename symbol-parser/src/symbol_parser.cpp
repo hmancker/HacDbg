@@ -7,11 +7,13 @@
 #include <winhttp.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <thread>
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -653,6 +655,87 @@ namespace
 		return stores;
 	}
 
+	// No new bytes for this long means the server is not sending the PDB.
+	// An active download resets the timer on every received chunk.
+	constexpr DWORD symbol_download_idle_ms = 8000;
+
+	struct http_download_t
+	{
+		HINTERNET session = nullptr;
+		HINTERNET connection = nullptr;
+		std::atomic<HINTERNET> request = nullptr;
+		std::atomic<std::uint8_t> stop = 0;
+		std::atomic<ULONGLONG> last_progress = 0;
+		std::thread worker;
+
+		http_download_t() = default;
+
+		http_download_t(const http_download_t&) = delete;
+
+		http_download_t& operator=(const http_download_t&) = delete;
+
+		~http_download_t()
+		{
+			stop.store(1);
+
+			if (worker.joinable() == true)
+			{
+				worker.join();
+			}
+
+			const HINTERNET open_request = request.exchange(nullptr);
+
+			if (open_request != nullptr)
+			{
+				WinHttpCloseHandle(open_request);
+			}
+
+			if (connection != nullptr)
+			{
+				WinHttpCloseHandle(connection);
+			}
+
+			if (session != nullptr)
+			{
+				WinHttpCloseHandle(session);
+			}
+		}
+
+		void arm()
+		{
+			last_progress.store(GetTickCount64());
+			worker = std::thread([this]
+			{
+				while (stop.load() == 0)
+				{
+					Sleep(200);
+
+					if (stop.load() == 1)
+					{
+						break;
+					}
+
+					const std::uint8_t interrupted = static_cast<std::uint8_t>(interrupt_check != nullptr && interrupt_check() == 1);
+					const ULONGLONG idle = GetTickCount64() - last_progress.load();
+
+					if (interrupted == 0 && idle < symbol_download_idle_ms)
+					{
+						continue;
+					}
+
+					const HINTERNET open_request = request.exchange(nullptr);
+
+					if (open_request != nullptr)
+					{
+						WinHttpCloseHandle(open_request);
+					}
+
+					break;
+				}
+			});
+		}
+	};
+
 	std::uint8_t download_url(const std::wstring& url, std::vector<std::uint8_t>& body, std::string& detail)
 	{
 		URL_COMPONENTS components = {};
@@ -671,50 +754,58 @@ namespace
 			return 0;
 		}
 
-		HINTERNET session = WinHttpOpen(L"hyper-reV", WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME,
-		                                 WINHTTP_NO_PROXY_BYPASS, 0);
+		http_download_t http = {};
+		http.session = WinHttpOpen(L"hyper-reV", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY, WINHTTP_NO_PROXY_NAME,
+		                           WINHTTP_NO_PROXY_BYPASS, 0);
 
-		if (session == nullptr)
+		if (http.session == nullptr)
 		{
 			detail = "WinHttpOpen failed " + std::to_string(GetLastError());
 
 			return 0;
 		}
 
-		WinHttpSetTimeouts(session, 10000, 20000, 30000, 1000);
-		HINTERNET connection = WinHttpConnect(session, host, components.nPort, 0);
+		WinHttpSetTimeouts(http.session, symbol_download_idle_ms, symbol_download_idle_ms, symbol_download_idle_ms, 1000);
+		http.connection = WinHttpConnect(http.session, host, components.nPort, 0);
 
-		if (connection == nullptr)
+		if (http.connection == nullptr)
 		{
 			detail = "WinHttpConnect failed " + std::to_string(GetLastError());
-			WinHttpCloseHandle(session);
 
 			return 0;
 		}
 
 		const DWORD request_flags = components.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0;
-		HINTERNET request = WinHttpOpenRequest(connection, L"GET", url_path, nullptr, WINHTTP_NO_REFERER,
-		                                        WINHTTP_DEFAULT_ACCEPT_TYPES, request_flags);
+		http.request.store(WinHttpOpenRequest(http.connection, L"GET", url_path, nullptr, WINHTTP_NO_REFERER,
+		                                      WINHTTP_DEFAULT_ACCEPT_TYPES, request_flags));
 
-		if (request == nullptr)
+		if (http.request.load() == nullptr)
 		{
 			detail = "WinHttpOpenRequest failed " + std::to_string(GetLastError());
-			WinHttpCloseHandle(connection);
-			WinHttpCloseHandle(session);
 
 			return 0;
 		}
 
 		const DWORD redirect_policy = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+		const HINTERNET request = http.request.load();
 		WinHttpSetOption(request, WINHTTP_OPTION_REDIRECT_POLICY, const_cast<DWORD*>(&redirect_policy), sizeof(redirect_policy));
+		http.arm();
 
 		if (WinHttpSendRequest(request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) == FALSE ||
 			WinHttpReceiveResponse(request, nullptr) == FALSE)
 		{
-			detail = "download failed, winhttp " + std::to_string(GetLastError());
-			WinHttpCloseHandle(request);
-			WinHttpCloseHandle(connection);
-			WinHttpCloseHandle(session);
+			if (interrupt_check != nullptr && interrupt_check() == 1)
+			{
+				detail = "interrupted";
+			}
+			else if (GetTickCount64() - http.last_progress.load() >= symbol_download_idle_ms)
+			{
+				detail = "download made no progress for 8 seconds";
+			}
+			else
+			{
+				detail = "download failed, winhttp " + std::to_string(GetLastError());
+			}
 
 			return 0;
 		}
@@ -727,9 +818,6 @@ namespace
 		if (status != 200)
 		{
 			detail = "symbol server returned HTTP " + std::to_string(status);
-			WinHttpCloseHandle(request);
-			WinHttpCloseHandle(connection);
-			WinHttpCloseHandle(session);
 
 			return 0;
 		}
@@ -739,9 +827,13 @@ namespace
 			if (interrupt_check != nullptr && interrupt_check() == 1)
 			{
 				detail = "interrupted";
-				WinHttpCloseHandle(request);
-				WinHttpCloseHandle(connection);
-				WinHttpCloseHandle(session);
+
+				return 0;
+			}
+
+			if (GetTickCount64() - http.last_progress.load() >= symbol_download_idle_ms)
+			{
+				detail = "download made no progress for 8 seconds";
 
 				return 0;
 			}
@@ -751,9 +843,6 @@ namespace
 			if (WinHttpQueryDataAvailable(request, &available) == FALSE)
 			{
 				detail = "download read failed, winhttp " + std::to_string(GetLastError());
-				WinHttpCloseHandle(request);
-				WinHttpCloseHandle(connection);
-				WinHttpCloseHandle(session);
 
 				return 0;
 			}
@@ -777,19 +866,17 @@ namespace
 				}
 
 				detail = "download read failed, winhttp " + std::to_string(GetLastError());
-				WinHttpCloseHandle(request);
-				WinHttpCloseHandle(connection);
-				WinHttpCloseHandle(session);
 
 				return 0;
 			}
 
 			body.resize(offset + read);
-		}
 
-		WinHttpCloseHandle(request);
-		WinHttpCloseHandle(connection);
-		WinHttpCloseHandle(session);
+			if (read != 0)
+			{
+				http.last_progress.store(GetTickCount64());
+			}
+		}
 
 		return 1;
 	}
@@ -798,6 +885,82 @@ namespace
 	{
 		return static_cast<std::uint8_t>(body.size() >= 24 &&
 			std::memcmp(body.data(), "Microsoft C/C++ MSF 7.00", 24) == 0);
+	}
+
+	std::wstring debugger_image_directory()
+	{
+		wchar_t path[MAX_PATH] = {};
+		const DWORD length = GetModuleFileNameW(nullptr, path, MAX_PATH);
+
+		if (length == 0 || length >= MAX_PATH)
+		{
+			return {};
+		}
+
+		std::wstring text(path, length);
+		const std::size_t slash = text.find_last_of(L"\\/");
+
+		if (slash == std::wstring::npos)
+		{
+			return {};
+		}
+
+		return text.substr(0, slash);
+	}
+
+	std::uint8_t same_directory(const std::wstring& left, const std::wstring& right)
+	{
+		if (left.empty() == true || right.empty() == true || left.size() != right.size())
+		{
+			return 0;
+		}
+
+		return static_cast<std::uint8_t>(_wcsicmp(left.c_str(), right.c_str()) == 0);
+	}
+
+	std::uint8_t module_is_debugger_image(const std::string_view image_path)
+	{
+		if (image_path.empty() == true)
+		{
+			return 0;
+		}
+
+		std::wstring image = normalize_image_path(widen(std::string(image_path)));
+		const std::size_t slash = image.find_last_of(L"\\/");
+
+		if (slash == std::wstring::npos)
+		{
+			return 0;
+		}
+
+		return same_directory(image.substr(0, slash), debugger_image_directory());
+	}
+
+	std::uint8_t pdb_beside_image(const std::string_view image_path, const std::string& pdb_name, std::wstring& path_out)
+	{
+		if (image_path.empty() == true || pdb_name.empty() == true)
+		{
+			return 0;
+		}
+
+		std::wstring image = normalize_image_path(widen(std::string(image_path)));
+		const std::size_t slash = image.find_last_of(L"\\/");
+
+		if (slash == std::wstring::npos)
+		{
+			return 0;
+		}
+
+		const std::wstring candidate = image.substr(0, slash + 1) + widen(pdb_name);
+
+		if (file_is_pdb(candidate) == 0)
+		{
+			return 0;
+		}
+
+		path_out = candidate;
+
+		return 1;
 	}
 
 	std::uint8_t find_pdb(const std::string& pdb_name, const GUID& guid, const std::uint32_t age, const std::uint8_t overwrite,
@@ -1336,6 +1499,16 @@ namespace symbol_parser
 		if (hinted_pdb.empty() == false && file_is_pdb(hinted_pdb) == 1)
 		{
 			pdb_path = hinted_pdb;
+		}
+		else if (pdb_beside_image(image_path, pdb_name, pdb_path) == 1)
+		{
+		}
+		else if (module_is_debugger_image(image_path) == 1 ||
+			base == reinterpret_cast<std::uint64_t>(GetModuleHandleW(nullptr)))
+		{
+			detail = "debugger module has no local pdb";
+
+			return 0;
 		}
 		else if (find_pdb(pdb_name, guid, age, overwrite, pdb_path, detail) == 0)
 		{
