@@ -75,6 +75,42 @@ EptAddHook(
 
 BOOLEAN
 /**
+ * @brief Reports whether a physical page is an active execute-hook shadow.
+ *
+ * @param PhysicalPage Page-aligned host physical address.
+ *
+ * @return TRUE when an active hook maps this page as its shadow.
+ */
+EptContainsShadowPage(
+    _In_ UINT64 PhysicalPage
+    );
+
+BOOLEAN
+/**
+ * @brief Reports whether a physical page is an active execute-hook target.
+ *
+ * @param PhysicalPage Page-aligned host physical address.
+ *
+ * @return TRUE when an active hook intercepts execution of this page.
+ */
+EptContainsHookTarget(
+    _In_ UINT64 PhysicalPage
+    );
+
+BOOLEAN
+/**
+ * @brief Reports whether a physical page is replaced by the zero dummy page.
+ *
+ * @param PhysicalPage Page-aligned host physical address.
+ *
+ * @return TRUE when the page is an active hidden page.
+ */
+EptContainsHiddenPage(
+    _In_ UINT64 PhysicalPage
+    );
+
+BOOLEAN
+/**
  * @brief Removes one execute hook and restores the page permissions.
  *
  * @param TargetPage Guest physical page previously passed to EptAddHook.

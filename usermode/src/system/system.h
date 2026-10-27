@@ -33,6 +33,7 @@ namespace sys
 		std::uint8_t set_debug_privilege(std::uint8_t state, std::uint8_t* previous_state);
 
 		void* allocate_locked_memory(std::uint64_t size, std::uint32_t protection);
+		std::uint8_t lock_resident_pages(void* address, std::uint64_t size);
 		std::uint8_t free_memory(void* address);
 
 		std::string to_string(std::wstring_view wstring);

@@ -18,6 +18,9 @@
 #define HacDbgSlatHidePage EptHidePage
 #define HacDbgSlatFreePages EptFreeTableCount
 #define HacDbgSlatFlush VmxFlushAllProcessors
+#define HacDbgSlatContainsShadow EptContainsShadowPage
+#define HacDbgSlatContainsHookTarget EptContainsHookTarget
+#define HacDbgSlatContainsHidden EptContainsHiddenPage
 #else
 #include "Npt.h"
 #include "Svm.h"
@@ -26,6 +29,9 @@
 #define HacDbgSlatHidePage NptHidePage
 #define HacDbgSlatFreePages NptFreeTableCount
 #define HacDbgSlatFlush SvmFlushAllProcessors
+#define HacDbgSlatContainsShadow NptContainsShadowPage
+#define HacDbgSlatContainsHookTarget NptContainsHookTarget
+#define HacDbgSlatContainsHidden NptContainsHiddenPage
 #endif
 
 #include "../shared/hypercall/hypercall_def.h"
@@ -52,6 +58,8 @@ static BOOLEAN g_BreakpointPauseActive;
 static BOOLEAN g_BreakpointGoRequested;
 static UINT64 g_BreakpointOwnerRsp;
 static UINT64 g_BreakpointOwnerCr3;
+static UINT64 g_BreakpointLatchPa;
+static volatile LONG g_BreakpointLatchLogs;
 static HACDBG_SPIN_LOCK g_BreakpointLock;
 static UINT64 g_KernelCr3;
 static volatile LONG g_VirtualCopyFailureLogCount;
@@ -121,6 +129,8 @@ HypercallInitialize(
     g_BreakpointGoRequested = FALSE;
     g_BreakpointOwnerRsp = 0;
     g_BreakpointOwnerCr3 = 0;
+    g_BreakpointLatchPa = 0;
+    g_BreakpointLatchLogs = 0;
     HacDbgSpinLockInitialize(&g_BreakpointLock);
 }
 
@@ -213,6 +223,99 @@ HypercallLogState(
     LogsAdd(&log);
 }
 
+// 暂停闩要么在活动钩子影子页里，要么紧跟 HACLATCH 且该页不是钩子目标。
+static BOOLEAN
+HypercallLatchIsAccepted(
+    _In_ UINT64 LatchPa
+    )
+{
+    UINT64 offset = LatchPa & (PAGE_SIZE - 1);
+    UINT64 page = LatchPa & ~(PAGE_SIZE - 1);
+    UINT64 signature = 0;
+
+    if (LatchPa == 0 || offset > PAGE_SIZE - sizeof(UINT64))
+    {
+        return FALSE;
+    }
+
+    if (HacDbgSlatContainsShadow(page) != FALSE)
+    {
+        return TRUE;
+    }
+
+    if (offset < sizeof(UINT64) || HacDbgSlatContainsHookTarget(page) != FALSE ||
+        HacDbgSlatContainsHidden(page) != FALSE)
+    {
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: LatchPa - 8 and LatchPa are in the same locked RAM page.
+    // The page is not an execute-hook target, so the main SLAT root maps it
+    // identity and the parked guest reads this signature.
+    //
+    if (PhysicalMemoryRead(HacDbgGuestPhysicalAddress(LatchPa - sizeof(UINT64)), &signature,
+                           sizeof(signature)) != sizeof(signature))
+    {
+        return FALSE;
+    }
+
+    return signature == pause_latch_signature;
+}
+
+static VOID
+HypercallRememberLatch(
+    _In_ UINT64 LatchPa
+    )
+{
+    if (HypercallLatchIsAccepted(LatchPa) == FALSE)
+    {
+        g_BreakpointLatchPa = 0;
+
+        if (InterlockedIncrement(&g_BreakpointLatchLogs) <= 4)
+        {
+            HACDBG_LOG("HacDbg: Err, breakpoint latch was rejected pa=0x%I64x.\n", LatchPa);
+        }
+
+        return;
+    }
+
+    g_BreakpointLatchPa = LatchPa;
+}
+
+// 置放行位，并把暂停闩写成 1。调用方持有 g_BreakpointLock。
+static VOID
+HypercallPublishLatch(
+    VOID
+    )
+{
+    UINT64 latchPa = g_BreakpointLatchPa;
+    UINT64 value = 1;
+
+    g_BreakpointGoRequested = TRUE;
+
+    if (HypercallLatchIsAccepted(latchPa) == FALSE)
+    {
+        if (InterlockedIncrement(&g_BreakpointLatchLogs) <= 4)
+        {
+            HACDBG_LOG("HacDbg: Err, breakpoint latch was rejected pa=0x%I64x.\n", latchPa);
+        }
+
+        return;
+    }
+
+    //
+    // INVARIANT: latchPa is an 8-byte pause latch in locked host RAM. It is
+    // either an active hook shadow or the qword after HACLATCH on a page the
+    // main SLAT root maps identity. The parked guest reads that same qword.
+    //
+    if (PhysicalMemoryWrite(HacDbgGuestPhysicalAddress(latchPa), &value, sizeof(value)) != sizeof(value) &&
+        InterlockedIncrement(&g_BreakpointLatchLogs) <= 4)
+    {
+        HACDBG_LOG("HacDbg: Err, breakpoint latch write failed pa=0x%I64x.\n", latchPa);
+    }
+}
+
 // 断点 stub 轮询：首次命中挂起，收到放行后返回 1。
 static UINT64
 HypercallBreakpointPausePoll(
@@ -241,6 +344,7 @@ HypercallBreakpointPausePoll(
         g_BreakpointGoRequested = FALSE;
         g_BreakpointOwnerRsp = guestRsp;
         g_BreakpointOwnerCr3 = guestCr3;
+        HypercallRememberLatch(GuestContext->Registers->R9);
         HacDbgSpinLockRelease(&g_BreakpointLock);
         HypercallLogState(GuestContext, HACDBG_LOG_POPPED_FIVE, breakpointRip, 0);
         return 0;
@@ -258,10 +362,12 @@ HypercallBreakpointPausePoll(
         g_BreakpointGoRequested = FALSE;
         g_BreakpointOwnerRsp = 0;
         g_BreakpointOwnerCr3 = 0;
+        g_BreakpointLatchPa = 0;
         HacDbgSpinLockRelease(&g_BreakpointLock);
         return 1;
     }
 
+    HypercallRememberLatch(GuestContext->Registers->R9);
     HacDbgSpinLockRelease(&g_BreakpointLock);
     return 0;
 }
@@ -566,10 +672,27 @@ HypercallExecute(
     case breakpoint_resume:
     {
         HacDbgSpinLockAcquire(&g_BreakpointLock);
-        if (g_BreakpointPauseActive != FALSE)
+
+        if (Information->call_reserved_data == breakpoint_resume_abandon)
         {
-            g_BreakpointGoRequested = TRUE;
+            //
+            // The owner thread is gone. Publishing the latch would wait forever
+            // for a confirmation CPUID that never comes, and every later hit
+            // would be treated as a non-owner and would not pause.
+            //
+            g_BreakpointPauseActive = FALSE;
+            g_BreakpointGoRequested = FALSE;
+            g_BreakpointOwnerRsp = 0;
+            g_BreakpointOwnerCr3 = 0;
+            g_BreakpointLatchPa = 0;
+            result = 1;
         }
+        else if (g_BreakpointPauseActive != FALSE)
+        {
+            HypercallPublishLatch();
+            result = 1;
+        }
+
         HacDbgSpinLockRelease(&g_BreakpointLock);
         break;
     }

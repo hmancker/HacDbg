@@ -296,7 +296,14 @@ std::uint64_t hypercall::breakpoint_resume()
 {
 	constexpr auto call_type = hypercall_type_t::breakpoint_resume;
 
-	return launch_cpuid_hypercall(call_type, 0, 0, 0, 0);
+	return launch_cpuid_hypercall(call_type, breakpoint_resume_publish, 0, 0, 0);
+}
+
+std::uint64_t hypercall::breakpoint_abandon()
+{
+	constexpr auto call_type = hypercall_type_t::breakpoint_resume;
+
+	return launch_cpuid_hypercall(call_type, breakpoint_resume_abandon, 0, 0, 0);
 }
 
 std::uint64_t hypercall::trace_control(const std::uint64_t control_flags, const std::uint32_t sample_rate,

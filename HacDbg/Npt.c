@@ -339,6 +339,30 @@ NptFindHook(
     return FALSE;
 }
 
+BOOLEAN
+NptContainsShadowPage(
+    _In_ UINT64 PhysicalPage
+    )
+{
+    UINT64 page = PhysicalPage & NPT_ADDRESS_MASK;
+    UINT32 index;
+    BOOLEAN found = FALSE;
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+
+    for (index = 0; index < HACDBG_NPT_MAX_HOOKS; index++)
+    {
+        if (g_Hooks[index].Active != FALSE && g_Hooks[index].ShadowPage == page)
+        {
+            found = TRUE;
+            break;
+        }
+    }
+
+    HacDbgSpinLockRelease(&g_NptLock);
+    return found;
+}
+
 // 查找已隐藏的客户物理页。
 static BOOLEAN
 NptFindHidden(
@@ -356,6 +380,32 @@ NptFindHidden(
     }
 
     return FALSE;
+}
+
+BOOLEAN
+NptContainsHookTarget(
+    _In_ UINT64 PhysicalPage
+    )
+{
+    BOOLEAN found;
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    found = NptFindHook(PhysicalPage & NPT_ADDRESS_MASK, NULL);
+    HacDbgSpinLockRelease(&g_NptLock);
+    return found;
+}
+
+BOOLEAN
+NptContainsHiddenPage(
+    _In_ UINT64 PhysicalPage
+    )
+{
+    BOOLEAN found;
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    found = NptFindHidden(PhysicalPage & NPT_ADDRESS_MASK);
+    HacDbgSpinLockRelease(&g_NptLock);
+    return found;
 }
 
 //

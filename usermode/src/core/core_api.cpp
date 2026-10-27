@@ -738,6 +738,9 @@ namespace
 		}
 
 		HACDBG_TRACE_SNAPSHOT& destination = core->trace_snapshots[snapshot_index];
+
+		sys::user::lock_resident_pages(&destination, sizeof(destination));
+
 		const std::uint64_t copied = hypercall::trace_read(destination, HACDBG_TRACE_ALL_CPUS);
 		const auto now = std::chrono::steady_clock::now();
 
@@ -920,6 +923,13 @@ namespace
 
 			apply_pending_trace_control(core);
 
+			// Trace reads used to skip this poll. A hit logged by the first
+			// pause CPUID then never reached the disassembly view.
+			if (commands::poll_breakpoint() != 0)
+			{
+				update_state(core);
+			}
+
 			if (perform_trace_read(core) != false)
 			{
 				continue;
@@ -943,11 +953,6 @@ namespace
 				}
 
 				continue;
-			}
-
-			if (commands::poll_breakpoint() != 0)
-			{
-				update_state(core);
 			}
 		}
 
@@ -1018,6 +1023,7 @@ HACDBG_CORE* HacDbgCoreCreate(const HACDBG_OUTPUT_CALLBACK output_callback, void
 		core->output_callback = output_callback;
 		core->output_context = context;
 		copy_version(core->state.UserVersion, HACDBG_VERSION_STRING);
+		sys::user::lock_resident_pages(core->trace_snapshots.data(), sizeof(core->trace_snapshots));
 
 		return core;
 	}

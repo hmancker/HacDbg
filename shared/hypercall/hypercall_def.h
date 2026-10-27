@@ -61,12 +61,25 @@ constexpr std::uint64_t hypercall_log_breakpoint_flag = 1;
 constexpr std::uint64_t hypercall_primary_key = 0x4E47;
 constexpr std::uint64_t hypercall_secondary_key = 0x7F;
 
+// Eight bytes immediately before a pause latch that lives outside a hook
+// shadow. The bytes are HACLATCH. The main SLAT root maps that page, so the
+// parked guest and the resume write see the same qword.
+constexpr std::uint64_t pause_latch_signature = 0x484354414C434148ull;
+
+// breakpoint_resume call_reserved_data. 0 publishes the latch as 1.
+// 1 drops the pause because the owner thread is gone and will not confirm.
+constexpr std::uint64_t breakpoint_resume_publish = 0;
+constexpr std::uint64_t breakpoint_resume_abandon = 1;
+
 // Bytes copied inside one CPUID vmexit. The copy runs in Hyper-V's vmexit
 // handler, so a longer exit can stall the guest long enough to bugcheck.
 constexpr std::uint64_t hypercall_memory_chunk_size = 0x10000;
 #else
 #define hypercall_primary_key 0x4E47
 #define hypercall_secondary_key 0x7F
+#define pause_latch_signature 0x484354414C434148ull
+#define breakpoint_resume_publish 0
+#define breakpoint_resume_abandon 1
 #define hypercall_memory_chunk_size 0x10000
 #endif
 

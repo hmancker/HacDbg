@@ -636,6 +636,30 @@ EptFindHook(
     return FALSE;
 }
 
+BOOLEAN
+EptContainsShadowPage(
+    _In_ UINT64 PhysicalPage
+    )
+{
+    UINT64 page = PhysicalPage & EPT_ADDRESS_MASK;
+    UINT32 index;
+    BOOLEAN found = FALSE;
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+
+    for (index = 0; index < HACDBG_EPT_MAX_HOOKS; index++)
+    {
+        if (g_Hooks[index].Active != FALSE && g_Hooks[index].ShadowPage == page)
+        {
+            found = TRUE;
+            break;
+        }
+    }
+
+    HacDbgSpinLockRelease(&g_EptLock);
+    return found;
+}
+
 static BOOLEAN
 EptFindHidden(
     _In_ UINT64 Page
@@ -652,6 +676,32 @@ EptFindHidden(
     }
 
     return FALSE;
+}
+
+BOOLEAN
+EptContainsHookTarget(
+    _In_ UINT64 PhysicalPage
+    )
+{
+    BOOLEAN found;
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    found = EptFindHook(PhysicalPage & EPT_ADDRESS_MASK, NULL);
+    HacDbgSpinLockRelease(&g_EptLock);
+    return found;
+}
+
+BOOLEAN
+EptContainsHiddenPage(
+    _In_ UINT64 PhysicalPage
+    )
+{
+    BOOLEAN found;
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    found = EptFindHidden(PhysicalPage & EPT_ADDRESS_MASK);
+    HacDbgSpinLockRelease(&g_EptLock);
+    return found;
 }
 
 // 取得客户页对应的 4 KiB PTE；遇到 2 MiB 大页时拆开。

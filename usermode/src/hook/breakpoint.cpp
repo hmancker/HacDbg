@@ -26,6 +26,32 @@ namespace
 	constexpr std::uint64_t absolute_jump_size = 14;
 	constexpr std::uint64_t relative_jump_size = 5;
 	constexpr std::uint64_t cr3_address_mask = ~0xFFFull;
+	// park clears TF, then waits without CPUID. It does not live in the hook
+	// shadow: the wait page is executable on the main SLAT root.
+	// Offsets match pause_spin2_template and pause_park_template.
+	constexpr std::uint64_t pause_latch_immediate_offset = 0x0C;
+	constexpr std::uint8_t pause_spin2_template[] = {
+		0x49, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x49, 0xB9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x0F, 0xA2, 0x85, 0xC0, 0x0F, 0x85, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x25, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+		0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+	// Saved RFLAGS is at [rsp+0x78] after entry1 and entry2. IF is bit 1 of [rsp+0x79].
+	// Relative jumps inside this block land on the compare at 0x0B, not on the TF clear.
+	constexpr std::uint8_t pause_park_template[] = {
+		0x9C, 0x48, 0x81, 0x64, 0x24, 0x00, 0xFF, 0xFE, 0xFF, 0xFF, 0x9D, 0x48, 0x83, 0x3D, 0x00, 0x00, 0x00, 0x00, 0x01,
+		0x75, 0x10, 0x48, 0xC7, 0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00, 0x66,
+		0x8C, 0xC8, 0xA8, 0x03, 0x75, 0x0E, 0xF6, 0x44, 0x24, 0x79, 0x02, 0x74, 0x03, 0xF4, 0xEB, 0xD5, 0xF3, 0x90, 0xEB,
+		0xD1, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x85, 0xC0, 0x74, 0xF3, 0x68, 0xF0, 0xD8, 0xFF, 0xFF, 0x33, 0xC9, 0x48, 0x89,
+		0xE2, 0x4C, 0x8B, 0xD1, 0x0F, 0x05, 0x48, 0x83, 0xC4, 0x08, 0xEB, 0xB3};
+	constexpr std::uint64_t pause_spin2_size = sizeof(pause_spin2_template);
+	constexpr std::uint64_t pause_park_size = sizeof(pause_park_template);
+
+	static_assert(pause_spin2_size == 0x2C);
+	static_assert(pause_park_size == 0x58);
+	static_assert(pause_spin2_template[0x14] == 0x0F && pause_spin2_template[0x15] == 0xA2);
+	static_assert(pause_spin2_template[0x1E] == 0xFF && pause_spin2_template[0x1F] == 0x25);
+	static_assert(pause_park_template[0x0B] == 0x48);
+	static_assert(pause_park_template[0x33] == 0xF4);
+	static_assert(pause_park_template[0x50] == 0x0F && pause_park_template[0x51] == 0x05);
 	// The pause poll hypercall restores the top five stack slots and then adds 40 to the logged rsp.
 	constexpr std::uint64_t hypervisor_popped_bytes = 40;
 	constexpr std::uint64_t pause_frame_bytes = 128;
@@ -394,6 +420,8 @@ namespace
 
 		if (write_physical_qword(entry_physical, new_entry) == 0)
 		{
+			sys::user::free_memory(table_page);
+
 			return 0;
 		}
 
@@ -457,42 +485,94 @@ namespace
 		return 1;
 	}
 
-	std::vector<std::uint64_t> collect_process_cr3s()
+	std::uint8_t directory_already_listed(const std::vector<std::uint64_t>& directories, const std::uint64_t directory)
 	{
-		std::vector<std::uint64_t> cr3s = {};
+		const std::uint64_t masked = directory & cr3_address_mask;
+
+		if (masked == 0)
+		{
+			return 1;
+		}
+
+		for (const std::uint64_t existing : directories)
+		{
+			if ((existing & cr3_address_mask) == masked)
+			{
+				return 1;
+			}
+		}
+
+		return 0;
+	}
+
+	// KPTI keeps user mappings in UserDirectoryTableBase. The kernel directory
+	// has no user half, so a free-page scan there looks empty and then builds
+	// page tables the user thread never walks.
+	std::vector<std::uint64_t> directories_for_user_park(const std::uint64_t filter_cr3)
+	{
+		std::vector<std::uint64_t> directories = {};
 		const nt_offsets_t* const nt = nt_offsets_current();
 		const std::unordered_map<std::string, std::uint64_t> aliases = sys::kernel::compile_symbol_list();
 		const auto system_process = aliases.find("ntoskrnl.exe!PsInitialSystemProcess");
 
 		if (nt == nullptr || system_process == aliases.end())
 		{
-			return cr3s;
+			return directories;
 		}
 
 		std::uint64_t eprocess = 0;
 
-		if (hypercall::read_guest_virtual_memory(&eprocess, system_process->second, sys::current_cr3, sizeof(eprocess)) != sizeof(eprocess) ||
+		if (hypercall::read_guest_virtual_memory(&eprocess, system_process->second, sys::current_cr3, sizeof(eprocess)) !=
+				sizeof(eprocess) ||
 			eprocess == 0)
 		{
-			return cr3s;
+			return directories;
 		}
 
 		const std::uint64_t first = eprocess;
+		const std::uint64_t filter = filter_cr3 & cr3_address_mask;
+
+		// A user breakpoint names one process. Filter 0 used to walk every process.
+		if (filter == 0)
+		{
+			return directories;
+		}
 
 		for (std::uint64_t count = 0; count < 4096 && eprocess != 0; count++)
 		{
 			std::uint64_t directory = 0;
+			std::uint64_t user_directory = 0;
 
 			if (hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3,
-			                                        sizeof(directory)) == sizeof(directory) && directory != 0)
+			                                        sizeof(directory)) == sizeof(directory))
 			{
-				cr3s.push_back(directory);
+				if (nt->eprocess_user_directory_table_base != 0)
+				{
+					hypercall::read_guest_virtual_memory(&user_directory, eprocess + nt->eprocess_user_directory_table_base,
+					                                     sys::current_cr3, sizeof(user_directory));
+				}
+
+				const std::uint64_t chosen = (user_directory & cr3_address_mask) != 0 ? user_directory : directory;
+				const std::uint8_t matches = static_cast<std::uint8_t>(
+					(directory & cr3_address_mask) == filter || (user_directory & cr3_address_mask) == filter ||
+					(chosen & cr3_address_mask) == filter);
+
+				if (matches == 1 && directory_already_listed(directories, chosen) == 0)
+				{
+					directories.push_back(chosen);
+				}
+
+				if (filter != 0 && matches == 1)
+				{
+					break;
+				}
 			}
 
 			std::uint64_t flink = 0;
 
 			if (hypercall::read_guest_virtual_memory(&flink, eprocess + nt->eprocess_active_process_links, sys::current_cr3,
-			                                        sizeof(flink)) != sizeof(flink) || flink == 0)
+			                                        sizeof(flink)) != sizeof(flink) ||
+				flink == 0)
 			{
 				break;
 			}
@@ -505,13 +585,120 @@ namespace
 			}
 		}
 
-		return cr3s;
+		return directories;
 	}
 
-	std::uint64_t place_user_trampoline(const std::vector<std::uint8_t>& bytes, const std::uint64_t near_address)
+	void raise_user_park_lock_quota()
+	{
+		SIZE_T minimum = 0;
+		SIZE_T maximum = 0;
+		constexpr SIZE_T want_minimum = 32ull * 1024ull * 1024ull;
+		constexpr SIZE_T want_maximum = 64ull * 1024ull * 1024ull;
+
+		if (GetProcessWorkingSetSize(GetCurrentProcess(), &minimum, &maximum) == 0)
+		{
+			return;
+		}
+
+		if (minimum >= want_minimum && maximum >= want_maximum)
+		{
+			return;
+		}
+
+		SetProcessWorkingSetSize(GetCurrentProcess(), minimum > want_minimum ? minimum : want_minimum,
+		                         maximum > want_maximum ? maximum : want_maximum);
+	}
+
+	std::uint8_t map_user_park_page(const std::uint64_t filter_cr3)
+	{
+		constexpr std::uint64_t candidates[] = {
+			0x0000000030000000ull, 0x0000000050000000ull, 0x0000000070000000ull, 0x00000000A0000000ull,
+			0x00000000C0000000ull, 0x00000000E0000000ull, 0x0000000120000000ull, 0x0000000140000000ull,
+			0x0000000180000000ull, 0x00000001C0000000ull, 0x0000000220000000ull, 0x0000000280000000ull,
+			0x0000000300000000ull, 0x0000000380000000ull, 0x0000000400000000ull, 0x0000000480000000ull};
+
+		raise_user_park_lock_quota();
+
+		const std::vector<std::uint64_t> directories = directories_for_user_park(filter_cr3);
+
+		if (directories.empty() == true)
+		{
+			return 0;
+		}
+
+		for (const std::uint64_t candidate : candidates)
+		{
+			std::uint8_t occupied = 0;
+
+			for (const std::uint64_t directory : directories)
+			{
+				if (user_page_is_present(directory, candidate) == 1)
+				{
+					occupied = 1;
+
+					break;
+				}
+			}
+
+			if (occupied == 1)
+			{
+				continue;
+			}
+
+			std::uint8_t mapped = 1;
+
+			for (const std::uint64_t directory : directories)
+			{
+				if (map_user_page(directory, candidate, user_trampoline_physical) == 0)
+				{
+					mapped = 0;
+
+					break;
+				}
+			}
+
+			if (mapped == 1)
+			{
+				user_trampoline_virtual = candidate;
+
+				return 1;
+			}
+		}
+
+		return 0;
+	}
+
+	// The park VA is chosen once. A later process still has to receive that same page.
+	std::uint8_t map_existing_user_park(const std::uint64_t filter_cr3)
+	{
+		if (user_trampoline_virtual == 0 || user_trampoline_physical == 0)
+		{
+			return 0;
+		}
+
+		const std::vector<std::uint64_t> directories = directories_for_user_park(filter_cr3);
+
+		if (directories.empty() == true)
+		{
+			return 0;
+		}
+
+		for (const std::uint64_t directory : directories)
+		{
+			if (map_user_page(directory, user_trampoline_virtual, user_trampoline_physical) == 0)
+			{
+				return 0;
+			}
+		}
+
+		return 1;
+	}
+
+	std::uint64_t place_user_trampoline(const std::vector<std::uint8_t>& bytes, const std::uint64_t filter_cr3)
 	{
 		if (user_trampoline_page == nullptr)
 		{
+			raise_user_park_lock_quota();
 			user_trampoline_page = static_cast<std::uint8_t*>(sys::user::allocate_locked_memory(page_size, PAGE_EXECUTE_READWRITE));
 
 			if (user_trampoline_page == nullptr)
@@ -525,56 +712,23 @@ namespace
 
 			if (user_trampoline_physical == 0)
 			{
+				sys::user::free_memory(user_trampoline_page);
+				user_trampoline_page = nullptr;
+
 				return 0;
 			}
+		}
 
-			const std::uint64_t region = (near_address & ~0x1FFFFFull) + 0x200000;
-			const std::vector<std::uint64_t> cr3s = collect_process_cr3s();
-
-			for (std::uint64_t page_index = 0; page_index < 2048; page_index++)
-			{
-				const std::uint64_t candidate = region + page_index * page_size;
-				std::uint8_t occupied = 0;
-
-				for (const std::uint64_t cr3 : cr3s)
-				{
-					if (user_page_is_present(cr3, candidate) == 1)
-					{
-						occupied = 1;
-
-						break;
-					}
-				}
-
-				if (occupied == 1)
-				{
-					continue;
-				}
-
-				std::uint8_t mapped = 1;
-
-				for (const std::uint64_t cr3 : cr3s)
-				{
-					if (map_user_page(cr3, candidate, user_trampoline_physical) == 0)
-					{
-						mapped = 0;
-
-						break;
-					}
-				}
-
-				if (mapped == 1)
-				{
-					user_trampoline_virtual = candidate;
-
-					break;
-				}
-			}
-
-			if (user_trampoline_virtual == 0)
+		if (user_trampoline_virtual == 0)
+		{
+			if (map_user_park_page(filter_cr3) == 0)
 			{
 				return 0;
 			}
+		}
+		else if (map_existing_user_park(filter_cr3) == 0)
+		{
+			return 0;
 		}
 
 		if (user_trampoline_used + bytes.size() > page_size)
@@ -743,6 +897,133 @@ namespace
 		*reinterpret_cast<std::int32_t*>(displacement) = static_cast<std::int32_t>(delta);
 
 		return 1;
+	}
+
+	std::uint32_t nt_delay_execution_ssn()
+	{
+		const HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+
+		if (ntdll == nullptr)
+		{
+			return 0;
+		}
+
+		const auto* const stub = reinterpret_cast<const std::uint8_t*>(GetProcAddress(ntdll, "NtDelayExecution"));
+
+		if (stub == nullptr || stub[0] != 0x4C || stub[1] != 0x8B || stub[2] != 0xD1 || stub[3] != 0xB8)
+		{
+			return 0;
+		}
+
+		return *reinterpret_cast<const std::uint32_t*>(stub + 4);
+	}
+
+	std::uint8_t build_pause_spin2(std::vector<std::uint8_t>& bytes, const std::uint64_t spin2, const std::uint64_t breakpoint_rip,
+	                               const std::uint64_t go1, const std::uint64_t park)
+	{
+		bytes.assign(pause_spin2_template, pause_spin2_template + pause_spin2_size);
+		std::memcpy(bytes.data() + 2, &breakpoint_rip, sizeof(breakpoint_rip));
+		std::memcpy(bytes.data() + 0x24, &park, sizeof(park));
+
+		if (write_rel32_at(bytes.data() + 0x1A, spin2 + 0x1E, go1) == 0)
+		{
+			return 0;
+		}
+
+		return 1;
+	}
+
+	std::uint8_t build_pause_park(std::vector<std::uint8_t>& bytes, const std::uint64_t park, const std::uint64_t after_wait,
+	                              const std::uint64_t flag)
+	{
+		bytes.assign(pause_park_template, pause_park_template + pause_park_size);
+		*reinterpret_cast<std::uint32_t*>(bytes.data() + 0x3B) = nt_delay_execution_ssn();
+
+		if (write_rel32_at(bytes.data() + 0x0E, park + 0x13, flag) == 0 ||
+			write_rel32_at(bytes.data() + 0x18, park + 0x20, flag) == 0 ||
+			write_rel32_at(bytes.data() + 0x21, park + 0x25, after_wait) == 0)
+		{
+			return 0;
+		}
+
+		return 1;
+	}
+
+	std::uint8_t stamp_pause_latch_pa(std::vector<std::uint8_t>& bytes, const std::uint64_t latch_physical)
+	{
+		if (bytes.size() != pause_spin2_size || latch_physical == 0 ||
+		    (latch_physical & 0xFFFull) > page_size - sizeof(std::uint64_t))
+		{
+			return 0;
+		}
+
+		std::memcpy(bytes.data() + pause_latch_immediate_offset, &latch_physical, sizeof(latch_physical));
+
+		return 1;
+	}
+
+	struct pause_park_site_t
+	{
+		std::uint64_t park = 0;
+		std::uint64_t latch_physical = 0;
+	};
+
+	// Park code, an absolute jump back to spin1, the HACLATCH signature, and the latch.
+	constexpr std::uint64_t pause_park_tail_size = 12;
+	constexpr std::uint64_t pause_park_blob_size = pause_park_size + pause_park_tail_size + 16;
+
+	// reentry is spin1. User wait uses SYSCALL, which replaces RCX and RDX.
+	// spin2's CPUID is a hypercall only while RCX still holds the key, so the
+	// confirmation must reload that key and the CR3 filter before CPUID.
+	std::uint8_t commit_pause_park(std::uint8_t* const page, const std::uint64_t page_virtual,
+	                               const std::uint64_t page_physical, const std::uint64_t offset,
+	                               const std::uint64_t reentry, pause_park_site_t& site)
+	{
+		if (page == nullptr || offset + pause_park_blob_size > page_size)
+		{
+			return 0;
+		}
+
+		const std::uint64_t park = page_virtual + offset;
+		const std::uint64_t tail = park + pause_park_size;
+		const std::uint64_t latch = tail + pause_park_tail_size + sizeof(std::uint64_t);
+		std::vector<std::uint8_t> code = {};
+
+		if (build_pause_park(code, park, tail, latch) == 0 || code.size() != pause_park_size)
+		{
+			return 0;
+		}
+
+		std::uint8_t tail_bytes[pause_park_tail_size] = {0x48, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xE0};
+
+		std::memcpy(tail_bytes + 2, &reentry, sizeof(reentry));
+		std::memcpy(page + offset, code.data(), code.size());
+		std::memcpy(page + offset + pause_park_size, tail_bytes, sizeof(tail_bytes));
+		std::memcpy(page + offset + pause_park_size + pause_park_tail_size, &pause_latch_signature,
+		            sizeof(pause_latch_signature));
+		std::memset(page + offset + pause_park_size + pause_park_tail_size + sizeof(std::uint64_t), 0,
+		            sizeof(std::uint64_t));
+		FlushInstructionCache(GetCurrentProcess(), page + offset, static_cast<SIZE_T>(pause_park_blob_size));
+
+		site.park = park;
+		site.latch_physical = (page_physical & ~0xFFFull) + offset + pause_park_size + pause_park_tail_size +
+			sizeof(std::uint64_t);
+
+		return 1;
+	}
+
+	std::uint8_t place_user_pause_park(const std::uint64_t filter_cr3, const std::uint64_t reentry, pause_park_site_t& site)
+	{
+		std::vector<std::uint8_t> placeholder(static_cast<std::size_t>(pause_park_blob_size), 0xCC);
+		const std::uint64_t blob = place_user_trampoline(placeholder, filter_cr3);
+
+		if (blob == 0 || user_trampoline_page == nullptr || blob < user_trampoline_virtual)
+		{
+			return 0;
+		}
+
+		return commit_pause_park(user_trampoline_page, user_trampoline_virtual, user_trampoline_physical,
+		                         blob - user_trampoline_virtual, reentry, site);
 	}
 
 	std::uint64_t find_fit(const std::uint64_t hint, const std::uint64_t translate_cr3, const std::uint64_t maximum,
@@ -1164,20 +1445,18 @@ namespace
 		std::uint64_t step2_size = 0;
 		const std::uint64_t step1 = find_fit(address, translate_cr3, 26, 20, avoids, step1_size);
 		const std::uint64_t entry1 = find_fit(address, translate_cr3, 25, 25, avoids, ignored_size);
-		const std::uint64_t spin2 = find_fit(address, translate_cr3, 25, 25, avoids, ignored_size);
+		const std::uint64_t spin2 = find_fit(address, translate_cr3, pause_spin2_size, pause_spin2_size, avoids, ignored_size);
 		const std::uint64_t step2 = find_fit(address, translate_cr3, 25, 19, avoids, step2_size);
-		const std::uint64_t restore1 = find_fit(address, translate_cr3, 22, 22, avoids, ignored_size);
 		const std::uint64_t go1 = find_fit(address, translate_cr3, 22, 22, avoids, ignored_size);
 		const std::uint64_t go2 = find_fit(address, translate_cr3, 22, 22, avoids, ignored_size);
 		const std::uint64_t spin1 = find_fit(address, translate_cr3, 20, 20, avoids, ignored_size);
 		const std::uint64_t go3 = find_fit(address, translate_cr3, 14, 14, avoids, ignored_size);
-		const std::uint64_t restore2 = find_fit(address, translate_cr3, 14, 13, avoids, ignored_size);
 		const std::uint64_t entry2 = find_fit(address, translate_cr3, 9, 9, avoids, ignored_size);
 		const std::uint64_t resume_size = relocated.size() + relative_jump_size;
 		const std::uint64_t resume = find_cave(address, resume_size, translate_cr3, avoids);
 
-		if (step1 == 0 || entry1 == 0 || spin2 == 0 || step2 == 0 || restore1 == 0 || go1 == 0 || go2 == 0 || spin1 == 0 ||
-			go3 == 0 || restore2 == 0 || entry2 == 0)
+		if (step1 == 0 || entry1 == 0 || spin2 == 0 || step2 == 0 || go1 == 0 || go2 == 0 || spin1 == 0 || go3 == 0 ||
+			entry2 == 0)
 		{
 			LOG_ERR("no code cave for the user breakpoint");
 
@@ -1187,6 +1466,15 @@ namespace
 		if (resume == 0)
 		{
 			LOG_ERR("no code cave for the resumed instructions");
+
+			return fail();
+		}
+
+		pause_park_site_t park_site = {};
+
+		if (place_user_pause_park(cr3, spin1, park_site) == 0)
+		{
+			LOG_ERR("failed to place the pause park");
 
 			return fail();
 		}
@@ -1212,19 +1500,15 @@ namespace
 		std::vector<std::uint8_t> entry2_bytes = {0x41, 0x50, 0x41, 0x53, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		std::vector<std::uint8_t> spin1_bytes = {0xB9, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		                                         0x00, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00};
-		std::vector<std::uint8_t> spin2_bytes = {0x49, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0x85, 0xC0,
-		                                         0x0F, 0x85, 0x00, 0x00, 0x00, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00};
+		std::vector<std::uint8_t> spin2_bytes;
 		std::vector<std::uint8_t> pop_prefix = {0x41, 0x5B, 0x41, 0x58, 0x5A, 0x59, 0x58, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D,
 		                                        0x41, 0x5C, 0x41, 0x5A, 0xE9, 0x00, 0x00, 0x00, 0x00};
-		// The leading nop keeps a one-byte-late landing on the pop instead of in the middle of it.
-		std::vector<std::uint8_t> restore2_bytes = {0x90, 0x41, 0x59, 0x5F, 0x5E, 0x5D, 0x5B, 0x9D, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		// Ten nops stand where `mov rsp, imm64` is written once the thread is actually paused.
 		// Other processes take this path immediately, and rsp is already restored by the pops.
 		std::vector<std::uint8_t> go2_bytes = {0x41, 0x59, 0x5F, 0x5E, 0x5D, 0x5B, 0x9D, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
 		                                       0x90, 0x90, 0x90, 0x90, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		std::vector<std::uint8_t> go3_bytes(absolute_jump_size);
 		std::vector<std::uint8_t> resume_body = relocated;
-		std::vector<std::uint8_t> restore1_bytes = pop_prefix;
 		std::vector<std::uint8_t> go1_bytes = pop_prefix;
 
 		resume_body.resize(resume_size);
@@ -1233,10 +1517,8 @@ namespace
 		if (write_rel32_at(&entry1_bytes[21], entry1 + entry1_bytes.size(), entry2) == 0 ||
 			write_rel32_at(&entry2_bytes[5], entry2 + entry2_bytes.size(), spin1) == 0 ||
 			write_rel32_at(&spin1_bytes[16], spin1 + spin1_bytes.size(), spin2) == 0 ||
-			write_rel32_at(&spin2_bytes[16], spin2 + 20, go1) == 0 ||
-			write_rel32_at(&spin2_bytes[21], spin2 + spin2_bytes.size(), restore1) == 0 ||
-			write_rel32_at(&restore1_bytes[18], restore1 + restore1_bytes.size(), restore2) == 0 ||
-			write_rel32_at(&restore2_bytes[9], restore2 + restore2_bytes.size(), entry1) == 0 ||
+			build_pause_spin2(spin2_bytes, spin2, address, go1, park_site.park) == 0 ||
+			stamp_pause_latch_pa(spin2_bytes, park_site.latch_physical) == 0 ||
 			write_rel32_at(&go1_bytes[18], go1 + go1_bytes.size(), go2) == 0 ||
 			write_rel32_at(&go2_bytes[18], go2 + go2_bytes.size(), go3) == 0)
 		{
@@ -1258,10 +1540,9 @@ namespace
 		write_relative_jump(resume_body.data() + relocated.size(), resume + relocated.size(), address + span);
 		*reinterpret_cast<std::uint32_t*>(&spin1_bytes[1]) = static_cast<std::uint32_t>(call_info.value);
 		std::memcpy(&spin1_bytes[7], &cr3, sizeof(cr3));
-		std::memcpy(&spin2_bytes[2], &address, sizeof(address));
 
-		if (entry1_bytes.size() != 25 || entry2_bytes.size() != 9 || spin1_bytes.size() != 20 || spin2_bytes.size() != 25 ||
-			restore1_bytes.size() != 22 || restore2_bytes.size() != 13 || go1_bytes.size() != 22 || go2_bytes.size() != 22)
+		if (entry1_bytes.size() != 25 || entry2_bytes.size() != 9 || spin1_bytes.size() != 20 ||
+			spin2_bytes.size() != pause_spin2_size || go1_bytes.size() != 22 || go2_bytes.size() != 22)
 		{
 			LOG_ERR("failed to build the user breakpoint");
 
@@ -1276,8 +1557,7 @@ namespace
 
 		const piece_t pieces[] = {
 			{entry1, &entry1_bytes}, {entry2, &entry2_bytes}, {spin1, &spin1_bytes}, {spin2, &spin2_bytes},
-			{restore1, &restore1_bytes}, {restore2, &restore2_bytes}, {go1, &go1_bytes}, {go2, &go2_bytes},
-			{go3, &go3_bytes}, {resume, &resume_body}};
+			{go1, &go1_bytes}, {go2, &go2_bytes}, {go3, &go3_bytes}, {resume, &resume_body}};
 
 		breakpoint_t breakpoint = {};
 
@@ -1517,6 +1797,74 @@ namespace
 		return 1;
 	}
 
+	std::uint8_t user_directory_is_live(const std::uint64_t cr3)
+	{
+		if ((cr3 & cr3_address_mask) == 0)
+		{
+			return 0;
+		}
+
+		return static_cast<std::uint8_t>(directories_for_user_park(cr3).empty() == false);
+	}
+
+	// The owner thread exited while the pause was still latched. Later hits are
+	// non-owners and return 1 until this record is dropped.
+	void release_dead_pause_owner()
+	{
+		if (pause_state.valid == 0 || pause_state.registers.cr3 == 0 ||
+			user_directory_is_live(pause_state.registers.cr3) == 1)
+		{
+			return;
+		}
+
+		hypercall::breakpoint_abandon();
+		pause_state.valid = 0;
+		pause_state.breakpoint_id = ~0ull;
+	}
+
+	std::uint8_t drop_stale_user_breakpoints(const std::uint64_t page_physical, const std::uint64_t page_offset,
+	                                         const std::uint64_t span)
+	{
+		std::vector<std::uint64_t> stale = {};
+
+		for (const breakpoint_t& breakpoint : breakpoints)
+		{
+			if (is_user_address(breakpoint.address) == 0 || breakpoint.page_physical != page_physical)
+			{
+				continue;
+			}
+
+			if (ranges_overlap(page_offset, span, breakpoint.page_offset, breakpoint.span) == 0)
+			{
+				continue;
+			}
+
+			if (breakpoint.cr3 != 0 && user_directory_is_live(breakpoint.cr3) == 1)
+			{
+				continue;
+			}
+
+			stale.push_back(breakpoint.id);
+		}
+
+		for (const std::uint64_t id : stale)
+		{
+			if (pause_state.valid == 1 && pause_state.breakpoint_id == id)
+			{
+				hypercall::breakpoint_abandon();
+				pause_state.valid = 0;
+				pause_state.breakpoint_id = ~0ull;
+			}
+
+			if (breakpoint::remove(id) == 0)
+			{
+				return 0;
+			}
+		}
+
+		return 1;
+	}
+
 	std::uint8_t arm_direct_pause_impl(const std::uint64_t logical_rip, const std::uint64_t cr3, const std::uint64_t cave_hint,
 	                                   std::uint64_t& entry_out, std::uint64_t& id_out)
 	{
@@ -1613,20 +1961,27 @@ namespace
 		std::uint64_t step2_size = 0;
 		const std::uint64_t step1 = find_fit(cave_hint, cr3, 26, 20, avoids, step1_size);
 		const std::uint64_t entry1 = find_fit(cave_hint, cr3, 25, 25, avoids, ignored_size);
-		const std::uint64_t spin2 = find_fit(cave_hint, cr3, 25, 25, avoids, ignored_size);
+		const std::uint64_t spin2 = find_fit(cave_hint, cr3, pause_spin2_size, pause_spin2_size, avoids, ignored_size);
 		const std::uint64_t step2 = find_fit(cave_hint, cr3, 25, 19, avoids, step2_size);
-		const std::uint64_t restore1 = find_fit(cave_hint, cr3, 22, 22, avoids, ignored_size);
 		const std::uint64_t go1 = find_fit(cave_hint, cr3, 22, 22, avoids, ignored_size);
 		const std::uint64_t go2 = find_fit(cave_hint, cr3, 22, 22, avoids, ignored_size);
 		const std::uint64_t spin1 = find_fit(cave_hint, cr3, 20, 20, avoids, ignored_size);
 		const std::uint64_t go3 = find_fit(cave_hint, cr3, 14, 14, avoids, ignored_size);
-		const std::uint64_t restore2 = find_fit(cave_hint, cr3, 14, 13, avoids, ignored_size);
 		const std::uint64_t entry2 = find_fit(cave_hint, cr3, 9, 9, avoids, ignored_size);
 
-		if (step1 == 0 || entry1 == 0 || spin2 == 0 || step2 == 0 || restore1 == 0 || go1 == 0 || go2 == 0 || spin1 == 0 ||
-			go3 == 0 || restore2 == 0 || entry2 == 0)
+		if (step1 == 0 || entry1 == 0 || spin2 == 0 || step2 == 0 || go1 == 0 || go2 == 0 || spin1 == 0 || go3 == 0 ||
+			entry2 == 0)
 		{
 			LOG_ERR("no code cave for the user breakpoint");
+
+			return fail();
+		}
+
+		pause_park_site_t park_site = {};
+
+		if (place_user_pause_park(cr3, spin1, park_site) == 0)
+		{
+			LOG_ERR("failed to place the pause park");
 
 			return fail();
 		}
@@ -1643,13 +1998,10 @@ namespace
 		std::vector<std::uint8_t> entry2_bytes = {0x41, 0x50, 0x41, 0x53, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		std::vector<std::uint8_t> spin1_bytes = {0xB9, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		                                         0x00, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00};
-		std::vector<std::uint8_t> spin2_bytes = {0x49, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0x85, 0xC0,
-		                                         0x0F, 0x85, 0x00, 0x00, 0x00, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00};
+		std::vector<std::uint8_t> spin2_bytes;
 		std::vector<std::uint8_t> pop_prefix = {0x41, 0x5B, 0x41, 0x58, 0x5A, 0x59, 0x58, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D,
 		                                        0x41, 0x5C, 0x41, 0x5A, 0xE9, 0x00, 0x00, 0x00, 0x00};
-		std::vector<std::uint8_t> restore1_bytes = pop_prefix;
 		std::vector<std::uint8_t> go1_bytes = pop_prefix;
-		std::vector<std::uint8_t> restore2_bytes = {0x90, 0x41, 0x59, 0x5F, 0x5E, 0x5D, 0x5B, 0x9D, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		std::vector<std::uint8_t> go2_bytes = {0x41, 0x59, 0x5F, 0x5E, 0x5D, 0x5B, 0x9D, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
 		                                       0x90, 0x90, 0x90, 0x90, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		std::vector<std::uint8_t> go3_bytes(absolute_jump_size);
@@ -1659,10 +2011,8 @@ namespace
 		if (write_rel32_at(&entry1_bytes[21], entry1 + entry1_bytes.size(), entry2) == 0 ||
 			write_rel32_at(&entry2_bytes[5], entry2 + entry2_bytes.size(), spin1) == 0 ||
 			write_rel32_at(&spin1_bytes[16], spin1 + spin1_bytes.size(), spin2) == 0 ||
-			write_rel32_at(&spin2_bytes[16], spin2 + 20, go1) == 0 ||
-			write_rel32_at(&spin2_bytes[21], spin2 + spin2_bytes.size(), restore1) == 0 ||
-			write_rel32_at(&restore1_bytes[18], restore1 + restore1_bytes.size(), restore2) == 0 ||
-			write_rel32_at(&restore2_bytes[9], restore2 + restore2_bytes.size(), entry1) == 0 ||
+			build_pause_spin2(spin2_bytes, spin2, logical_rip, go1, park_site.park) == 0 ||
+			stamp_pause_latch_pa(spin2_bytes, park_site.latch_physical) == 0 ||
 			write_rel32_at(&go1_bytes[18], go1 + go1_bytes.size(), go2) == 0 ||
 			write_rel32_at(&go2_bytes[18], go2 + go2_bytes.size(), go3) == 0)
 		{
@@ -1676,7 +2026,6 @@ namespace
 		// directory table. The shared instruction is not patched, so other processes do not enter.
 		const std::uint64_t filter_cr3 = 0;
 		std::memcpy(&spin1_bytes[7], &filter_cr3, sizeof(filter_cr3));
-		std::memcpy(&spin2_bytes[2], &logical_rip, sizeof(logical_rip));
 
 		struct piece_t
 		{
@@ -1686,8 +2035,7 @@ namespace
 
 		const piece_t pieces[] = {
 			{entry1, &entry1_bytes}, {entry2, &entry2_bytes}, {spin1, &spin1_bytes}, {spin2, &spin2_bytes},
-			{restore1, &restore1_bytes}, {restore2, &restore2_bytes}, {go1, &go1_bytes}, {go2, &go2_bytes},
-			{go3, &go3_bytes}};
+			{go1, &go1_bytes}, {go2, &go2_bytes}, {go3, &go3_bytes}};
 
 		breakpoint_t breakpoint = {};
 
@@ -1981,7 +2329,8 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 	return 0;
 }
 
-	constexpr std::uint64_t kernel_pause_fixed = 25 + 9 + 20 + 25 + 22 + 13 + 22 + 22 + 14 + 26 + 25;
+	constexpr std::uint64_t kernel_pause_fixed =
+		25 + 9 + 20 + pause_spin2_size + 22 + 22 + 14 + 26 + 25;
 	constexpr std::uint64_t kernel_pause_slack = 96;
 	constexpr std::uint64_t kernel_pause_need = kernel_pause_fixed + kernel_pause_slack;
 
@@ -2015,6 +2364,191 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 		}
 
 		return directory;
+	}
+
+	std::uint8_t* kernel_pause_page = nullptr;
+	std::uint64_t kernel_pause_physical = 0;
+	std::uint64_t kernel_pause_virtual = 0;
+	std::uint64_t kernel_pause_used = 0;
+
+	std::uint8_t ensure_supervisor_entry(const std::uint64_t table_physical, const std::uint64_t index,
+	                                     std::uint64_t& next_physical, const std::uint8_t create)
+	{
+		const std::uint64_t entry_physical = (table_physical & page_table_entry_mask) + index * 8;
+		const std::uint64_t entry = read_physical_qword(entry_physical);
+
+		if ((entry & 1) == 1)
+		{
+			if ((entry & 0x80) == 0x80 || (entry & (1ull << 63)) != 0)
+			{
+				return 0;
+			}
+
+			next_physical = entry & page_table_entry_mask;
+
+			return 1;
+		}
+
+		if (create == 0)
+		{
+			return 0;
+		}
+
+		auto* const table_page = static_cast<std::uint8_t*>(sys::user::allocate_locked_memory(page_size, PAGE_READWRITE));
+
+		if (table_page == nullptr)
+		{
+			return 0;
+		}
+
+		std::memset(table_page, 0, page_size);
+
+		const std::uint64_t table_page_physical = hypercall::translate_guest_virtual_address(
+			reinterpret_cast<std::uint64_t>(table_page), sys::directory_for_local_memory());
+
+		if (table_page_physical == 0)
+		{
+			sys::user::free_memory(table_page);
+
+			return 0;
+		}
+
+		const std::uint64_t new_entry = (table_page_physical & page_table_entry_mask) | 0x3;
+
+		if (write_physical_qword(entry_physical, new_entry) == 0)
+		{
+			sys::user::free_memory(table_page);
+
+			return 0;
+		}
+
+		next_physical = table_page_physical & page_table_entry_mask;
+
+		return 1;
+	}
+
+	std::uint8_t map_supervisor_page(const std::uint64_t cr3, const std::uint64_t virtual_address,
+	                                 const std::uint64_t physical_address)
+	{
+		if ((virtual_address & 0xFFFF800000000000ull) != 0xFFFF800000000000ull)
+		{
+			return 0;
+		}
+
+		std::uint64_t table = cr3 & page_table_entry_mask;
+		const std::uint64_t shifts[] = {39, 30, 21};
+
+		for (std::size_t level = 0; level < 3; level++)
+		{
+			std::uint64_t next = 0;
+
+			if (ensure_supervisor_entry(table, page_table_index(virtual_address, shifts[level]), next,
+			                            level == 0 ? 0 : 1) == 0)
+			{
+				return 0;
+			}
+
+			table = next;
+		}
+
+		const std::uint64_t pte_physical = table + page_table_index(virtual_address, 12) * 8;
+		const std::uint64_t pte = read_physical_qword(pte_physical);
+
+		if ((pte & 1) == 1)
+		{
+			return static_cast<std::uint8_t>((pte & page_table_entry_mask) == (physical_address & page_table_entry_mask));
+		}
+
+		const std::uint64_t new_pte = (physical_address & page_table_entry_mask) | 0x63;
+
+		return write_physical_qword(pte_physical, new_pte);
+	}
+
+	std::uint8_t ensure_kernel_pause_page(const std::uint64_t kernel_cr3)
+	{
+		if (kernel_pause_page != nullptr)
+		{
+			return 1;
+		}
+
+		const auto module = sys::kernel::modules_list.find("ntoskrnl.exe");
+
+		if (module == sys::kernel::modules_list.end() || module->second.base_address == 0 || module->second.size == 0)
+		{
+			return 0;
+		}
+
+		auto* const page = static_cast<std::uint8_t*>(sys::user::allocate_locked_memory(page_size, PAGE_EXECUTE_READWRITE));
+
+		if (page == nullptr)
+		{
+			return 0;
+		}
+
+		std::memset(page, 0xCC, page_size);
+
+		const std::uint64_t physical = hypercall::translate_guest_virtual_address(
+			reinterpret_cast<std::uint64_t>(page), sys::directory_for_local_memory());
+
+		if (physical == 0)
+		{
+			sys::user::free_memory(page);
+
+			return 0;
+		}
+
+		const std::uint64_t start = (module->second.base_address + module->second.size + page_size - 1) & ~0xFFFull;
+		constexpr std::uint64_t scan = 64ull * 1024ull * 1024ull;
+
+		for (std::uint64_t offset = 0; offset < scan; offset += page_size)
+		{
+			const std::uint64_t candidate = start + offset;
+
+			if (user_page_is_present(kernel_cr3, candidate) == 1)
+			{
+				continue;
+			}
+
+			if (map_supervisor_page(kernel_cr3, candidate, physical) == 0)
+			{
+				continue;
+			}
+
+			kernel_pause_page = page;
+			kernel_pause_physical = physical & page_table_entry_mask;
+			kernel_pause_virtual = candidate;
+			kernel_pause_used = 0;
+
+			return 1;
+		}
+
+		sys::user::free_memory(page);
+
+		return 0;
+	}
+
+	std::uint8_t place_kernel_pause_park(const std::uint64_t kernel_cr3, const std::uint64_t reentry, pause_park_site_t& site)
+	{
+		if (ensure_kernel_pause_page(kernel_cr3) == 0)
+		{
+			return 0;
+		}
+
+		if (kernel_pause_used + pause_park_blob_size > page_size)
+		{
+			return 0;
+		}
+
+		const std::uint64_t offset = kernel_pause_used;
+
+		if (commit_pause_park(kernel_pause_page, kernel_pause_virtual, kernel_pause_physical, offset, reentry, site) == 0)
+		{
+			return 0;
+		}
+
+		kernel_pause_used += (pause_park_blob_size + 15) & ~0xFull;
+
+		return 1;
 	}
 
 	std::uint8_t rel32_reaches(const std::uint64_t site, const std::uint64_t target)
@@ -2316,15 +2850,7 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 		const std::uint64_t spin2 = cursor;
 
-		cursor += 25;
-
-		const std::uint64_t restore1 = cursor;
-
-		cursor += 22;
-
-		const std::uint64_t restore2 = cursor;
-
-		cursor += 13;
+		cursor += pause_spin2_size;
 
 		const std::uint64_t go1 = cursor;
 
@@ -2357,6 +2883,15 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 			return 0;
 		}
 
+		pause_park_site_t park_site = {};
+
+		if (place_kernel_pause_park(kernel_cr3, spin1, park_site) == 0)
+		{
+			LOG_ERR("failed to place the pause park");
+
+			return 0;
+		}
+
 		hypercall_info_t call_info = {};
 
 		call_info.primary_key = hypercall_primary_key;
@@ -2369,16 +2904,13 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 		std::vector<std::uint8_t> entry2_bytes = {0x41, 0x50, 0x41, 0x53, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		std::vector<std::uint8_t> spin1_bytes = {0xB9, 0x00, 0x00, 0x00, 0x00, 0x48, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 		                                         0x00, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00};
-		std::vector<std::uint8_t> spin2_bytes = {0x49, 0xB8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0x85, 0xC0,
-		                                         0x0F, 0x85, 0x00, 0x00, 0x00, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00};
+		std::vector<std::uint8_t> spin2_bytes;
 		std::vector<std::uint8_t> pop_prefix = {0x41, 0x5B, 0x41, 0x58, 0x5A, 0x59, 0x58, 0x41, 0x5F, 0x41, 0x5E, 0x41, 0x5D,
 		                                        0x41, 0x5C, 0x41, 0x5A, 0xE9, 0x00, 0x00, 0x00, 0x00};
-		std::vector<std::uint8_t> restore2_bytes = {0x90, 0x41, 0x59, 0x5F, 0x5E, 0x5D, 0x5B, 0x9D, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		std::vector<std::uint8_t> go2_bytes = {0x41, 0x59, 0x5F, 0x5E, 0x5D, 0x5B, 0x9D, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90,
 		                                       0x90, 0x90, 0x90, 0x90, 0xE9, 0x00, 0x00, 0x00, 0x00};
 		std::vector<std::uint8_t> go3_bytes(absolute_jump_size);
 		std::vector<std::uint8_t> resume_body = aligned_bytes.first;
-		std::vector<std::uint8_t> restore1_bytes = pop_prefix;
 		std::vector<std::uint8_t> go1_bytes = pop_prefix;
 
 		resume_body.resize(static_cast<std::size_t>(resume_size));
@@ -2399,10 +2931,8 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 		if (write_rel32_at(&entry1_bytes[21], entry1 + entry1_bytes.size(), entry2) == 0 ||
 			write_rel32_at(&entry2_bytes[5], entry2 + entry2_bytes.size(), spin1) == 0 ||
 			write_rel32_at(&spin1_bytes[16], spin1 + spin1_bytes.size(), spin2) == 0 ||
-			write_rel32_at(&spin2_bytes[16], spin2 + 20, go1) == 0 ||
-			write_rel32_at(&spin2_bytes[21], spin2 + spin2_bytes.size(), restore1) == 0 ||
-			write_rel32_at(&restore1_bytes[18], restore1 + restore1_bytes.size(), restore2) == 0 ||
-			write_rel32_at(&restore2_bytes[9], restore2 + restore2_bytes.size(), entry1) == 0 ||
+			build_pause_spin2(spin2_bytes, spin2, address, go1, park_site.park) == 0 ||
+			stamp_pause_latch_pa(spin2_bytes, park_site.latch_physical) == 0 ||
 			write_rel32_at(&go1_bytes[18], go1 + go1_bytes.size(), go2) == 0 ||
 			write_rel32_at(&go2_bytes[18], go2 + go2_bytes.size(), go3) == 0)
 		{
@@ -2413,7 +2943,6 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 		*reinterpret_cast<std::uint32_t*>(&spin1_bytes[1]) = static_cast<std::uint32_t>(call_info.value);
 		std::memcpy(&spin1_bytes[7], &cr3, sizeof(cr3));
-		std::memcpy(&spin2_bytes[2], &address, sizeof(address));
 
 		struct piece_t
 		{
@@ -2423,8 +2952,7 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 		const piece_t pieces[] = {
 			{entry1, &entry1_bytes}, {entry2, &entry2_bytes}, {spin1, &spin1_bytes}, {spin2, &spin2_bytes},
-			{restore1, &restore1_bytes}, {restore2, &restore2_bytes}, {go1, &go1_bytes}, {go2, &go2_bytes},
-			{go3, &go3_bytes}, {resume, &resume_body}};
+			{go1, &go1_bytes}, {go2, &go2_bytes}, {go3, &go3_bytes}, {resume, &resume_body}};
 
 		breakpoint_t breakpoint = {};
 
@@ -2780,6 +3308,15 @@ static std::uint64_t user_execution_cr3(const std::uint64_t cr3, const std::uint
 
 std::uint8_t breakpoint::add(const std::uint64_t address, const std::uint64_t cr3, std::uint64_t& id_out)
 {
+	if (is_user_address(address) == 1 && cr3 == 0)
+	{
+		LOG_ERR("user breakpoint requires a process id");
+
+		return 0;
+	}
+
+	release_dead_pause_owner();
+
 	const std::uint64_t effective_cr3 = is_user_address(address) == 1 && cr3 != 0 ? user_execution_cr3(cr3, address) : cr3;
 
 	for (const breakpoint_t& breakpoint : breakpoints)
@@ -2860,6 +3397,12 @@ std::uint8_t breakpoint::add(const std::uint64_t address, const std::uint64_t cr
 			LOG_ERR("breakpoint crosses a page");
 		}
 
+		return 0;
+	}
+
+	if (is_user_address(address) == 1 &&
+		drop_stale_user_breakpoints(page_physical, page_offset, aligned_bytes.second) == 0)
+	{
 		return 0;
 	}
 

@@ -1122,16 +1122,89 @@ void* sys::user::allocate_locked_memory(const std::uint64_t size, const std::uin
 		return nullptr;
 	}
 
-	const std::int32_t lock_status = VirtualLock(allocation_base, size);
-
-	if (lock_status == 0)
+	if (VirtualLock(allocation_base, size) != 0)
 	{
-		free_memory(allocation_base);
-
-		return nullptr;
+		return allocation_base;
 	}
 
-	return allocation_base;
+	// VirtualLock is capped by the working-set minimum. A failed user-park
+	// map can fill that cap with page-table pages and then every later lock fails.
+	constexpr std::uint32_t increase_working_set_privilege = 33;
+	constexpr SIZE_T want_minimum = 64ull * 1024ull * 1024ull;
+	constexpr SIZE_T want_maximum = 128ull * 1024ull * 1024ull;
+	std::uint8_t previous_privilege = 0;
+	SIZE_T minimum = 0;
+	SIZE_T maximum = 0;
+
+	adjust_privilege(increase_working_set_privilege, 1, 0, &previous_privilege);
+
+	if (GetProcessWorkingSetSize(GetCurrentProcess(), &minimum, &maximum) != 0)
+	{
+		SetProcessWorkingSetSize(GetCurrentProcess(), minimum > want_minimum ? minimum : want_minimum,
+		                         maximum > want_maximum ? maximum : want_maximum);
+	}
+
+	if (VirtualLock(allocation_base, size) != 0)
+	{
+		return allocation_base;
+	}
+
+	free_memory(allocation_base);
+
+	return nullptr;
+}
+
+std::uint8_t sys::user::lock_resident_pages(void* const address, const std::uint64_t size)
+{
+	if (address == nullptr || size == 0)
+	{
+		return 0;
+	}
+
+	auto* const bytes = static_cast<volatile std::uint8_t*>(address);
+
+	// A VM-exit cannot fault the destination back in. Touch every page from
+	// user mode first. User breakpoints lock other pages and raise the working
+	// set; an unlocked trace snapshot is trimmed and then every trace_read fails.
+	auto touch = [&]()
+	{
+		for (std::uint64_t offset = 0; offset < size; offset += page_size)
+		{
+			const std::uint8_t value = bytes[offset];
+
+			bytes[offset] = value;
+		}
+
+		const std::uint8_t tail = bytes[size - 1];
+
+		bytes[size - 1] = tail;
+	};
+
+	touch();
+
+	if (VirtualLock(address, static_cast<SIZE_T>(size)) != 0)
+	{
+		return 1;
+	}
+
+	constexpr std::uint32_t increase_working_set_privilege = 33;
+	constexpr SIZE_T want_minimum = 64ull * 1024ull * 1024ull;
+	constexpr SIZE_T want_maximum = 128ull * 1024ull * 1024ull;
+	std::uint8_t previous_privilege = 0;
+	SIZE_T minimum = 0;
+	SIZE_T maximum = 0;
+
+	adjust_privilege(increase_working_set_privilege, 1, 0, &previous_privilege);
+
+	if (GetProcessWorkingSetSize(GetCurrentProcess(), &minimum, &maximum) != 0)
+	{
+		SetProcessWorkingSetSize(GetCurrentProcess(), minimum > want_minimum ? minimum : want_minimum,
+		                         maximum > want_maximum ? maximum : want_maximum);
+	}
+
+	touch();
+
+	return static_cast<std::uint8_t>(VirtualLock(address, static_cast<SIZE_T>(size)) != 0);
 }
 
 std::uint8_t sys::user::free_memory(void* address)
