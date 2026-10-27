@@ -20,6 +20,19 @@
 #define HACDBG_HOST_STACK_SIZE    0x8000
 #define HACDBG_MAX_PROCESSORS     256
 #define HACDBG_MSR_EFER           0xC0000080ull
+//
+// Vol. 3C 29.3.1.1: when load-EFER is 1, LMA must match the IA-32e guest
+// control and must equal LME while CR0.PG is 1.
+//
+#define VMX_EFER_LME              (1ull << 8)
+#define VMX_EFER_LMA              (1ull << 10)
+//
+// Vol. 3C 29.3.1.1: DR7 bits reserved in the register must be 0 when
+// load-debug is 1. Bits 63:32 are reserved. Vol. 3C 29.3.2.1 loads bit 12
+// and bits 15:14 as 0, and loads bit 10 as 1.
+//
+#define VMX_DR7_RESERVED_ZERO     0xFFFFFFFF0000D000ull
+#define VMX_DR7_BIT10             (1ull << 10)
 #define HACDBG_MSR_PAT            0x277ull
 #define HACDBG_MSR_DEBUGCTL       0x1D9ull
 #define HACDBG_MSR_FS_BASE        0xC0000100ull
@@ -254,7 +267,11 @@ VmxDescriptorRights(
 
     if ((Selector & 0xFFF8u) == 0)
     {
-        return AllowUnusable ? VMX_ACCESS_UNUSABLE : 0;
+        //
+        // Vol. 3C 29.3.1.2: SS.DPL must equal the selector RPL even when the
+        // segment is unusable. A null selector keeps that RPL in bits 1:0.
+        //
+        return AllowUnusable ? (VMX_ACCESS_UNUSABLE | ((UINT32)(Selector & 3u) << 5)) : 0;
     }
 
     first = *(UINT64*)(ULONG_PTR)(GdtBase + (Selector & 0xFFF8u));
@@ -2376,6 +2393,11 @@ VmxHandleVmExit(
         UINT64 cs = 0;
         UINT64 rflags = 0;
         UINT64 entry = 0;
+        UINT64 pending = 0;
+        UINT64 dr7 = 0;
+        UINT64 ss = 0;
+        UINT64 ssSelector = 0;
+        UINT64 tr = 0;
 
         VmxRead(VMCS_EXIT_QUALIFICATION, &qualification);
         VmxRead(VMCS_GUEST_CR0, &cr0);
@@ -2385,11 +2407,18 @@ VmxHandleVmExit(
         VmxRead(VMCS_GUEST_CS_ACCESS, &cs);
         VmxRead(VMCS_GUEST_RFLAGS, &rflags);
         VmxRead(VMCS_CTRL_VMENTRY, &entry);
+        VmxRead(VMCS_GUEST_PENDING_DEBUG, &pending);
+        VmxRead(VMCS_GUEST_DR7, &dr7);
+        VmxRead(VMCS_GUEST_SS_ACCESS, &ss);
+        VmxRead(VMCS_GUEST_SS_SELECTOR, &ssSelector);
+        VmxRead(VMCS_GUEST_TR_ACCESS, &tr);
         HACDBG_LOG("HacDbg: Err, VM-entry failed reason=%u qual=0x%I64x cr0=0x%I64x cr3=0x%I64x "
                    "cr4=0x%I64x efer=0x%I64x dbg=0x%I64x cs=0x%I64x rflags=0x%I64x rip=0x%I64x "
-                   "entry=0x%I64x.\n",
+                   "entry=0x%I64x pend=0x%I64x dr7=0x%I64x ss=0x%I64x sssel=0x%I64x tr=0x%I64x "
+                   "cpu=%u.\n",
                    reason, qualification, cr0, ProcessorContext->GuestCr3, cr4, efer, debugCtl, cs,
-                   rflags, ProcessorContext->GuestRip, entry);
+                   rflags, ProcessorContext->GuestRip, entry, pending, dr7, ss, ssSelector, tr,
+                   KeGetCurrentProcessorNumber());
         stopGuest = VmxLeaveVmx(ProcessorContext);
     }
     else
@@ -2592,8 +2621,10 @@ VmxLoadControls(
 
     g_ProcControls2 = VmxAdjust(desired2, VMX_MSR_PROCBASED_CTLS2);
     {
-        UINT32 exitRequested = VMX_EXIT_HOST_ADDR_SPACE_SIZE | VMX_EXIT_SAVE_DEBUG;
-        UINT32 entryRequested = VMX_ENTRY_IA32E_MODE_GUEST | VMX_ENTRY_LOAD_DEBUG;
+        UINT32 exitRequested = VMX_EXIT_HOST_ADDR_SPACE_SIZE | VMX_EXIT_SAVE_DEBUG |
+                               VMX_EXIT_SAVE_EFER | VMX_EXIT_LOAD_EFER;
+        UINT32 entryRequested = VMX_ENTRY_IA32E_MODE_GUEST | VMX_ENTRY_LOAD_DEBUG |
+                                VMX_ENTRY_LOAD_EFER;
 
 #if HACDBG_HIDE_VIRTUALIZATION
         if (g_SyntheticMsrPassthrough == 0)
@@ -2915,10 +2946,16 @@ VmxFillVmcs(
     }
 
     HypercallNoteKernelCr3(cr3);
-    UINT64 efer = __readmsr(HACDBG_MSR_EFER);
+    //
+    // Vol. 3C 29.3.2.1 loads IA32_EFER.LMA from the IA-32e guest control when
+    // load-EFER is 0, and does not check the VMCS field. The field is still
+    // undefined until VMWRITE. An outer hypervisor that compares it with the
+    // IA-32e guest control rejects LMA=0 as invalid guest state.
+    //
+    UINT64 efer = __readmsr(HACDBG_MSR_EFER) | VMX_EFER_LME | VMX_EFER_LMA;
     UINT64 pat = __readmsr(HACDBG_MSR_PAT);
     UINT16 hostCs = (UINT16)(Context->SegCs & 0xF8u);
-
+    UINT16 guestSs = (UINT16)Context->SegSs;
     _sgdt(&gdtr);
     __sidt(&idtr);
     ProcessorContext->SavedGdtrLimit = gdtr.Limit;
@@ -2926,6 +2963,18 @@ VmxFillVmcs(
     ProcessorContext->SavedIdtrLimit = idtr.Limit;
     ProcessorContext->SavedIdtrBase = idtr.Base;
     ProcessorContext->DescriptorTablesSaved = TRUE;
+    //
+    // IA-32e mode may run with a null SS. Vol. 3C 29.3.1.2 treats access
+    // rights 0 as a usable data segment and rejects it. The null SS is
+    // unusable, its RPL equals CS.DPL, and that DPL is the CPL.
+    //
+    if ((guestSs & 0xFFF8u) == 0)
+    {
+        UINT32 csRights = VmxDescriptorRights(gdtr.Base, (UINT16)Context->SegCs, FALSE);
+
+        guestSs = (UINT16)((csRights >> 5) & 3u);
+    }
+
     cr4 |= VMX_CR4_VMXE;
     __writecr0(cr0);
     if ((cr4 & VMX_CR4_PCIDE) == 0)
@@ -2989,9 +3038,7 @@ VmxFillVmcs(
         return FALSE;
     }
 
-    if (((g_ExitControls & (VMX_EXIT_SAVE_EFER | VMX_EXIT_LOAD_EFER)) != 0 ||
-         (g_EntryControls & VMX_ENTRY_LOAD_EFER) != 0) &&
-        (VmxWrite(VMCS_GUEST_EFER, efer) == FALSE || VmxWrite(VMCS_HOST_EFER, efer) == FALSE))
+    if (VmxWrite(VMCS_GUEST_EFER, efer) == FALSE || VmxWrite(VMCS_HOST_EFER, efer) == FALSE)
     {
         return FALSE;
     }
@@ -3005,7 +3052,7 @@ VmxFillVmcs(
 
     if ((g_EntryControls & VMX_ENTRY_LOAD_DEBUG) != 0 &&
         (VmxWrite(VMCS_GUEST_DEBUGCTL, __readmsr(HACDBG_MSR_DEBUGCTL)) == FALSE ||
-         VmxWrite(VMCS_GUEST_DR7, __readdr(7)) == FALSE))
+         VmxWrite(VMCS_GUEST_DR7, (__readdr(7) & ~VMX_DR7_RESERVED_ZERO) | VMX_DR7_BIT10) == FALSE))
     {
         return FALSE;
     }
@@ -3016,9 +3063,9 @@ VmxFillVmcs(
         VmxWriteSegment((UINT16)Context->SegCs, gdtr.Base, VMCS_GUEST_CS_SELECTOR,
                         VMCS_GUEST_CS_LIMIT, VMCS_GUEST_CS_ACCESS, VMCS_GUEST_CS_BASE,
                         VmxDescriptorBase(gdtr.Base, (UINT16)Context->SegCs), FALSE, FALSE) == FALSE ||
-        VmxWriteSegment((UINT16)Context->SegSs, gdtr.Base, VMCS_GUEST_SS_SELECTOR,
+        VmxWriteSegment(guestSs, gdtr.Base, VMCS_GUEST_SS_SELECTOR,
                         VMCS_GUEST_SS_LIMIT, VMCS_GUEST_SS_ACCESS, VMCS_GUEST_SS_BASE,
-                        VmxDescriptorBase(gdtr.Base, (UINT16)Context->SegSs), FALSE, FALSE) == FALSE ||
+                        VmxDescriptorBase(gdtr.Base, guestSs), TRUE, FALSE) == FALSE ||
         VmxWriteSegment((UINT16)Context->SegDs, gdtr.Base, VMCS_GUEST_DS_SELECTOR,
                         VMCS_GUEST_DS_LIMIT, VMCS_GUEST_DS_ACCESS, VMCS_GUEST_DS_BASE,
                         VmxDescriptorBase(gdtr.Base, (UINT16)Context->SegDs), TRUE, FALSE) == FALSE ||
@@ -3034,6 +3081,16 @@ VmxFillVmcs(
         VmxWriteSegment(tr, gdtr.Base, VMCS_GUEST_TR_SELECTOR, VMCS_GUEST_TR_LIMIT,
                         VMCS_GUEST_TR_ACCESS, VMCS_GUEST_TR_BASE,
                         VmxDescriptorBase(gdtr.Base, tr), FALSE, TRUE) == FALSE)
+    {
+        return FALSE;
+    }
+
+    //
+    // Vol. 3C 29.3.1.5 checks this field on every VM-entry. Bits 11:4, bit 13,
+    // bit 15, and bits 63:17 must be 0. VMCLEAR does not clear it. Activity is
+    // active and interruptibility is 0, so bit 14 may be 0.
+    //
+    if (VmxWrite(VMCS_GUEST_PENDING_DEBUG, 0) == FALSE)
     {
         return FALSE;
     }
