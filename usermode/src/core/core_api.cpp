@@ -576,6 +576,10 @@ namespace
 				fill_registers(state.Registers, registers);
 			}
 		}
+		else
+		{
+			state.Registers.Cr3 = commands::context_cr3();
+		}
 
 		const std::vector<breakpoint::info_t> breakpoints = breakpoint::list();
 		const std::size_t count = (std::min)(breakpoints.size(), static_cast<std::size_t>(HACDBG_CORE_MAX_BREAKPOINTS));

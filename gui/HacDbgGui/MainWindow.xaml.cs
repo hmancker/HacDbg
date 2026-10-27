@@ -60,7 +60,6 @@ public partial class MainWindow : FluentWindow
     private bool _lastRegisterSnapshotKnown;
     private bool _versionWarningReported;
     private bool _shownVersionBytesValid;
-    private bool _shownCr3Paused;
     private bool _shownCommandControlsRunning;
     private ulong _shownCr3;
     private bool _outputNearEnd = true;
@@ -398,18 +397,17 @@ public partial class MainWindow : FluentWindow
             UpdateVersionWarning(state, userVersion, driverVersion);
         }
 
-        if (paused)
+        if (state.Initialized != 0 && state.Registers.Cr3 != 0)
         {
-            if (_shownCr3Paused == false || state.Registers.Cr3 != _shownCr3)
+            if (state.Registers.Cr3 != _shownCr3)
             {
                 _shownCr3 = state.Registers.Cr3;
-                _shownCr3Paused = true;
                 Cr3Text.Text = $"CR3 {_shownCr3:X16}";
             }
         }
-        else if (_shownCr3Paused)
+        else if (_shownCr3 != 0)
         {
-            _shownCr3Paused = false;
+            _shownCr3 = 0;
             Cr3Text.Text = "CR3 —";
         }
 

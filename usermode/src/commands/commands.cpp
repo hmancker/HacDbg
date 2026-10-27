@@ -4776,6 +4776,16 @@ static std::uint64_t current_user_cr3()
 	return user_cr3_for_pid(GetCurrentProcessId());
 }
 
+std::uint64_t commands::context_cr3()
+{
+	if (implicit_process.set == 1 && implicit_process.process.user_cr3 != 0)
+	{
+		return implicit_process.process.user_cr3;
+	}
+
+	return sys::directory_for_local_memory();
+}
+
 static std::uint64_t cr3_for_guest_address(const std::uint64_t address)
 {
 	if (address <= 0x00007FFFFFFFFFFFull)
