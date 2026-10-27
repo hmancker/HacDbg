@@ -8,6 +8,7 @@ typedef std::uint64_t hypercall_uint64_t;
 typedef unsigned long long hypercall_uint64_t;
 #endif
 #include "../structures/memory_operation.h"
+#include "../structures/trap_frame.h"
 
 #ifdef __cplusplus
 enum class hypercall_type_t : std::uint64_t
@@ -73,11 +74,11 @@ constexpr std::uint64_t pause_latch_signature = 0x484354414C434148ull;
 constexpr std::uint64_t breakpoint_resume_publish = 0;
 constexpr std::uint64_t breakpoint_resume_abandon = 1;
 
-// flush_logs call_reserved_data. 0 copies the log ring. The call-type field
-// is 4 bits and 0..15 are already assigned, so the notify page shares this call.
-// 1 registers the caller's HACDBG_LOG_NOTIFY. 2 drops that registration.
-constexpr std::uint64_t flush_logs_register_notify = 1;
-constexpr std::uint64_t flush_logs_unregister_notify = 2;
+// flush_logs call_reserved_data. 0 copies the kernel log ring. The call-type
+// field is 4 bits and 0..15 are already assigned, so the mailbox shares this
+// call. 1 registers the caller's HACDBG_LOG_MAILBOX. 2 drops that registration.
+constexpr std::uint64_t flush_logs_register_mailbox = 1;
+constexpr std::uint64_t flush_logs_unregister_mailbox = 2;
 
 // Bytes copied inside one CPUID vmexit. The copy runs in Hyper-V's vmexit
 // handler, so a longer exit can stall the guest long enough to bugcheck.
@@ -88,32 +89,57 @@ constexpr std::uint64_t hypercall_memory_chunk_size = 0x10000;
 #define pause_latch_signature 0x484354414C434148ull
 #define breakpoint_resume_publish 0
 #define breakpoint_resume_abandon 1
-#define flush_logs_register_notify 1
-#define flush_logs_unregister_notify 2
+#define flush_logs_register_mailbox 1
+#define flush_logs_unregister_mailbox 2
 #define hypercall_memory_chunk_size 0x10000
 #endif
 
+// Records that follow the 32-byte header. trap_frame_log_t is 0xb8 bytes.
+#define HACDBG_LOG_MAILBOX_CAPACITY 2048
+#define HACDBG_LOG_MAILBOX_HEADER_BYTES 32
+#define HACDBG_LOG_MAILBOX_RECORD_BYTES 0xb8
+
 //
-// Debugger page registered through flush_logs. After each appended log the
-// hypervisor writes sequence, then sequence_copy, with the same value. A
-// reader that observes equal fields has a complete value. key is chosen by
-// the debugger and checked before every write so a reused CR3 is ignored.
+// Debugger mailbox registered through flush_logs. The header is 32 bytes and
+// records[HACDBG_LOG_MAILBOX_CAPACITY] follow it. Each record is
+// HACDBG_LOG_MAILBOX_RECORD_BYTES. After the record bytes are stored, the
+// hypervisor writes producer, then producer_copy, with the same count of
+// records ever published. A reader that observes equal fields has a complete
+// count. key is chosen by the debugger and checked before every write so a
+// reused CR3 is ignored. capacity is HACDBG_LOG_MAILBOX_CAPACITY; a smaller
+// page is rejected.
 //
-typedef struct _HACDBG_LOG_NOTIFY
+typedef struct _HACDBG_LOG_MAILBOX
 {
     hypercall_uint64_t key;
-    hypercall_uint64_t sequence;
-    hypercall_uint64_t sequence_copy;
-} HACDBG_LOG_NOTIFY;
+    hypercall_uint64_t capacity;
+    hypercall_uint64_t producer;
+    hypercall_uint64_t producer_copy;
+    unsigned char records[HACDBG_LOG_MAILBOX_CAPACITY * HACDBG_LOG_MAILBOX_RECORD_BYTES];
+} HACDBG_LOG_MAILBOX;
 
 #ifdef __cplusplus
-static_assert(sizeof(HACDBG_LOG_NOTIFY) == 24, "log notify ABI changed");
-static_assert(offsetof(HACDBG_LOG_NOTIFY, sequence) == 8, "log notify ABI changed");
-static_assert(offsetof(HACDBG_LOG_NOTIFY, sequence_copy) == 16, "log notify ABI changed");
+static_assert(sizeof(trap_frame_log_t) == HACDBG_LOG_MAILBOX_RECORD_BYTES, "log mailbox record size changed");
+static_assert(sizeof(HACDBG_LOG_MAILBOX) ==
+                  HACDBG_LOG_MAILBOX_HEADER_BYTES +
+                      (HACDBG_LOG_MAILBOX_CAPACITY * HACDBG_LOG_MAILBOX_RECORD_BYTES),
+              "log mailbox ABI changed");
+static_assert(offsetof(HACDBG_LOG_MAILBOX, capacity) == 8, "log mailbox ABI changed");
+static_assert(offsetof(HACDBG_LOG_MAILBOX, producer) == 16, "log mailbox ABI changed");
+static_assert(offsetof(HACDBG_LOG_MAILBOX, producer_copy) == 24, "log mailbox ABI changed");
+static_assert(offsetof(HACDBG_LOG_MAILBOX, records) == HACDBG_LOG_MAILBOX_HEADER_BYTES,
+              "log mailbox ABI changed");
 #else
-_Static_assert(sizeof(HACDBG_LOG_NOTIFY) == 24, "log notify ABI changed");
-_Static_assert(offsetof(HACDBG_LOG_NOTIFY, sequence) == 8, "log notify ABI changed");
-_Static_assert(offsetof(HACDBG_LOG_NOTIFY, sequence_copy) == 16, "log notify ABI changed");
+_Static_assert(sizeof(trap_frame_log_t) == HACDBG_LOG_MAILBOX_RECORD_BYTES, "log mailbox record size changed");
+_Static_assert(sizeof(HACDBG_LOG_MAILBOX) ==
+                   HACDBG_LOG_MAILBOX_HEADER_BYTES +
+                       (HACDBG_LOG_MAILBOX_CAPACITY * HACDBG_LOG_MAILBOX_RECORD_BYTES),
+               "log mailbox ABI changed");
+_Static_assert(offsetof(HACDBG_LOG_MAILBOX, capacity) == 8, "log mailbox ABI changed");
+_Static_assert(offsetof(HACDBG_LOG_MAILBOX, producer) == 16, "log mailbox ABI changed");
+_Static_assert(offsetof(HACDBG_LOG_MAILBOX, producer_copy) == 24, "log mailbox ABI changed");
+_Static_assert(offsetof(HACDBG_LOG_MAILBOX, records) == HACDBG_LOG_MAILBOX_HEADER_BYTES,
+               "log mailbox ABI changed");
 #endif
 
 #ifdef __cplusplus

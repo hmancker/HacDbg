@@ -929,7 +929,7 @@ namespace
 
 			// Trace reads used to skip this poll. A hit logged by the first
 			// pause CPUID then never reached the disassembly view. The poll
-			// reads the log notify sequence and flushes only when it changes.
+			// reads the log mailbox and copies new records locally.
 			if (commands::poll_breakpoint() != 0)
 			{
 				update_state(core);

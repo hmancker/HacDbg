@@ -638,13 +638,13 @@ HypercallExecute(
         break;
 
     case flush_logs:
-        if (Information->call_reserved_data == flush_logs_register_notify)
+        if (Information->call_reserved_data == flush_logs_register_mailbox)
         {
-            result = LogsRegisterNotify(CurrentCr3, registers->Rdx);
+            result = LogsRegisterMailbox(CurrentCr3, registers->Rdx);
         }
-        else if (Information->call_reserved_data == flush_logs_unregister_notify)
+        else if (Information->call_reserved_data == flush_logs_unregister_mailbox)
         {
-            result = LogsUnregisterNotify();
+            result = LogsUnregisterMailbox();
         }
         else if (Information->call_reserved_data == 0)
         {

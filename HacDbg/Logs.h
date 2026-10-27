@@ -57,26 +57,26 @@ LogsFlush(
 
 UINT64
 /**
- * @brief Registers the debugger page that receives the log sequence.
+ * @brief Registers the debugger mailbox that receives trap frame logs.
  *
  * @param Cr3 Page table root of the registering CPUID. Under KPTI this is
  * the debugger's user directory.
- * @param VirtualAddress Guest virtual address of one HACDBG_LOG_NOTIFY.
- * The structure must be 8-byte aligned and must not cross a page.
+ * @param VirtualAddress Guest virtual address of one page-aligned
+ * HACDBG_LOG_MAILBOX. The debugger locks every page before this call.
  *
- * @return 1 when the page is accepted; otherwise 0.
+ * @return 1 when the mailbox is accepted; otherwise 0.
  */
-LogsRegisterNotify(
+LogsRegisterMailbox(
     _In_ UINT64 Cr3,
     _In_ UINT64 VirtualAddress
     );
 
 UINT64
 /**
- * @brief Drops the log notify registration.
+ * @brief Drops the log mailbox registration.
  *
  * @return 1.
  */
-LogsUnregisterNotify(
+LogsUnregisterMailbox(
     VOID
     );

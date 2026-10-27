@@ -2,6 +2,7 @@
 #include <Windows.h>
 #include <hypercall/hypercall_def.h>
 #include <hypercall/control.h>
+#include <version.h>
 #include "../system/system.h"
 
 #include <atomic>
@@ -15,34 +16,181 @@ static_assert(sizeof(HACDBG_VERSION_INFO) == 0x30, "version ABI changed");
 
 static std::mutex g_flush_mutex;
 
-alignas(4096) static std::uint8_t g_log_notify_storage[4096];
+static HACDBG_LOG_MAILBOX* g_log_mailbox = nullptr;
+static std::uint64_t g_log_mailbox_key = 0;
 static std::atomic<std::uint8_t> g_log_notify_armed = 0;
 static std::atomic<std::uint64_t> g_log_notify_seen = 0;
 
-static HACDBG_LOG_NOTIFY* log_notify_page()
+static std::uint64_t mailbox_key()
 {
-	return reinterpret_cast<HACDBG_LOG_NOTIFY*>(g_log_notify_storage);
+	if (g_log_mailbox == nullptr)
+	{
+		return 0;
+	}
+
+	return *reinterpret_cast<const volatile std::uint64_t*>(&g_log_mailbox->key);
 }
 
-static std::uint64_t sample_log_notify(std::uint8_t& stable)
+static std::uint64_t launch_cpuid_hypercall(hypercall_type_t call_type, std::uint64_t call_reserved_data,
+                                            std::uint64_t rdx, std::uint64_t r8, std::uint64_t r9);
+
+static std::uint8_t mailbox_key_acceptable(const std::uint64_t key, const std::uint8_t allow_cleared)
 {
-	const HACDBG_LOG_NOTIFY* const page = log_notify_page();
+	if (key == g_log_mailbox_key)
+	{
+		return 1;
+	}
+
+	return static_cast<std::uint8_t>(allow_cleared == 1 && key == 0);
+}
+
+static std::uint64_t sample_log_mailbox(std::uint8_t& stable, const std::uint8_t allow_cleared)
+{
 	stable = 0;
+
+	if (g_log_mailbox == nullptr || mailbox_key_acceptable(mailbox_key(), allow_cleared) == 0)
+	{
+		return 0;
+	}
 
 	for (std::uint32_t attempt = 0; attempt < 8; ++attempt)
 	{
-		const std::uint64_t copy = *reinterpret_cast<const volatile std::uint64_t*>(&page->sequence_copy);
-		const std::uint64_t sequence = *reinterpret_cast<const volatile std::uint64_t*>(&page->sequence);
+		const std::uint64_t copy = *reinterpret_cast<const volatile std::uint64_t*>(&g_log_mailbox->producer_copy);
+		const std::uint64_t producer = *reinterpret_cast<const volatile std::uint64_t*>(&g_log_mailbox->producer);
 
-		if (copy == sequence)
+		if (copy == producer && mailbox_key_acceptable(mailbox_key(), allow_cleared) == 1)
 		{
 			stable = 1;
 
-			return sequence;
+			return producer;
 		}
 	}
 
 	return 0;
+}
+
+static trap_frame_log_t* mailbox_record(const std::uint64_t slot)
+{
+	return reinterpret_cast<trap_frame_log_t*>(g_log_mailbox->records +
+	                                           (slot * sizeof(trap_frame_log_t)));
+}
+
+// Copies records the mailbox has published since the last local read.
+// give_up is 1 when the mailbox key is no longer the one this process registered.
+static std::uint64_t copy_log_mailbox(std::vector<trap_frame_log_t>& logs, std::uint8_t& give_up)
+{
+	const std::uint64_t key = mailbox_key();
+	std::uint8_t stable = 0;
+	std::uint64_t producer;
+	std::uint64_t cursor;
+	std::uint64_t count;
+
+	give_up = 0;
+
+	if (mailbox_key_acceptable(key, 1) == 0)
+	{
+		give_up = 1;
+
+		return 0;
+	}
+
+	producer = sample_log_mailbox(stable, static_cast<std::uint8_t>(key == 0));
+
+	if (stable == 0)
+	{
+		if (key == 0)
+		{
+			give_up = 1;
+		}
+
+		return 0;
+	}
+
+	cursor = g_log_notify_seen.load(std::memory_order_relaxed);
+
+	if (producer < cursor)
+	{
+		cursor = 0;
+	}
+
+	if (producer - cursor > HACDBG_LOG_MAILBOX_CAPACITY)
+	{
+		cursor = producer - HACDBG_LOG_MAILBOX_CAPACITY;
+	}
+
+	count = producer - cursor;
+
+	if (count > logs.size())
+	{
+		count = logs.size();
+	}
+
+	std::atomic_thread_fence(std::memory_order_acquire);
+
+	for (std::uint64_t index = 0; index < count; index++)
+	{
+		const std::uint64_t slot = (cursor + index) % HACDBG_LOG_MAILBOX_CAPACITY;
+
+		logs[index] = *mailbox_record(slot);
+	}
+
+	g_log_notify_seen.store(cursor + count, std::memory_order_release);
+
+	if (mailbox_key() == 0)
+	{
+		give_up = 1;
+	}
+
+	return count;
+}
+
+static std::uint64_t flush_logs_hypercall(std::vector<trap_frame_log_t>& logs)
+{
+	constexpr auto call_type = hypercall_type_t::flush_logs;
+
+	if (logs.empty() == true)
+	{
+		return 0;
+	}
+
+	return launch_cpuid_hypercall(call_type, 0, reinterpret_cast<std::uint64_t>(logs.data()), logs.size(), 0);
+}
+
+static std::uint8_t driver_has_log_mailbox()
+{
+	std::uint32_t major = 0;
+	std::uint32_t minor = 0;
+	std::uint32_t patch = 0;
+	std::uint32_t abi = 0;
+	std::string version = {};
+
+	if (hypercall::query_driver_version(major, minor, patch, abi, version) == 0)
+	{
+		return 0;
+	}
+
+	if (major > HACDBG_VERSION_MAJOR)
+	{
+		return 1;
+	}
+
+	if (major < HACDBG_VERSION_MAJOR)
+	{
+		return 0;
+	}
+
+	if (minor > HACDBG_VERSION_MINOR)
+	{
+		return 1;
+	}
+
+	if (minor < HACDBG_VERSION_MINOR)
+	{
+		return 0;
+	}
+
+	// The mailbox was added in 1.1.5. A later patch still has it.
+	return static_cast<std::uint8_t>(patch >= 5);
 }
 
 static std::uint8_t offset_wraps(const std::uint64_t address, const std::uint64_t offset)
@@ -243,80 +391,144 @@ std::uint64_t hypercall::hide_guest_physical_page(const std::uint64_t target_gue
 
 std::uint64_t hypercall::flush_logs(std::vector<trap_frame_log_t>& logs)
 {
-	constexpr auto call_type = hypercall_type_t::flush_logs;
-	std::uint8_t stable = 0;
-	const std::uint8_t armed = g_log_notify_armed.load(std::memory_order_acquire);
-	const std::uint64_t observed = armed != 0 ? sample_log_notify(stable) : 0;
-	const std::uint64_t result = launch_cpuid_hypercall(call_type, 0, reinterpret_cast<std::uint64_t>(logs.data()),
-	                                                    logs.size(), 0);
+	std::lock_guard<std::mutex> guard(g_flush_mutex);
 
-	if (armed != 0 && stable != 0 && result != static_cast<std::uint64_t>(-1))
+	if (g_log_notify_armed.load(std::memory_order_acquire) != 0 && g_log_mailbox != nullptr)
 	{
-		g_log_notify_seen.store(observed, std::memory_order_release);
+		std::uint8_t give_up = 0;
+		const std::uint64_t copied = copy_log_mailbox(logs, give_up);
+
+		if (give_up == 0)
+		{
+			return copied;
+		}
+
+		g_log_notify_armed.store(0, std::memory_order_release);
+
+		if (copied >= logs.size())
+		{
+			return copied;
+		}
+
+		std::vector<trap_frame_log_t> rest(logs.size() - copied);
+		const std::uint64_t kernel = flush_logs_hypercall(rest);
+
+		if (kernel == static_cast<std::uint64_t>(-1))
+		{
+			return copied == 0 ? kernel : copied;
+		}
+
+		const std::uint64_t extra = kernel < rest.size() ? kernel : rest.size();
+
+		for (std::uint64_t index = 0; index < extra; index++)
+		{
+			logs[copied + index] = rest[index];
+		}
+
+		return copied + extra;
 	}
 
-	return result;
+	return flush_logs_hypercall(logs);
 }
 
 std::uint64_t hypercall::register_log_notify()
 {
-	HACDBG_LOG_NOTIFY* const page = log_notify_page();
-	std::uint64_t key = (static_cast<std::uint64_t>(GetTickCount64()) << 32) ^
-	                    reinterpret_cast<std::uintptr_t>(page) ^ 0x4E474C4F474E5446ull;
+	std::lock_guard<std::mutex> guard(g_flush_mutex);
+	HACDBG_LOG_MAILBOX* mailbox;
+	std::uint64_t key;
+
+	if (driver_has_log_mailbox() == 0)
+	{
+		return 0;
+	}
+
+	mailbox = static_cast<HACDBG_LOG_MAILBOX*>(
+		sys::user::allocate_locked_memory(sizeof(HACDBG_LOG_MAILBOX), PAGE_READWRITE));
+
+	if (mailbox == nullptr)
+	{
+		return 0;
+	}
+
+	key = (static_cast<std::uint64_t>(GetTickCount64()) << 32) ^
+	      reinterpret_cast<std::uintptr_t>(mailbox) ^ 0x4E474C4F474E5446ull;
 
 	if (key == 0)
 	{
 		key = 1;
 	}
 
-	page->key = key;
-	page->sequence = 0;
-	page->sequence_copy = 0;
+	mailbox->key = key;
+	mailbox->capacity = HACDBG_LOG_MAILBOX_CAPACITY;
+	mailbox->producer = 0;
+	mailbox->producer_copy = 0;
+	g_log_mailbox = mailbox;
+	g_log_mailbox_key = key;
 	g_log_notify_seen.store(0, std::memory_order_relaxed);
 
-	// A VM-exit cannot fault this page in. Lock it before the driver translates it.
-	if (sys::user::lock_resident_pages(g_log_notify_storage, sizeof(g_log_notify_storage)) == 0)
+	// A VM-exit cannot fault these pages in. Lock them before the driver translates them.
+	const std::uint64_t registered = launch_cpuid_hypercall(hypercall_type_t::flush_logs, flush_logs_register_mailbox,
+	                                                        reinterpret_cast<std::uint64_t>(mailbox), 0, 0);
+
+	if (registered != 1)
 	{
+		g_log_mailbox = nullptr;
+		g_log_mailbox_key = 0;
 		g_log_notify_armed.store(0, std::memory_order_release);
+		sys::user::free_memory(mailbox);
 
 		return 0;
 	}
 
-	const std::uint64_t registered = launch_cpuid_hypercall(hypercall_type_t::flush_logs, flush_logs_register_notify,
-	                                                        reinterpret_cast<std::uint64_t>(page), 0, 0);
+	g_log_notify_armed.store(1, std::memory_order_release);
 
-	g_log_notify_armed.store(registered == 1 ? 1 : 0, std::memory_order_release);
-
-	return registered == 1 ? 1 : 0;
+	return 1;
 }
 
 void hypercall::unregister_log_notify()
 {
-	if (g_log_notify_armed.exchange(0, std::memory_order_acq_rel) == 0)
+	std::lock_guard<std::mutex> guard(g_flush_mutex);
+	HACDBG_LOG_MAILBOX* mailbox;
+	const std::uint8_t armed = g_log_notify_armed.exchange(0, std::memory_order_acq_rel);
+
+	mailbox = g_log_mailbox;
+	g_log_mailbox = nullptr;
+	g_log_mailbox_key = 0;
+
+	if (armed != 0)
 	{
-		return;
+		launch_cpuid_hypercall(hypercall_type_t::flush_logs, flush_logs_unregister_mailbox, 0, 0, 0);
 	}
 
-	launch_cpuid_hypercall(hypercall_type_t::flush_logs, flush_logs_unregister_notify, 0, 0, 0);
+	if (mailbox != nullptr)
+	{
+		sys::user::free_memory(mailbox);
+	}
 }
 
 std::uint8_t hypercall::log_notify_idle()
 {
+	std::lock_guard<std::mutex> guard(g_flush_mutex);
 	std::uint8_t stable = 0;
 
-	if (g_log_notify_armed.load(std::memory_order_acquire) == 0)
+	if (g_log_notify_armed.load(std::memory_order_acquire) == 0 || g_log_mailbox == nullptr)
 	{
 		return 0;
 	}
 
-	const std::uint64_t sequence = sample_log_notify(stable);
+	if (mailbox_key() != g_log_mailbox_key)
+	{
+		return 0;
+	}
+
+	const std::uint64_t producer = sample_log_mailbox(stable, 0);
 
 	if (stable == 0)
 	{
 		return 0;
 	}
 
-	return sequence == g_log_notify_seen.load(std::memory_order_acquire) ? 1 : 0;
+	return producer == g_log_notify_seen.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 std::uint64_t hypercall::get_heap_free_page_count()

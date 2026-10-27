@@ -35,10 +35,10 @@ namespace hypercall
 
 	std::uint64_t flush_logs(std::vector<trap_frame_log_t>& logs);
 
-	// Registers this process's log notify page. 0 leaves polling on flush_logs.
+	// Registers this process's log mailbox. 0 leaves polling on flush_logs.
 	std::uint64_t register_log_notify();
 	void unregister_log_notify();
-	// 1 when the registered sequence matches the last successful flush.
+	// 1 when the mailbox has no records newer than the last local copy.
 	std::uint8_t log_notify_idle();
 
 	std::uint64_t get_heap_free_page_count();

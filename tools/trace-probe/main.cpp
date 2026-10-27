@@ -8,6 +8,36 @@
 
 #include "hypercall.h"
 
+// hypercall.cpp registers the log mailbox with these two functions. This probe
+// does not call them. The definitions are here because the probe does not link
+// usermode/src/system/system.cpp.
+namespace sys::user
+{
+	void* allocate_locked_memory(const std::uint64_t size, const std::uint32_t protection)
+	{
+		void* const base = VirtualAlloc(nullptr, static_cast<SIZE_T>(size), MEM_COMMIT | MEM_RESERVE, protection);
+
+		if (base == nullptr)
+		{
+			return nullptr;
+		}
+
+		if (VirtualLock(base, static_cast<SIZE_T>(size)) == 0)
+		{
+			VirtualFree(base, 0, MEM_RELEASE);
+
+			return nullptr;
+		}
+
+		return base;
+	}
+
+	std::uint8_t free_memory(void* address)
+	{
+		return static_cast<std::uint8_t>(VirtualFree(address, 0, MEM_RELEASE) != 0);
+	}
+}
+
 namespace
 {
 	const char* const reason_names[HACDBG_TRACE_REASON_COUNT] = {

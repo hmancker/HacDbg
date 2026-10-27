@@ -1127,6 +1127,121 @@ PhysicalMemoryMapsKernelImage(
     return (entry & PHYSICAL_PTE_PRESENT) != 0;
 }
 
+// 只接受已经在位的 4 KiB 页，并记下叶子 PTE 的物理地址。
+INT
+GuestVirtualTranslate4k(
+    _In_ UINT64 Cr3,
+    _In_ GUEST_VIRTUAL_ADDRESS VirtualAddress,
+    _Out_ GUEST_PHYSICAL_ADDRESS* PagePhysical,
+    _Out_ GUEST_PHYSICAL_ADDRESS* PtePhysical
+    )
+{
+    UINT64 table = Cr3 & PHYSICAL_PTE_FRAME;
+    UINT64 entry = 0;
+    UINT8 level;
+    UINT8 levels = g_FiveLevelPaging != FALSE ? 5 : 4;
+    UINT64 shift = g_FiveLevelPaging != FALSE ? 48 : 39;
+
+    if (PagePhysical == NULL || PtePhysical == NULL || table == 0)
+    {
+        return 0;
+    }
+
+    PagePhysical->Value = 0;
+    PtePhysical->Value = 0;
+
+    for (level = 0; level < levels; level++, shift -= 9)
+    {
+        UINT64 index = (VirtualAddress.Value >> shift) & 0x1ffull;
+        GUEST_PHYSICAL_ADDRESS entryAddress = HacDbgGuestPhysicalAddress(table + (index * sizeof(UINT64)));
+        UINT64 available = 0;
+        SIZE_T read;
+
+        //
+        // INVARIANT: entryAddress is one 8-byte slot in a guest page-table
+        // page reached from Cr3. That table page is RAM. The read does not
+        // allocate and does not use a guest virtual alias.
+        //
+        read = PhysicalMemoryRead(entryAddress, &entry, sizeof(entry));
+
+        if (read != sizeof(entry) || (entry & PHYSICAL_PTE_PRESENT) == 0)
+        {
+            return 0;
+        }
+
+        if ((shift == 30 || shift == 21) && (entry & PHYSICAL_PTE_LARGE) != 0)
+        {
+            return 0;
+        }
+
+        if (shift == 12)
+        {
+            UINT64 frame = entry & PHYSICAL_PTE_FRAME;
+
+            if (PhysicalMemoryFindRange(frame, &available) == FALSE)
+            {
+                return 0;
+            }
+
+            PagePhysical->Value = frame;
+            PtePhysical->Value = entryAddress.Value;
+            return 1;
+        }
+
+        {
+            UINT64 nextTable = entry & PHYSICAL_PTE_FRAME;
+
+            if (PhysicalMemoryFindRange(nextTable, &available) == FALSE)
+            {
+                return 0;
+            }
+
+            table = nextTable;
+        }
+    }
+
+    return 0;
+}
+
+// 叶子 PTE 仍指向注册时记下的 4 KiB 页时返回 1。
+INT
+GuestPhysicalPteState(
+    _In_ GUEST_PHYSICAL_ADDRESS PtePhysical,
+    _In_ GUEST_PHYSICAL_ADDRESS PagePhysical
+    )
+{
+    UINT64 entry = 0;
+    SIZE_T read;
+
+    if ((PagePhysical.Value & (PAGE_SIZE - 1)) != 0)
+    {
+        return -1;
+    }
+
+    //
+    // INVARIANT: PtePhysical is the guest physical address of one leaf PTE
+    // captured while that page was present. The read does not allocate.
+    //
+    read = PhysicalMemoryRead(PtePhysical, &entry, sizeof(entry));
+
+    if (read != sizeof(entry))
+    {
+        return 0;
+    }
+
+    if ((entry & PHYSICAL_PTE_PRESENT) == 0 || (entry & PHYSICAL_PTE_LARGE) != 0)
+    {
+        return -1;
+    }
+
+    if ((entry & PHYSICAL_PTE_FRAME) != PagePhysical.Value)
+    {
+        return -1;
+    }
+
+    return 1;
+}
+
 // 按 CR3 遍历四/五级页表。内核半区的 PML4/PDPT 缺失时，改用其它 CPL 0 目录。
 BOOLEAN
 _Success_(return != FALSE)

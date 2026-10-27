@@ -170,6 +170,42 @@ GuestVirtualToPhysical(
     _Out_opt_ BOOLEAN* NotResident
     );
 
+INT
+/**
+ * @brief Translates one present 4 KiB guest page and its leaf PTE.
+ *
+ * @details Large pages and software PTEs are rejected. The caller uses the
+ * returned page and PTE addresses on later exits instead of walking again.
+ *
+ * @param Cr3 Guest page table root.
+ * @param VirtualAddress Guest virtual address inside the page.
+ * @param PagePhysical Receives the 4 KiB-aligned guest physical page.
+ * @param PtePhysical Receives the guest physical address of the leaf PTE.
+ *
+ * @return 1 when the leaf is a present 4 KiB PTE in RAM; otherwise 0.
+ */
+GuestVirtualTranslate4k(
+    _In_ UINT64 Cr3,
+    _In_ GUEST_VIRTUAL_ADDRESS VirtualAddress,
+    _Out_ GUEST_PHYSICAL_ADDRESS* PagePhysical,
+    _Out_ GUEST_PHYSICAL_ADDRESS* PtePhysical
+    );
+
+INT
+/**
+ * @brief Compares a cached leaf PTE with the page it must still name.
+ *
+ * @param PtePhysical Guest physical address of the leaf PTE.
+ * @param PagePhysical 4 KiB-aligned guest physical page captured earlier.
+ *
+ * @return 1 when the PTE is present and names PagePhysical. 0 when the PTE
+ * could not be read. -1 when the PTE was read and does not name that page.
+ */
+GuestPhysicalPteState(
+    _In_ GUEST_PHYSICAL_ADDRESS PtePhysical,
+    _In_ GUEST_PHYSICAL_ADDRESS PagePhysical
+    );
+
 SIZE_T
 /**
  * @brief Reads through guest page tables.

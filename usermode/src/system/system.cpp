@@ -1083,7 +1083,7 @@ std::uint8_t sys::set_up()
 
 	if (hypercall::register_log_notify() == 0)
 	{
-		LOG_ERR("log notify registration failed, breakpoint polling uses cpuid");
+		LOG_ERR("log mailbox registration failed, breakpoint polling uses cpuid");
 	}
 
 	return 1;
