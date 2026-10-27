@@ -3637,15 +3637,8 @@ static std::uint8_t read_kernel_memory(std::uint64_t address, void* buffer, std:
 static void release_suspended_process_for_pause(std::uint64_t cr3);
 static void announce_breakpoint_hit();
 
-static void process_g(const CLI::App* const command)
+static void resume_paused_command()
 {
-	if (command->remaining().empty() == false)
-	{
-		LOG_ERR("invalid syntax");
-
-		return;
-	}
-
 	if (breakpoint::has_paused_thread() == 0)
 	{
 		if (resume_suspended_process() == 0)
@@ -3675,6 +3668,18 @@ static void process_g(const CLI::App* const command)
 	{
 		release_suspended_process_for_pause(registers.cr3);
 	}
+}
+
+static void process_g(const CLI::App* const command)
+{
+	if (command->remaining().empty() == false)
+	{
+		LOG_ERR("invalid syntax");
+
+		return;
+	}
+
+	resume_paused_command();
 }
 
 static void process_bp(const CLI::App* const command)
@@ -10108,6 +10113,139 @@ std::uint8_t commands::is_quit_command(const std::string& command)
 		equals_ignore_case(text, "qq") == 1 || equals_ignore_case(text, ".quit") == 1);
 }
 
+static std::uint8_t control_step_kind(const std::string& name, std::uint8_t& into_out, step_stop_t& stop_out)
+{
+	into_out = 0;
+	stop_out = step_stop_t::none;
+
+	if (equals_ignore_case(name, "t") == 1)
+	{
+		into_out = 1;
+
+		return 1;
+	}
+
+	if (equals_ignore_case(name, "p") == 1)
+	{
+		return 1;
+	}
+
+	if (equals_ignore_case(name, "tc") == 1)
+	{
+		into_out = 1;
+		stop_out = step_stop_t::call;
+
+		return 1;
+	}
+
+	if (equals_ignore_case(name, "tt") == 1)
+	{
+		into_out = 1;
+		stop_out = step_stop_t::ret;
+
+		return 1;
+	}
+
+	if (equals_ignore_case(name, "tct") == 1)
+	{
+		into_out = 1;
+		stop_out = step_stop_t::either;
+
+		return 1;
+	}
+
+	if (equals_ignore_case(name, "pc") == 1)
+	{
+		stop_out = step_stop_t::call;
+
+		return 1;
+	}
+
+	if (equals_ignore_case(name, "pt") == 1)
+	{
+		stop_out = step_stop_t::ret;
+
+		return 1;
+	}
+
+	if (equals_ignore_case(name, "pct") == 1)
+	{
+		stop_out = step_stop_t::either;
+
+		return 1;
+	}
+
+	return 0;
+}
+
+//
+// g and the step commands do not use the kernel module list. Parsing every
+// loaded module here rereads PsLoadedModuleList through hypercalls before the
+// paused thread is released.
+//
+static std::uint8_t dispatch_control_command(const std::string& command)
+{
+	std::string_view body = skip_whitespace(command);
+	std::string name = {};
+
+	if (take_command_token(body, name) == 0)
+	{
+		return 0;
+	}
+
+	if (equals_ignore_case(name, "g") == 1)
+	{
+		std::string extra = {};
+
+		if (take_command_token(body, extra) == 1)
+		{
+			LOG_ERR("invalid syntax");
+
+			return 1;
+		}
+
+		resume_paused_command();
+
+		return 1;
+	}
+
+	std::uint8_t into = 0;
+	step_stop_t stop = step_stop_t::none;
+
+	if (control_step_kind(name, into, stop) == 0)
+	{
+		return 0;
+	}
+
+	std::vector<std::string> args = {};
+	std::string count_text = {};
+
+	if (take_command_token(body, count_text) == 1)
+	{
+		std::string extra = {};
+
+		if (take_command_token(body, extra) == 1)
+		{
+			LOG_ERR("invalid syntax");
+
+			return 1;
+		}
+
+		args.push_back(count_text);
+	}
+
+	std::uint64_t count = 1;
+
+	if (parse_step_count(args, count) == 0)
+	{
+		return 1;
+	}
+
+	run_steps(into, count, stop);
+
+	return 1;
+}
+
 void commands::process(const std::string& command)
 {
 	if (command.empty())
@@ -10117,6 +10255,11 @@ void commands::process(const std::string& command)
 
 	const std::string parsed_command = normalize_symbol_command(command);
 	windbg_command_line = parsed_command;
+
+	if (dispatch_control_command(parsed_command) == 1)
+	{
+		return;
+	}
 
 	CLI::App app;
 	app.require_subcommand(1);
