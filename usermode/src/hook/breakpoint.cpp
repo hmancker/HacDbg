@@ -3894,6 +3894,11 @@ std::uint8_t breakpoint::poll_new_pause()
 		return 1;
 	}
 
+	if (hypercall::log_notify_idle() != 0)
+	{
+		return 0;
+	}
+
 	if (flush_into_pause_state(0) == 0)
 	{
 		return 0;
@@ -4193,7 +4198,7 @@ std::uint8_t breakpoint::continue_paused_thread(const std::uint64_t logical_rip,
 
 	while (GetTickCount64() - started < wait_ms)
 	{
-		if (flush_into_pause_state(0) == 1 && pause_state.valid == 1)
+		if (hypercall::log_notify_idle() == 0 && flush_into_pause_state(0) == 1 && pause_state.valid == 1)
 		{
 			return 1;
 		}

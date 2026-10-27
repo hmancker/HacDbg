@@ -1081,11 +1081,17 @@ std::uint8_t sys::set_up()
 		return 0;
 	}
 
+	if (hypercall::register_log_notify() == 0)
+	{
+		LOG_ERR("log notify registration failed, breakpoint polling uses cpuid");
+	}
+
 	return 1;
 }
 
 void sys::clean_up()
 {
+	hypercall::unregister_log_notify();
 	breakpoint::clean_up();
 	symbol_parser::unload();
 	hook::clean_up();

@@ -2,7 +2,9 @@
 #include <Windows.h>
 #include <hypercall/hypercall_def.h>
 #include <hypercall/control.h>
+#include "../system/system.h"
 
+#include <atomic>
 #include <mutex>
 
 extern "C" std::uint64_t launch_raw_hypercall(hypercall_info_t rcx, std::uint64_t rdx, std::uint64_t r8,
@@ -12,6 +14,36 @@ static_assert(sizeof(HACDBG_HYPERCALL_REQUEST) == 0x40, "IOCTL ABI changed");
 static_assert(sizeof(HACDBG_VERSION_INFO) == 0x30, "version ABI changed");
 
 static std::mutex g_flush_mutex;
+
+alignas(4096) static std::uint8_t g_log_notify_storage[4096];
+static std::atomic<std::uint8_t> g_log_notify_armed = 0;
+static std::atomic<std::uint64_t> g_log_notify_seen = 0;
+
+static HACDBG_LOG_NOTIFY* log_notify_page()
+{
+	return reinterpret_cast<HACDBG_LOG_NOTIFY*>(g_log_notify_storage);
+}
+
+static std::uint64_t sample_log_notify(std::uint8_t& stable)
+{
+	const HACDBG_LOG_NOTIFY* const page = log_notify_page();
+	stable = 0;
+
+	for (std::uint32_t attempt = 0; attempt < 8; ++attempt)
+	{
+		const std::uint64_t copy = *reinterpret_cast<const volatile std::uint64_t*>(&page->sequence_copy);
+		const std::uint64_t sequence = *reinterpret_cast<const volatile std::uint64_t*>(&page->sequence);
+
+		if (copy == sequence)
+		{
+			stable = 1;
+
+			return sequence;
+		}
+	}
+
+	return 0;
+}
 
 static std::uint8_t offset_wraps(const std::uint64_t address, const std::uint64_t offset)
 {
@@ -212,8 +244,79 @@ std::uint64_t hypercall::hide_guest_physical_page(const std::uint64_t target_gue
 std::uint64_t hypercall::flush_logs(std::vector<trap_frame_log_t>& logs)
 {
 	constexpr auto call_type = hypercall_type_t::flush_logs;
+	std::uint8_t stable = 0;
+	const std::uint8_t armed = g_log_notify_armed.load(std::memory_order_acquire);
+	const std::uint64_t observed = armed != 0 ? sample_log_notify(stable) : 0;
+	const std::uint64_t result = launch_cpuid_hypercall(call_type, 0, reinterpret_cast<std::uint64_t>(logs.data()),
+	                                                    logs.size(), 0);
 
-	return launch_cpuid_hypercall(call_type, 0, reinterpret_cast<std::uint64_t>(logs.data()), logs.size(), 0);
+	if (armed != 0 && stable != 0 && result != static_cast<std::uint64_t>(-1))
+	{
+		g_log_notify_seen.store(observed, std::memory_order_release);
+	}
+
+	return result;
+}
+
+std::uint64_t hypercall::register_log_notify()
+{
+	HACDBG_LOG_NOTIFY* const page = log_notify_page();
+	std::uint64_t key = (static_cast<std::uint64_t>(GetTickCount64()) << 32) ^
+	                    reinterpret_cast<std::uintptr_t>(page) ^ 0x4E474C4F474E5446ull;
+
+	if (key == 0)
+	{
+		key = 1;
+	}
+
+	page->key = key;
+	page->sequence = 0;
+	page->sequence_copy = 0;
+	g_log_notify_seen.store(0, std::memory_order_relaxed);
+
+	// A VM-exit cannot fault this page in. Lock it before the driver translates it.
+	if (sys::user::lock_resident_pages(g_log_notify_storage, sizeof(g_log_notify_storage)) == 0)
+	{
+		g_log_notify_armed.store(0, std::memory_order_release);
+
+		return 0;
+	}
+
+	const std::uint64_t registered = launch_cpuid_hypercall(hypercall_type_t::flush_logs, flush_logs_register_notify,
+	                                                        reinterpret_cast<std::uint64_t>(page), 0, 0);
+
+	g_log_notify_armed.store(registered == 1 ? 1 : 0, std::memory_order_release);
+
+	return registered == 1 ? 1 : 0;
+}
+
+void hypercall::unregister_log_notify()
+{
+	if (g_log_notify_armed.exchange(0, std::memory_order_acq_rel) == 0)
+	{
+		return;
+	}
+
+	launch_cpuid_hypercall(hypercall_type_t::flush_logs, flush_logs_unregister_notify, 0, 0, 0);
+}
+
+std::uint8_t hypercall::log_notify_idle()
+{
+	std::uint8_t stable = 0;
+
+	if (g_log_notify_armed.load(std::memory_order_acquire) == 0)
+	{
+		return 0;
+	}
+
+	const std::uint64_t sequence = sample_log_notify(stable);
+
+	if (stable == 0)
+	{
+		return 0;
+	}
+
+	return sequence == g_log_notify_seen.load(std::memory_order_acquire) ? 1 : 0;
 }
 
 std::uint64_t hypercall::get_heap_free_page_count()

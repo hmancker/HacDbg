@@ -8,6 +8,7 @@
 #pragma once
 
 #include "Types.h"
+#include "../shared/hypercall/hypercall_def.h"
 #include "../shared/structures/trap_frame.h"
 
 NTSTATUS
@@ -52,4 +53,30 @@ LogsFlush(
     _In_ UINT64 DestinationCr3,
     _In_ GUEST_VIRTUAL_ADDRESS Destination,
     _In_ UINT64 MaximumCount
+    );
+
+UINT64
+/**
+ * @brief Registers the debugger page that receives the log sequence.
+ *
+ * @param Cr3 Page table root of the registering CPUID. Under KPTI this is
+ * the debugger's user directory.
+ * @param VirtualAddress Guest virtual address of one HACDBG_LOG_NOTIFY.
+ * The structure must be 8-byte aligned and must not cross a page.
+ *
+ * @return 1 when the page is accepted; otherwise 0.
+ */
+LogsRegisterNotify(
+    _In_ UINT64 Cr3,
+    _In_ UINT64 VirtualAddress
+    );
+
+UINT64
+/**
+ * @brief Drops the log notify registration.
+ *
+ * @return 1.
+ */
+LogsUnregisterNotify(
+    VOID
     );

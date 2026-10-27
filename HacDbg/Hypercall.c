@@ -638,7 +638,19 @@ HypercallExecute(
         break;
 
     case flush_logs:
-        result = LogsFlush(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx), registers->R8);
+        if (Information->call_reserved_data == flush_logs_register_notify)
+        {
+            result = LogsRegisterNotify(CurrentCr3, registers->Rdx);
+        }
+        else if (Information->call_reserved_data == flush_logs_unregister_notify)
+        {
+            result = LogsUnregisterNotify();
+        }
+        else if (Information->call_reserved_data == 0)
+        {
+            result = LogsFlush(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx), registers->R8);
+        }
+
         break;
 
     case get_heap_free_page_count:

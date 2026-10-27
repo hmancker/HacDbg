@@ -924,7 +924,8 @@ namespace
 			apply_pending_trace_control(core);
 
 			// Trace reads used to skip this poll. A hit logged by the first
-			// pause CPUID then never reached the disassembly view.
+			// pause CPUID then never reached the disassembly view. The poll
+			// reads the log notify sequence and flushes only when it changes.
 			if (commands::poll_breakpoint() != 0)
 			{
 				update_state(core);

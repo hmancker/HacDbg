@@ -1,8 +1,10 @@
 #pragma once
 #ifdef __cplusplus
+#include <cstddef>
 #include <cstdint>
 typedef std::uint64_t hypercall_uint64_t;
 #else
+#include <stddef.h>
 typedef unsigned long long hypercall_uint64_t;
 #endif
 #include "../structures/memory_operation.h"
@@ -71,6 +73,12 @@ constexpr std::uint64_t pause_latch_signature = 0x484354414C434148ull;
 constexpr std::uint64_t breakpoint_resume_publish = 0;
 constexpr std::uint64_t breakpoint_resume_abandon = 1;
 
+// flush_logs call_reserved_data. 0 copies the log ring. The call-type field
+// is 4 bits and 0..15 are already assigned, so the notify page shares this call.
+// 1 registers the caller's HACDBG_LOG_NOTIFY. 2 drops that registration.
+constexpr std::uint64_t flush_logs_register_notify = 1;
+constexpr std::uint64_t flush_logs_unregister_notify = 2;
+
 // Bytes copied inside one CPUID vmexit. The copy runs in Hyper-V's vmexit
 // handler, so a longer exit can stall the guest long enough to bugcheck.
 constexpr std::uint64_t hypercall_memory_chunk_size = 0x10000;
@@ -80,7 +88,32 @@ constexpr std::uint64_t hypercall_memory_chunk_size = 0x10000;
 #define pause_latch_signature 0x484354414C434148ull
 #define breakpoint_resume_publish 0
 #define breakpoint_resume_abandon 1
+#define flush_logs_register_notify 1
+#define flush_logs_unregister_notify 2
 #define hypercall_memory_chunk_size 0x10000
+#endif
+
+//
+// Debugger page registered through flush_logs. After each appended log the
+// hypervisor writes sequence, then sequence_copy, with the same value. A
+// reader that observes equal fields has a complete value. key is chosen by
+// the debugger and checked before every write so a reused CR3 is ignored.
+//
+typedef struct _HACDBG_LOG_NOTIFY
+{
+    hypercall_uint64_t key;
+    hypercall_uint64_t sequence;
+    hypercall_uint64_t sequence_copy;
+} HACDBG_LOG_NOTIFY;
+
+#ifdef __cplusplus
+static_assert(sizeof(HACDBG_LOG_NOTIFY) == 24, "log notify ABI changed");
+static_assert(offsetof(HACDBG_LOG_NOTIFY, sequence) == 8, "log notify ABI changed");
+static_assert(offsetof(HACDBG_LOG_NOTIFY, sequence_copy) == 16, "log notify ABI changed");
+#else
+_Static_assert(sizeof(HACDBG_LOG_NOTIFY) == 24, "log notify ABI changed");
+_Static_assert(offsetof(HACDBG_LOG_NOTIFY, sequence) == 8, "log notify ABI changed");
+_Static_assert(offsetof(HACDBG_LOG_NOTIFY, sequence_copy) == 16, "log notify ABI changed");
 #endif
 
 #ifdef __cplusplus
