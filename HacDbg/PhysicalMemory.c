@@ -752,6 +752,41 @@ PhysicalMemoryMapTemporary(
     return (PUCHAR)slot->Window + pageOffset;
 }
 
+BOOLEAN
+PhysicalMemoryFlushPage(
+    _In_ GUEST_PHYSICAL_ADDRESS Page
+    )
+{
+    SIZE_T mappedSize = 0;
+    PVOID mapped;
+    UINT64 offset;
+
+    if ((Page.Value & (PAGE_SIZE - 1)) != 0)
+    {
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: Page is one 4 KiB RAM frame. The temporary window is a
+    // host virtual alias of that frame and is not a guest mapping.
+    //
+    mapped = PhysicalMemoryMapTemporary(Page, PAGE_SIZE, &mappedSize);
+
+    if (mapped == NULL || mappedSize < PAGE_SIZE)
+    {
+        return FALSE;
+    }
+
+    for (offset = 0; offset < PAGE_SIZE; offset += 64)
+    {
+        _mm_clflush((PUCHAR)mapped + offset);
+    }
+
+    _mm_mfence();
+    PhysicalMemoryUnmapTemporary(mapped, mappedSize);
+    return TRUE;
+}
+
 // 解除临时映射。
 VOID
 PhysicalMemoryUnmapTemporary(

@@ -155,6 +155,22 @@ PhysicalMemoryRead(
     _In_ SIZE_T Size
     );
 
+BOOLEAN
+/**
+ * @brief Writes a guest RAM page back from the cache.
+ *
+ * @details Execute hooks publish bytes that were stored through another
+ * mapping. A later fetch uses the EPT memory type of that page. When the
+ * type does not snoop, the fetch reads DRAM and misses the cached stores.
+ *
+ * @param Page 4 KiB-aligned guest physical page in RAM.
+ *
+ * @return TRUE when the page was mapped and flushed.
+ */
+PhysicalMemoryFlushPage(
+    _In_ GUEST_PHYSICAL_ADDRESS Page
+    );
+
 SIZE_T
 /**
  * @brief Writes guest physical memory.

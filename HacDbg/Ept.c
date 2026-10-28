@@ -1051,8 +1051,7 @@ EptAddHook(
     UINT64* hookPte;
     UINT32 index;
 
-    if (g_Initialized == FALSE || (TargetPage.Value & (PAGE_SIZE - 1)) != 0 ||
-        (ShadowPage.Value & (PAGE_SIZE - 1)) != 0)
+    if (g_Initialized == FALSE || target == 0 || shadow == 0)
     {
         HACDBG_LOG("HacDbg: Err, EPT hook rejected initialized=%u target=0x%I64x shadow=0x%I64x.\n",
                  g_Initialized, TargetPage.Value, ShadowPage.Value);
@@ -1097,6 +1096,11 @@ EptAddHook(
     g_Hooks[index].TargetPage = target;
     g_Hooks[index].ShadowPage = shadow;
     g_Hooks[index].Active = FALSE;
+
+    if (PhysicalMemoryFlushPage(HacDbgGuestPhysicalAddress(shadow)) == FALSE)
+    {
+        HACDBG_LOG("HacDbg: Err, EPT shadow flush failed pa=0x%I64x.\n", shadow);
+    }
 
     *hookPte = (shadow & EPT_ADDRESS_MASK) | EptAccessFlags(shadow, TRUE);
     EptSetAdjacentExecutable(target);
