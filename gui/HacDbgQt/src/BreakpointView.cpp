@@ -34,19 +34,20 @@ BreakpointView::BreakpointView(QWidget* parent)
     m_table = new QTableView(this);
     prepareTable(m_table);
     m_model = new QStandardItemModel(this);
-    m_model->setHorizontalHeaderLabels(
-        {QStringLiteral("ID"), QStringLiteral("地址"), QStringLiteral("CR3"), QStringLiteral("状态"), QStringLiteral("暂停")});
+    m_model->setHorizontalHeaderLabels({QStringLiteral("种类"), QStringLiteral("ID"), QStringLiteral("地址"),
+                                        QStringLiteral("CR3"), QStringLiteral("状态"), QStringLiteral("暂停"),
+                                        QStringLiteral("次数")});
     m_table->setModel(m_model);
     layout->addWidget(m_table);
     connect(m_table, &QTableView::doubleClicked, this, [this](const QModelIndex& index)
     {
-        if (index.row() < 0 || index.row() >= static_cast<int>(m_rows.size()))
+        if (index.row() < 0 || index.row() >= static_cast<int>(m_activation.size()))
         {
             return;
         }
 
-        const HACDBG_CORE_BREAKPOINT& row = m_rows[static_cast<std::size_t>(index.row())];
-        emit addressActivated(row.Address, row.Cr3);
+        const Activation& row = m_activation[static_cast<std::size_t>(index.row())];
+        emit addressActivated(row.address, row.cr3);
     });
 }
 
@@ -73,16 +74,64 @@ void BreakpointView::setBreakpoints(const HACDBG_CORE_BREAKPOINT* breakpoints, s
     }
 
     m_rows.assign(breakpoints, breakpoints + count);
+    rebuild();
+}
+
+void BreakpointView::setMonitors(const HACDBG_CORE_MONITOR* monitors, std::uint32_t count)
+{
+    if (count > HACDBG_CORE_MAX_MONITORS)
+    {
+        count = HACDBG_CORE_MAX_MONITORS;
+    }
+
+    bool same = count == m_monitors.size();
+
+    for (std::uint32_t index = 0; same && index < count; ++index)
+    {
+        const HACDBG_CORE_MONITOR& next = monitors[index];
+        const HACDBG_CORE_MONITOR& previous = m_monitors[index];
+        same = next.Address == previous.Address && next.Hits == previous.Hits;
+    }
+
+    if (same)
+    {
+        return;
+    }
+
+    m_monitors.assign(monitors, monitors + count);
+    rebuild();
+}
+
+void BreakpointView::rebuild()
+{
     m_model->removeRows(0, m_model->rowCount());
+    m_activation.clear();
 
     for (const HACDBG_CORE_BREAKPOINT& row : m_rows)
     {
+        m_activation.push_back({row.Address, row.Cr3});
         m_model->appendRow({
+            new QStandardItem(QStringLiteral("断点")),
             new QStandardItem(QString::number(row.Id)),
             new QStandardItem(hex16(row.Address)),
             new QStandardItem(row.Cr3 == 0 ? QStringLiteral("—") : hex16(row.Cr3)),
             new QStandardItem(row.Enabled != 0 ? QStringLiteral("启用") : QStringLiteral("禁用")),
             new QStandardItem(row.PausesThread != 0 ? QStringLiteral("暂停") : QString()),
+            new QStandardItem(QStringLiteral("—")),
+        });
+    }
+
+    for (const HACDBG_CORE_MONITOR& row : m_monitors)
+    {
+        m_activation.push_back({row.Address, 0});
+        m_model->appendRow({
+            new QStandardItem(QStringLiteral("监控")),
+            new QStandardItem(QStringLiteral("—")),
+            new QStandardItem(hex16(row.Address)),
+            new QStandardItem(QStringLiteral("—")),
+            new QStandardItem(QStringLiteral("启用")),
+            new QStandardItem(QString()),
+            new QStandardItem(QString::number(row.Hits)),
         });
     }
 }

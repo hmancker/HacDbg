@@ -59,12 +59,37 @@ static CLI::Option* add_command_option(CLI::App* const app, const std::string& o
 	return app->add_option(option_name);
 }
 
+static std::uint8_t resolve_windbg_address(const std::unordered_map<std::string, std::uint64_t>& aliases,
+                                           std::string_view text, std::uint64_t& address_out);
+
 static CLI::Option* add_transformed_command_option(CLI::App* const app, const std::string& option_name,
                                                    const CLI::Transformer& transformer)
 {
 	auto* const option = add_command_option(app, option_name);
 
 	return option->transform(transformer);
+}
+
+//
+// The option is stored as an integer. Resolve the same address text the
+// unassemble command accepts, then give back a decimal string. Leave an
+// unresolved token unchanged.
+//
+static CLI::Option* add_windbg_address_option(CLI::App* const app, const std::string& option_name,
+                                              const std::unordered_map<std::string, std::uint64_t>& aliases)
+{
+	auto* const option = add_command_option(app, option_name);
+
+	return option->transform([&aliases](std::string input) {
+		std::uint64_t address = 0;
+
+		if (resolve_windbg_address(aliases, input, address) == 0)
+		{
+			return input;
+		}
+
+		return std::to_string(address);
+	});
 }
 
 static std::uint8_t get_command_flag(const CLI::App* const app, const std::string& flag_name)
@@ -478,14 +503,14 @@ static void process_cgvm(const CLI::App* const wgvm)
 	}
 }
 
-static CLI::App* init_akh(CLI::App& app, const CLI::Transformer& aliases_transformer)
+static CLI::App* init_akh(CLI::App& app, const std::unordered_map<std::string, std::uint64_t>& aliases)
 {
 	CLI::App* const akh = app.add_subcommand(
 		                         "akh",
 		                         "add a hook on specified kernel code (given the guest virtual address) (asmbytes in form: 0xE8 0x12 0x23 0x34 0x45)")
 	                         ->ignore_case();
 
-	add_transformed_command_option(akh, "virtual_address", aliases_transformer)->required();
+	add_windbg_address_option(akh, "virtual_address", aliases)->required();
 	add_command_option(akh, "--script_text")->multi_option_policy(CLI::MultiOptionPolicy::TakeAll)->expected(-1);
 	add_command_option(akh, "--script_file")->multi_option_policy(CLI::MultiOptionPolicy::TakeAll)->expected(-1);
 	add_command_option(akh, "--asmbytes")->multi_option_policy(CLI::MultiOptionPolicy::TakeAll)->expected(-1);
@@ -524,20 +549,25 @@ static void process_akh(const CLI::App* const akh)
 
 	if (monitor == 1)
 	{
-		std::array<std::uint8_t, 9> monitor_bytes = {
-			0x51, // push rcx
-			0xB9, 0x00, 0x00, 0x00, 0x00, // mov ecx, 0
-			0x0F, 0xA2, // cpuid
-			0x59 // pop rcx
-		};
+		//
+		// push rcx; push rdx; push r8; mov ecx, imm32; mov edx, 0;
+		// mov r8, function; cpuid; pop r8; pop rdx; pop rcx.
+		// imm32 has log_current_state and hypercall_log_breakpoint_flag.
+		// The driver records r8 and restores the three saved registers.
+		//
+		std::array<std::uint8_t, 30> monitor_bytes = {
+			0x51, 0x52, 0x41, 0x50, 0xB9, 0x00, 0x00, 0x00, 0x00, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x49, 0xB8, 0x00, 0x00,
+			0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0xA2, 0x41, 0x58, 0x5A, 0x59};
 
 		hypercall_info_t call_info = {};
 
 		call_info.primary_key = hypercall_primary_key;
 		call_info.secondary_key = hypercall_secondary_key;
 		call_info.call_type = hypercall_type_t::log_current_state;
+		call_info.call_reserved_data = hypercall_log_breakpoint_flag;
 
-		*reinterpret_cast<std::uint32_t*>(&monitor_bytes[2]) = static_cast<std::uint32_t>(call_info.value);
+		*reinterpret_cast<std::uint32_t*>(&monitor_bytes[5]) = static_cast<std::uint32_t>(call_info.value);
+		*reinterpret_cast<std::uint64_t*>(&monitor_bytes[16]) = virtual_address;
 
 		asm_bytes.insert(asm_bytes.end(), monitor_bytes.begin(), monitor_bytes.end());
 	}
@@ -547,6 +577,19 @@ static void process_akh(const CLI::App* const akh)
 	if (hook_status == 1)
 	{
 		LOG_INFO("success in hook");
+
+		//
+		// The driver records r8, which the stub sets to this function.
+		// span covers the stub so a record that still carries the cpuid
+		// address is accepted as well.
+		//
+		if (monitor == 1 && asm_bytes.empty() == false)
+		{
+			if (breakpoint::add_monitor(virtual_address, virtual_address, asm_bytes.size()) == 0)
+			{
+				LOG_ERR("monitor list is full");
+			}
+		}
 	}
 	else
 	{
@@ -554,7 +597,7 @@ static void process_akh(const CLI::App* const akh)
 	}
 }
 
-static CLI::App* init_rkh(CLI::App& app, const CLI::Transformer& aliases_transformer)
+static CLI::App* init_rkh(CLI::App& app, const std::unordered_map<std::string, std::uint64_t>& aliases)
 {
 	CLI::App* rkh = app.add_subcommand(
 		                   "rkh",
@@ -562,7 +605,7 @@ static CLI::App* init_rkh(CLI::App& app, const CLI::Transformer& aliases_transfo
 	                   ->
 	                   ignore_case();
 
-	add_transformed_command_option(rkh, "virtual_address", aliases_transformer)->required();
+	add_windbg_address_option(rkh, "virtual_address", aliases)->required();
 
 	return rkh;
 }
@@ -570,6 +613,8 @@ static CLI::App* init_rkh(CLI::App& app, const CLI::Transformer& aliases_transfo
 static void process_rkh(const CLI::App* const rkh)
 {
 	const auto virtual_address = get_command_option<std::uint64_t>(rkh, "virtual_address");
+
+	breakpoint::remove_monitor(virtual_address);
 
 	const std::uint8_t hook_removal_status = hook::remove_kernel_hook(virtual_address, 1);
 
@@ -628,6 +673,7 @@ static void process_fl([[maybe_unused]] const CLI::App* const fl)
 	if (logs_flushed != failed_log_count && logs_flushed > 0)
 	{
 		breakpoint::observe_pause_logs(logs.data(), logs_flushed);
+		breakpoint::note_monitor_logs(logs.data(), logs_flushed);
 	}
 
 	std::uint64_t pending_count = 0;
@@ -10340,8 +10386,8 @@ void commands::process(const std::string& command)
 	const CLI::App* const rgvm = init_rgvm(app, aliases_transformer);
 	const CLI::App* const wgvm = init_wgvm(app, aliases_transformer);
 	const CLI::App* const cgvm = init_cgvm(app, aliases_transformer);
-	const CLI::App* const akh = init_akh(app, aliases_transformer);
-	const CLI::App* const rkh = init_rkh(app, aliases_transformer);
+	const CLI::App* const akh = init_akh(app, aliases);
+	const CLI::App* const rkh = init_rkh(app, aliases);
 	const CLI::App* const gva = init_gva(app, aliases_transformer);
 	const CLI::App* const hgpp = init_hgpp(app, aliases_transformer);
 	const CLI::App* const fl = init_fl(app);

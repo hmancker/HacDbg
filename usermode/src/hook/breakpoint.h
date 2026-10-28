@@ -62,6 +62,30 @@ namespace breakpoint
 	void clean_up();
 
 	void observe_pause_logs(const trap_frame_log_t* logs, std::uint64_t count);
+
+	// akh --monitor. log_rip is the address the stub asks the driver to
+	// record. span is the stub length at address; a record whose rip falls
+	// inside that stub still counts. Hits come from the log mailbox.
+	struct monitor_site_t
+	{
+		std::uint64_t address = 0;
+		std::uint64_t log_rip = 0;
+		std::uint64_t span = 0;
+		std::uint64_t hits = 0;
+	};
+
+	struct monitor_hit_t
+	{
+		std::uint64_t address = 0;
+		trap_frame_log_t log = {};
+	};
+
+	std::uint8_t add_monitor(std::uint64_t address, std::uint64_t log_rip, std::uint64_t span);
+	void remove_monitor(std::uint64_t address);
+	void note_monitor_logs(const trap_frame_log_t* logs, std::uint64_t count);
+	std::vector<monitor_site_t> monitor_sites();
+	std::vector<monitor_hit_t> take_monitor_hits();
+
 	std::uint8_t capture_pause();
 	std::uint8_t poll_new_pause();
 	std::uint8_t has_paused_thread();

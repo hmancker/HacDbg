@@ -107,7 +107,9 @@ int CoreSession::checkAbi(const wchar_t* directory, QString* error)
                         structureMatches(structureSize, HacDbgStructureTraceStatus, sizeof(HACDBG_CORE_TRACE_STATUS)) &&
                         structureMatches(structureSize, HacDbgStructureTraceSnapshot, sizeof(HACDBG_TRACE_SNAPSHOT)) &&
                         structureMatches(structureSize, HacDbgStructureCompletion, sizeof(HACDBG_CORE_COMPLETION)) &&
-                        structureMatches(structureSize, HacDbgStructureCompletionStatus, sizeof(HACDBG_CORE_COMPLETION_STATUS));
+                        structureMatches(structureSize, HacDbgStructureCompletionStatus, sizeof(HACDBG_CORE_COMPLETION_STATUS)) &&
+                        structureMatches(structureSize, HacDbgStructureMonitor, sizeof(HACDBG_CORE_MONITOR)) &&
+                        structureMatches(structureSize, HacDbgStructureMonitorHit, sizeof(HACDBG_CORE_MONITOR_HIT));
     const bool traceOk = traceVersion != nullptr &&
                          themeSize != nullptr &&
                          traceVersion() == HACDBG_TRACE_API_VERSION &&
@@ -184,11 +186,15 @@ bool CoreSession::load(const QString& directory, QString* error)
         bindProc(module, "HacDbgCoreCompleteCommands", &m_completeCommands) &&
         bindProc(module, "HacDbgCoreRequestCompletions", &m_requestCompletions) &&
         bindProc(module, "HacDbgCoreGetCompletionStatus", &m_getCompletionStatus) &&
-        bindProc(module, "HacDbgCoreCopyCompletions", &m_copyCompletions);
+        bindProc(module, "HacDbgCoreCopyCompletions", &m_copyCompletions) &&
+        bindProc(module, "HacDbgCoreCopyMonitors", &m_copyMonitors) &&
+        bindProc(module, "HacDbgCoreCopyMonitorHits", &m_copyMonitorHits);
 
     if (bound == false ||
         m_apiVersion() != HACDBG_CORE_API_VERSION ||
-        m_stateSize() != sizeof(HACDBG_CORE_STATE))
+        m_stateSize() != sizeof(HACDBG_CORE_STATE) ||
+        m_structureSize(HacDbgStructureMonitor) != sizeof(HACDBG_CORE_MONITOR) ||
+        m_structureSize(HacDbgStructureMonitorHit) != sizeof(HACDBG_CORE_MONITOR_HIT))
     {
         FreeLibrary(module);
         m_module = nullptr;
@@ -469,6 +475,18 @@ bool CoreSession::copyResolvedAddress(HACDBG_CORE_RESOLVED_ADDRESS* address) con
 {
     return m_started && m_copyResolvedAddress != nullptr &&
            m_copyResolvedAddress(m_core, address) == HacDbgCoreStatusOk;
+}
+
+bool CoreSession::copyMonitors(HACDBG_CORE_MONITOR* monitors, std::uint32_t capacity, std::uint32_t* count) const
+{
+    return m_started && m_copyMonitors != nullptr && count != nullptr &&
+           m_copyMonitors(m_core, monitors, capacity, count) == HacDbgCoreStatusOk;
+}
+
+bool CoreSession::copyMonitorHits(HACDBG_CORE_MONITOR_HIT* hits, std::uint32_t capacity, std::uint32_t* count) const
+{
+    return m_started && m_copyMonitorHits != nullptr && count != nullptr &&
+           m_copyMonitorHits(m_core, hits, capacity, count) == HacDbgCoreStatusOk;
 }
 
 bool CoreSession::traceControl(std::uint32_t flags, std::uint32_t sampleRate, std::uint32_t eventMask)

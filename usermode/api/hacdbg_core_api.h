@@ -17,7 +17,9 @@ extern "C"
 {
 #endif
 
-#define HACDBG_CORE_API_VERSION 4u
+#define HACDBG_CORE_API_VERSION 5u
+#define HACDBG_CORE_MAX_MONITORS 64u
+#define HACDBG_CORE_MONITOR_STACK 5u
 #define HACDBG_CORE_MAX_BREAKPOINTS 64u
 #define HACDBG_CORE_VERSION_STRING_SIZE 32u
 #define HACDBG_CORE_MAX_MODULES 512u
@@ -92,7 +94,9 @@ typedef enum _HACDBG_CORE_STRUCTURE
     HacDbgStructureTraceStatus = 8,
     HacDbgStructureTraceSnapshot = 9,
     HacDbgStructureCompletion = 10,
-    HacDbgStructureCompletionStatus = 11
+    HacDbgStructureCompletionStatus = 11,
+    HacDbgStructureMonitor = 12,
+    HacDbgStructureMonitorHit = 13
 } HACDBG_CORE_STRUCTURE;
 
 /**
@@ -473,10 +477,68 @@ uint32_t HacDbgCoreCopyCompletions(HACDBG_CORE* Core, uint64_t RequestId,
                                    HACDBG_CORE_COMPLETION* Items, uint32_t Capacity,
                                    uint32_t* CountOut);
 
+/**
+ * @brief One akh --monitor hook. Address is the hooked function. Hits is the
+ * number of mailbox records matched since the hook was installed.
+ */
+typedef struct _HACDBG_CORE_MONITOR
+{
+    uint64_t Address;
+    uint64_t Hits;
+} HACDBG_CORE_MONITOR;
+
+/**
+ * @brief One monitor hit copied from the log mailbox. Rip is the address the
+ * stub asked the driver to record, which is the function passed to akh.
+ * Address is that same function. Stack is the five qwords that were on the
+ * guest stack before the stub's pushes.
+ */
+typedef struct _HACDBG_CORE_MONITOR_HIT
+{
+    uint64_t Address;
+    uint64_t Rip;
+    uint64_t Rax;
+    uint64_t Rcx;
+    uint64_t Rdx;
+    uint64_t Rbx;
+    uint64_t Rsp;
+    uint64_t Rbp;
+    uint64_t Rsi;
+    uint64_t Rdi;
+    uint64_t R8;
+    uint64_t R9;
+    uint64_t R10;
+    uint64_t R11;
+    uint64_t R12;
+    uint64_t R13;
+    uint64_t R14;
+    uint64_t R15;
+    uint64_t Cr3;
+    uint64_t Stack[HACDBG_CORE_MONITOR_STACK];
+} HACDBG_CORE_MONITOR_HIT;
+
+/**
+ * @brief Copies the current akh --monitor hooks. Does not enter the driver.
+ */
+uint32_t HacDbgCoreCopyMonitors(HACDBG_CORE* Core, HACDBG_CORE_MONITOR* Items, uint32_t Capacity,
+                                uint32_t* CountOut);
+
+/**
+ * @brief Copies and removes the oldest monitor hits waiting for the GUI.
+ *
+ * @details The core worker already reads the log mailbox. Hits stay here until
+ * this copy, up to 2048. Older hits are dropped when that queue is full.
+ */
+uint32_t HacDbgCoreCopyMonitorHits(HACDBG_CORE* Core, HACDBG_CORE_MONITOR_HIT* Items, uint32_t Capacity,
+                                   uint32_t* CountOut);
+
 #ifdef __cplusplus
 }
 
 static_assert(sizeof(HACDBG_CORE_TRACE_STATUS) == 80, "core trace status ABI changed");
 static_assert(sizeof(HACDBG_CORE_COMPLETION) == 512, "core completion ABI changed");
 static_assert(sizeof(HACDBG_CORE_COMPLETION_STATUS) == 32, "core completion status ABI changed");
+static_assert(sizeof(HACDBG_CORE_MONITOR) == 16, "core monitor ABI changed");
+static_assert(sizeof(HACDBG_CORE_MONITOR_HIT) == 192, "core monitor hit ABI changed");
+static_assert(HACDBG_CORE_MONITOR_STACK == 5, "core monitor stack ABI changed");
 #endif

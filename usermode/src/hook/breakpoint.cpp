@@ -3738,8 +3738,14 @@ std::vector<breakpoint::info_t> breakpoint::list()
 	return infos;
 }
 
+std::vector<breakpoint::monitor_site_t> monitor_site_list = {};
+std::vector<breakpoint::monitor_hit_t> monitor_hit_list = {};
+
 void breakpoint::clean_up()
 {
+	monitor_site_list.clear();
+	monitor_hit_list.clear();
+
 	if (pause_state.valid == 1)
 	{
 		resume_paused();
@@ -3755,6 +3761,59 @@ void breakpoint::clean_up()
 }
 
 std::vector<trap_frame_log_t> pending_logs = {};
+
+constexpr std::size_t monitor_site_limit = 64;
+constexpr std::size_t monitor_hit_limit = 2048;
+
+std::uint8_t monitor_log_matches(const breakpoint::monitor_site_t& site, const std::uint64_t rip)
+{
+	if (rip == 0)
+	{
+		return 0;
+	}
+
+	if (rip == site.address || rip == site.log_rip)
+	{
+		return 1;
+	}
+
+	if (site.span != 0 && rip >= site.address && rip - site.address < site.span)
+	{
+		return 1;
+	}
+
+	return 0;
+}
+
+void note_one_monitor_log(const trap_frame_log_t& log)
+{
+	if (log.rip == 0)
+	{
+		return;
+	}
+
+	for (breakpoint::monitor_site_t& site : monitor_site_list)
+	{
+		if (monitor_log_matches(site, log.rip) == 0)
+		{
+			continue;
+		}
+
+		site.hits++;
+
+		if (monitor_hit_list.size() == monitor_hit_limit)
+		{
+			monitor_hit_list.erase(monitor_hit_list.begin());
+		}
+
+		breakpoint::monitor_hit_t hit = {};
+		hit.address = site.address;
+		hit.log = log;
+		monitor_hit_list.push_back(hit);
+
+		return;
+	}
+}
 
 void remember_flushed_logs(const trap_frame_log_t* const logs, const std::uint64_t count)
 {
@@ -3778,6 +3837,7 @@ void remember_flushed_logs(const trap_frame_log_t* const logs, const std::uint64
 		}
 
 		pending_logs.push_back(logs[index]);
+		note_one_monitor_log(logs[index]);
 	}
 }
 
@@ -3820,7 +3880,7 @@ void discard_stale_pause_logs(const breakpoint_t* const breakpoint)
 	pending_logs = std::move(kept);
 }
 
-std::uint8_t flush_into_pause_state(const std::uint8_t report_error)
+std::uint8_t flush_into_pause_state(const std::uint8_t report_error, const std::uint8_t observe)
 {
 	constexpr std::uint64_t log_count = 2840;
 	std::vector<trap_frame_log_t> logs(log_count);
@@ -3839,7 +3899,11 @@ std::uint8_t flush_into_pause_state(const std::uint8_t report_error)
 	if (logs_flushed > 0)
 	{
 		remember_flushed_logs(logs.data(), logs_flushed);
-		observe_logs_impl(logs.data(), logs_flushed);
+
+		if (observe == 1)
+		{
+			observe_logs_impl(logs.data(), logs_flushed);
+		}
 	}
 
 	return 1;
@@ -3874,7 +3938,7 @@ std::uint8_t breakpoint::capture_pause()
 		return 1;
 	}
 
-	if (flush_into_pause_state(1) == 0)
+	if (flush_into_pause_state(1, 1) == 0)
 	{
 		return 0;
 	}
@@ -3886,6 +3950,16 @@ std::uint8_t breakpoint::poll_new_pause()
 {
 	if (pause_state.valid == 1)
 	{
+		//
+		// A paused thread used to skip the mailbox. Monitor hits on other
+		// processors would sit there until fl. Copy them without replacing
+		// the pause this thread already owns.
+		//
+		if (hypercall::log_notify_idle() == 0)
+		{
+			flush_into_pause_state(0, 0);
+		}
+
 		return 0;
 	}
 
@@ -3899,12 +3973,87 @@ std::uint8_t breakpoint::poll_new_pause()
 		return 0;
 	}
 
-	if (flush_into_pause_state(0) == 0)
+	if (flush_into_pause_state(0, 1) == 0)
 	{
 		return 0;
 	}
 
 	return pause_state.valid;
+}
+
+std::uint8_t breakpoint::add_monitor(const std::uint64_t address, const std::uint64_t log_rip,
+                                         const std::uint64_t span)
+{
+	if (address == 0 || log_rip == 0)
+	{
+		return 0;
+	}
+
+	for (monitor_site_t& site : monitor_site_list)
+	{
+		if (site.address == address)
+		{
+			site.log_rip = log_rip;
+			site.span = span;
+
+			return 1;
+		}
+	}
+
+	if (monitor_site_list.size() == monitor_site_limit)
+	{
+		return 0;
+	}
+
+	monitor_site_t site = {};
+	site.address = address;
+	site.log_rip = log_rip;
+	site.span = span;
+	monitor_site_list.push_back(site);
+
+	return 1;
+}
+
+void breakpoint::remove_monitor(const std::uint64_t address)
+{
+	std::vector<monitor_site_t> kept = {};
+
+	for (const monitor_site_t& site : monitor_site_list)
+	{
+		if (site.address != address)
+		{
+			kept.push_back(site);
+		}
+	}
+
+	monitor_site_list = std::move(kept);
+}
+
+void breakpoint::note_monitor_logs(const trap_frame_log_t* const logs, const std::uint64_t count)
+{
+	if (logs == nullptr)
+	{
+		return;
+	}
+
+	for (std::uint64_t index = 0; index < count; index++)
+	{
+		note_one_monitor_log(logs[index]);
+	}
+}
+
+std::vector<breakpoint::monitor_site_t> breakpoint::monitor_sites()
+{
+	return monitor_site_list;
+}
+
+std::vector<breakpoint::monitor_hit_t> breakpoint::take_monitor_hits()
+{
+	std::vector<monitor_hit_t> hits = std::move(monitor_hit_list);
+
+	monitor_hit_list.clear();
+
+	return hits;
 }
 
 std::uint8_t breakpoint::has_paused_thread()
@@ -4198,7 +4347,7 @@ std::uint8_t breakpoint::continue_paused_thread(const std::uint64_t logical_rip,
 
 	while (GetTickCount64() - started < wait_ms)
 	{
-		if (hypercall::log_notify_idle() == 0 && flush_into_pause_state(0) == 1 && pause_state.valid == 1)
+		if (hypercall::log_notify_idle() == 0 && flush_into_pause_state(0, 1) == 1 && pause_state.valid == 1)
 		{
 			return 1;
 		}

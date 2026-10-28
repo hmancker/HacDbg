@@ -59,6 +59,8 @@
     <None Include="src\CpuView.h" />
     <None Include="src\BreakpointView.cpp" />
     <None Include="src\BreakpointView.h" />
+    <None Include="src\MonitorView.cpp" />
+    <None Include="src\MonitorView.h" />
     <None Include="src\SymbolView.cpp" />
     <None Include="src\SymbolView.h" />
     <None Include="src\ProcessThreadView.cpp" />

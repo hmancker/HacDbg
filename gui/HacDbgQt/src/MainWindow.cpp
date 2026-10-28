@@ -1,6 +1,7 @@
 #include "MainWindow.h"
 
 #include "BreakpointView.h"
+#include "MonitorView.h"
 #include "CommandView.h"
 #include "CpuView.h"
 #include "Format.h"
@@ -189,6 +190,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogDetailedView), QStringLiteral("命令台"));
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_ComputerIcon), QStringLiteral("反汇编"));
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_MessageBoxCritical), QStringLiteral("断点"));
+    m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogInfoView), QStringLiteral("监控"));
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogContentsView), QStringLiteral("符号"));
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogListView), QStringLiteral("进程/线程"));
 
@@ -390,6 +392,13 @@ void MainWindow::ensurePage(int index)
         holder(index)->layout()->addWidget(m_breakpoints);
         connect(m_breakpoints, &BreakpointView::addressActivated, this, &MainWindow::openDisassembly);
     }
+    else if (index == PageMonitors && m_monitors == nullptr)
+    {
+        m_monitors = new MonitorView(holder(index));
+        m_monitors->setSession(&m_session);
+        holder(index)->layout()->addWidget(m_monitors);
+        connect(m_monitors, &MonitorView::addressActivated, this, &MainWindow::openDisassembly);
+    }
     else if (index == PageSymbols && m_symbols == nullptr)
     {
         m_symbols = new SymbolView(holder(index));
@@ -441,6 +450,20 @@ void MainWindow::refreshVisiblePage()
         if (m_breakpoints != nullptr)
         {
             m_breakpoints->setBreakpoints(m_state.Breakpoints, m_state.BreakpointCount);
+            std::vector<HACDBG_CORE_MONITOR> monitors(HACDBG_CORE_MAX_MONITORS);
+            std::uint32_t monitorCount = 0;
+
+            if (m_session.copyMonitors(monitors.data(), HACDBG_CORE_MAX_MONITORS, &monitorCount))
+            {
+                m_breakpoints->setMonitors(monitors.data(), monitorCount);
+            }
+        }
+        break;
+
+    case PageMonitors:
+        if (m_monitors != nullptr)
+        {
+            m_monitors->poll();
         }
         break;
 

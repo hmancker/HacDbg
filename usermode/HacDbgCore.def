@@ -35,3 +35,5 @@ EXPORTS
     HacDbgCoreRequestCompletions
     HacDbgCoreGetCompletionStatus
     HacDbgCoreCopyCompletions
+    HacDbgCoreCopyMonitors
+    HacDbgCoreCopyMonitorHits

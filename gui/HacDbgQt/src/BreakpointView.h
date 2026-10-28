@@ -18,12 +18,23 @@ public:
     explicit BreakpointView(QWidget* parent = nullptr);
 
     void setBreakpoints(const HACDBG_CORE_BREAKPOINT* breakpoints, std::uint32_t count);
+    void setMonitors(const HACDBG_CORE_MONITOR* monitors, std::uint32_t count);
 
 signals:
     void addressActivated(quint64 address, quint64 cr3);
 
 private:
+    struct Activation
+    {
+        std::uint64_t address = 0;
+        std::uint64_t cr3 = 0;
+    };
+
+    void rebuild();
+
     QTableView* m_table = nullptr;
     QStandardItemModel* m_model = nullptr;
     std::vector<HACDBG_CORE_BREAKPOINT> m_rows;
+    std::vector<HACDBG_CORE_MONITOR> m_monitors;
+    std::vector<Activation> m_activation;
 };

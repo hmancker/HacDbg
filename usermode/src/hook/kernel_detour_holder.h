@@ -3,7 +3,7 @@
 
 namespace kernel_detour_holder
 {
-	void set_up(std::uint64_t holder_base, std::uint64_t holder_size);
+	void set_up(std::uint64_t page_base, std::uint64_t cave_offset, std::uint64_t cave_size);
 
 	void* allocate_memory(std::uint16_t size);
 	void free_memory(void* buffer);
@@ -26,5 +26,6 @@ namespace kernel_detour_holder
 	};
 
 	inline detour_entry_t* list_head = nullptr;
+	inline std::uint64_t holder_page = 0;
 	inline std::uint64_t holder_end = 0;
 }

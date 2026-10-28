@@ -5,6 +5,7 @@
 #include "../logs/logs.h"
 
 #include <Windows.h>
+#include <immintrin.h>
 #include <vector>
 #include <array>
 #include <memory_resource>
@@ -15,17 +16,147 @@ namespace
 {
 	std::unordered_map<std::uint64_t, hook::kernel_hook_info_t> kernel_hook_list = {};
 
+	std::uint64_t kernel_detour_section_base = 0;
+	std::uint64_t kernel_detour_section_size = 0;
 	std::uint64_t kernel_detour_holder_base = 0;
 	std::uint64_t kernel_detour_holder_physical_page = 0;
 	std::uint8_t* kernel_detour_holder_shadow_page_mapped = nullptr;
 
 	constexpr std::size_t inline_hook_bytes_size = 14;
+	constexpr std::uint64_t detour_cave_minimum = 0x80;
+
+	std::uint8_t padding_byte(const std::uint8_t value)
+	{
+		return static_cast<std::uint8_t>(value == 0 || value == 0xCC);
+	}
+
+	void longest_padding_cave(const std::uint8_t* const page, const std::uint64_t page_bytes,
+	                          std::uint64_t& offset_out, std::uint64_t& size_out)
+	{
+		offset_out = 0;
+		size_out = 0;
+
+		std::uint64_t index = 0;
+
+		while (index < page_bytes)
+		{
+			if (padding_byte(page[index]) == 0)
+			{
+				index++;
+
+				continue;
+			}
+
+			const std::uint64_t start = index;
+
+			while (index < page_bytes && padding_byte(page[index]) == 1)
+			{
+				index++;
+			}
+
+			std::uint64_t cave_offset = start;
+			std::uint64_t cave_size = index - start;
+
+			if ((cave_offset & 1) != 0)
+			{
+				cave_offset++;
+				cave_size--;
+			}
+
+			cave_size &= ~1ull;
+
+			if (cave_size > size_out)
+			{
+				offset_out = cave_offset;
+				size_out = cave_size;
+			}
+		}
+	}
+
+	void publish_shadow_bytes(void* const address, const std::uint64_t size)
+	{
+		if (address == nullptr || size == 0)
+		{
+			return;
+		}
+
+		auto* const bytes = static_cast<std::uint8_t*>(address);
+
+		for (std::uint64_t index = 0; index < size; index += 64)
+		{
+			_mm_clflush(bytes + index);
+		}
+
+		_mm_mfence();
+		FlushInstructionCache(GetCurrentProcess(), address, static_cast<SIZE_T>(size));
+	}
 }
 
 std::uint8_t hook::set_up()
 {
-	kernel_detour_holder_shadow_page_mapped = static_cast<std::uint8_t*>(sys::user::allocate_locked_memory(
-		page_size, PAGE_READWRITE));
+	//
+	// The first page of the executable padding section still contains live
+	// instructions. A detour written over those bytes runs when that function
+	// reaches them.
+	//
+	std::array<std::uint8_t, page_size> page_bytes = {};
+	std::uint64_t chosen_page = 0;
+	std::uint64_t chosen_physical = 0;
+	std::uint64_t cave_offset = 0;
+	std::uint64_t cave_size = 0;
+	const std::uint64_t section_end = kernel_detour_section_base + kernel_detour_section_size;
+	const std::uint64_t first_page = (kernel_detour_section_base + page_size - 1) & ~(page_size - 1);
+
+	for (std::uint64_t page = first_page; page + page_size <= section_end; page += page_size)
+	{
+		const std::uint64_t physical = hypercall::translate_guest_virtual_address(page, sys::current_cr3) &
+			~(page_size - 1);
+
+		if (physical == 0)
+		{
+			continue;
+		}
+
+		if (hypercall::read_guest_physical_memory(page_bytes.data(), physical, page_size) != page_size)
+		{
+			continue;
+		}
+
+		std::uint64_t offset = 0;
+		std::uint64_t size = 0;
+
+		longest_padding_cave(page_bytes.data(), page_size, offset, size);
+
+		if (size < detour_cave_minimum || size <= cave_size)
+		{
+			continue;
+		}
+
+		chosen_page = page;
+		chosen_physical = physical;
+		cave_offset = offset;
+		cave_size = size;
+
+		if (size == page_size)
+		{
+			break;
+		}
+	}
+
+	if (chosen_page == 0)
+	{
+		LOG_ERR("kernel hook holder has no unused padding");
+
+		return 0;
+	}
+
+	kernel_detour_holder_base = chosen_page;
+
+	if (kernel_detour_holder_shadow_page_mapped == nullptr)
+	{
+		kernel_detour_holder_shadow_page_mapped = static_cast<std::uint8_t*>(sys::user::allocate_locked_memory(
+			page_size, PAGE_READWRITE));
+	}
 
 	if (kernel_detour_holder_shadow_page_mapped == nullptr)
 	{
@@ -40,29 +171,27 @@ std::uint8_t hook::set_up()
 		return 0;
 	}
 
-	kernel_detour_holder_physical_page = hypercall::translate_guest_virtual_address(
-		kernel_detour_holder_base, sys::current_cr3);
-
-	if (kernel_detour_holder_physical_page == 0)
-	{
-		return 0;
-	}
+	kernel_detour_holder_physical_page = chosen_physical;
 
 	// in case of a previously wrongfully ended session which would've left the hook still applied
 	hypercall::remove_slat_code_hook(kernel_detour_holder_physical_page);
 
-	hypercall::read_guest_physical_memory(kernel_detour_holder_shadow_page_mapped, kernel_detour_holder_physical_page,
-	                                      page_size);
+	memcpy(kernel_detour_holder_shadow_page_mapped, page_bytes.data(), page_size);
+
+	kernel_detour_holder::set_up(reinterpret_cast<std::uint64_t>(kernel_detour_holder_shadow_page_mapped), cave_offset,
+	                             cave_size);
+
+	publish_shadow_bytes(kernel_detour_holder_shadow_page_mapped, page_size);
 
 	const std::uint64_t hook_status = hypercall::add_slat_code_hook(kernel_detour_holder_physical_page,
 	                                                                shadow_page_physical);
 
 	if (hook_status == 0)
 	{
+		kernel_detour_holder_physical_page = 0;
+
 		return 0;
 	}
-
-	kernel_detour_holder::set_up(reinterpret_cast<std::uint64_t>(kernel_detour_holder_shadow_page_mapped), page_size);
 
 	return 1;
 }
@@ -124,9 +253,10 @@ void hook::clean_up()
 	}
 }
 
-void hook::set_kernel_detour_holder_base(const std::uint64_t address)
+void hook::set_kernel_detour_holder_base(const std::uint64_t address, const std::uint64_t size)
 {
-	kernel_detour_holder_base = address;
+	kernel_detour_section_base = address;
+	kernel_detour_section_size = size;
 }
 
 static std::pair<std::vector<std::uint8_t>, std::uint64_t> load_original_bytes_into_shadow_page(
@@ -260,6 +390,7 @@ static std::uint8_t set_up_hook_handler(const std::uint64_t routine_to_hook_virt
 	detour_holder_shadow_offset = kernel_detour_holder::get_allocation_offset(bytes_buffer);
 
 	memcpy(bytes_buffer, hook_handler_bytes.data(), hook_handler_bytes.size());
+	publish_shadow_bytes(bytes_buffer, hook_handler_bytes.size());
 
 	return 1;
 }
@@ -346,7 +477,14 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 		return 0;
 	}
 
-	hook_status = hypercall::add_slat_code_hook(routine_to_hook_physical, shadow_page_physical);
+	publish_shadow_bytes(shadow_page_virtual, is_overflow_hook == 1 ? (page_size * 2) : page_size);
+
+	//
+	// Translation includes the byte offset inside the page. The SLAT hook
+	// names the 4 KiB page, and a non-zero offset is rejected.
+	//
+	hook_status = hypercall::add_slat_code_hook(routine_to_hook_physical & ~0xFFFull,
+	                                            shadow_page_physical & ~0xFFFull);
 
 	if (hook_status == 0)
 	{
@@ -355,8 +493,8 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 
 	if (overflow_shadow_page_physical_address != 0)
 	{
-		hook_status = hypercall::add_slat_code_hook(overflow_page_physical_address,
-		                                            overflow_shadow_page_physical_address);
+		hook_status = hypercall::add_slat_code_hook(overflow_page_physical_address & ~0xFFFull,
+		                                            overflow_shadow_page_physical_address & ~0xFFFull);
 
 		if (hook_status == 0)
 		{

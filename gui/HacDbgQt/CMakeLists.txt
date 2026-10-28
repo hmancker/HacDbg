@@ -26,6 +26,8 @@ set(HACDBG_QT_SOURCES
     src/CpuView.h
     src/BreakpointView.cpp
     src/BreakpointView.h
+    src/MonitorView.cpp
+    src/MonitorView.h
     src/SymbolView.cpp
     src/SymbolView.h
     src/ProcessThreadView.cpp

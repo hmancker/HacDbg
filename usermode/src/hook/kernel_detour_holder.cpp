@@ -1,13 +1,15 @@
 #include "kernel_detour_holder.h"
 
-void kernel_detour_holder::set_up(const std::uint64_t holder_base, const std::uint64_t holder_size)
+void kernel_detour_holder::set_up(const std::uint64_t page_base, const std::uint64_t cave_offset,
+                                  const std::uint64_t cave_size)
 {
-	list_head = reinterpret_cast<detour_entry_t*>(holder_base);
+	holder_page = page_base;
+	list_head = reinterpret_cast<detour_entry_t*>(page_base + cave_offset);
 
-	list_head->size = static_cast<std::uint16_t>(holder_size - sizeof(detour_entry_t));
+	list_head->size = static_cast<std::uint16_t>(cave_size - sizeof(detour_entry_t));
 	list_head->is_allocated = 0;
 
-	holder_end = holder_base + holder_size;
+	holder_end = page_base + cave_offset + cave_size;
 }
 
 void* kernel_detour_holder::allocate_memory(const std::uint16_t size)
@@ -53,20 +55,14 @@ void* kernel_detour_holder::allocate_memory(const std::uint16_t size)
 
 std::uint16_t kernel_detour_holder::get_allocation_offset(const void* const buffer)
 {
-	const auto base = reinterpret_cast<std::uint64_t>(list_head);
 	const auto allocation = reinterpret_cast<std::uint64_t>(buffer);
 
-	const auto offset = static_cast<std::uint16_t>(allocation - base);
-
-	return offset;
+	return static_cast<std::uint16_t>(allocation - holder_page);
 }
 
 void* kernel_detour_holder::get_allocation_from_offset(const std::uint16_t offset)
 {
-	const auto base = reinterpret_cast<std::uint64_t>(list_head);
-	const std::uint64_t allocation = base + offset;
-
-	return reinterpret_cast<void*>(allocation);
+	return reinterpret_cast<void*>(holder_page + offset);
 }
 
 static void try_merge_of_next_entry(kernel_detour_holder::detour_entry_t* current_entry)

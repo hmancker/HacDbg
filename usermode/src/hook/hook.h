@@ -11,7 +11,7 @@ namespace hook
 	std::uint8_t contains_hooked_page(std::uint64_t physical_address);
 	void clean_up();
 
-	void set_kernel_detour_holder_base(std::uint64_t address);
+	void set_kernel_detour_holder_base(std::uint64_t address, std::uint64_t size);
 
 	std::uint8_t add_kernel_hook(std::uint64_t routine_to_hook_virtual,
 	                             std::span<const std::uint8_t> extra_assembled_bytes,

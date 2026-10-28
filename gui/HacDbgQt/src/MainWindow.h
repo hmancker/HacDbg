@@ -8,6 +8,7 @@
 
 class BreakpointView;
 class CommandView;
+class MonitorView;
 class CpuView;
 class ProcessThreadView;
 class QLabel;
@@ -39,6 +40,7 @@ private:
         PageCommand = 0,
         PageDisassembly,
         PageBreakpoints,
+        PageMonitors,
         PageSymbols,
         PageProcesses
     };
@@ -60,12 +62,13 @@ private:
     CommandView* m_command = nullptr;
     CpuView* m_cpu = nullptr;
     BreakpointView* m_breakpoints = nullptr;
+    MonitorView* m_monitors = nullptr;
     SymbolView* m_symbols = nullptr;
     ProcessThreadView* m_processes = nullptr;
     TraceWindow* m_trace = nullptr;
     QTabBar* m_tabs = nullptr;
     QStackedWidget* m_stack = nullptr;
-    QWidget* m_holders[5] = {};
+    QWidget* m_holders[6] = {};
     QTimer* m_timer = nullptr;
     QLabel* m_connection = nullptr;
     QLabel* m_paused = nullptr;

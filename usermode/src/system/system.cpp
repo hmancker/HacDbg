@@ -505,14 +505,19 @@ static std::vector<std::uint8_t> dump_kernel_module(const std::uint64_t module_b
 }
 
 static std::uint64_t find_kernel_detour_holder_base_address(const portable_executable::image_t* const ntoskrnl,
-                                                            const std::uint64_t ntoskrnl_base_address)
+                                                            const std::uint64_t ntoskrnl_base_address,
+                                                            std::uint64_t& section_size_out)
 {
+	section_size_out = 0;
+
 	for (const auto& current_section : ntoskrnl->sections())
 	{
 		const std::string_view current_section_name(current_section.name);
 
 		if (current_section.characteristics.mem_execute == 1 && current_section_name.contains("Pad"))
 		{
+			section_size_out = current_section.virtual_size;
+
 			return ntoskrnl_base_address + current_section.virtual_address;
 		}
 	}
@@ -892,17 +897,18 @@ static std::uint8_t parse_ntoskrnl()
 		return 0;
 	}
 
+	std::uint64_t kernel_detour_section_size = 0;
 	const std::uint64_t kernel_detour_holder_base = find_kernel_detour_holder_base_address(
-		ntoskrnl_image, ntoskrnl_info->base_address);
+		ntoskrnl_image, ntoskrnl_info->base_address, kernel_detour_section_size);
 
-	if (kernel_detour_holder_base == 0)
+	if (kernel_detour_holder_base == 0 || kernel_detour_section_size == 0)
 	{
 		LOG_ERR("unable to locate kernel hook holder");
 
 		return 0;
 	}
 
-	hook::set_kernel_detour_holder_base(kernel_detour_holder_base);
+	hook::set_kernel_detour_holder_base(kernel_detour_holder_base, kernel_detour_section_size);
 
 	return 1;
 }
