@@ -1,5 +1,6 @@
 #include "CommandView.h"
 
+#include <QDateTime>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QKeyEvent>
@@ -18,6 +19,7 @@
 namespace
 {
 constexpr int kMaximumBlocks = 20000;
+constexpr qint64 kCtrlCChordMs = 500;
 
 QString commonPrefix(const std::vector<QString>& items)
 {
@@ -661,12 +663,26 @@ bool CommandView::eventFilter(QObject* watched, QEvent* event)
 
         if (plainControl && key->key() == Qt::Key_C && key->isAutoRepeat() == false)
         {
+            const qint64 now = QDateTime::currentMSecsSinceEpoch();
+            const bool chord = m_lastCtrlCMs != 0 && now - m_lastCtrlCMs <= kCtrlCChordMs;
+
+            if (chord == false)
+            {
+                if (event->type() == QEvent::KeyPress)
+                {
+                    m_lastCtrlCMs = now;
+                }
+
+                return QWidget::eventFilter(watched, event);
+            }
+
             if (event->type() == QEvent::ShortcutOverride)
             {
                 event->accept();
                 return true;
             }
 
+            m_lastCtrlCMs = now;
             closeCompletion();
 
             if (watched == m_input)

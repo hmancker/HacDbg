@@ -169,7 +169,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     continueAction->setToolTip(debugTip(QStringLiteral("继续"), QKeySequence(Qt::Key_F5)));
     stepOverAction->setToolTip(debugTip(QStringLiteral("步过"), QKeySequence(Qt::Key_F10)));
     stepIntoAction->setToolTip(debugTip(QStringLiteral("步入"), QKeySequence(Qt::Key_F11)));
-    cancelAction->setToolTip(debugTip(QStringLiteral("取消"), QKeySequence(Qt::CTRL | Qt::Key_C)));
+    cancelAction->setToolTip(QStringLiteral("取消 (连按两次 Ctrl+C)"));
 
     auto* central = new QWidget(this);
     auto* layout = new QVBoxLayout(central);

@@ -69,4 +69,5 @@ private:
     std::uint64_t m_completionRequestId = 0;
     QString m_completionToken;
     bool m_applyingCompletion = false;
+    qint64 m_lastCtrlCMs = 0;
 };
