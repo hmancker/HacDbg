@@ -395,6 +395,143 @@ static std::uint8_t set_up_hook_handler(const std::uint64_t routine_to_hook_virt
 	return 1;
 }
 
+static std::vector<std::uint8_t> absolute_jump(const std::uint64_t target)
+{
+	std::vector<std::uint8_t> bytes = {
+		0x68, 0x21, 0x43, 0x65, 0x87, // push   0xffffffff87654321
+		0xC7, 0x44, 0x24, 0x04, 0x78, 0x56, 0x34, 0x12, // mov    DWORD PTR [rsp+0x4],0x12345678
+		0xC3 // ret
+	};
+
+	const parted_address_t parted = {.value = target};
+
+	*reinterpret_cast<std::uint32_t*>(&bytes[1]) = parted.u.low_part;
+	*reinterpret_cast<std::uint32_t*>(&bytes[9]) = parted.u.high_part;
+
+	return bytes;
+}
+
+static std::vector<std::uint8_t> relative_jump(const std::uint64_t site, const std::uint64_t target)
+{
+	const std::int64_t displacement = static_cast<std::int64_t>(target) - static_cast<std::int64_t>(site + 5);
+
+	if (displacement > 0x7FFFFFFF || displacement < -static_cast<std::int64_t>(0x80000000))
+	{
+		return {};
+	}
+
+	std::vector<std::uint8_t> bytes = {0xE9, 0x00, 0x00, 0x00, 0x00};
+
+	*reinterpret_cast<std::int32_t*>(&bytes[1]) = static_cast<std::int32_t>(displacement);
+
+	return bytes;
+}
+
+static std::uint8_t detour_in_rel32(const std::uint64_t site)
+{
+	const std::int64_t near_edge = static_cast<std::int64_t>(kernel_detour_holder_base) -
+		static_cast<std::int64_t>(site + 5);
+	const std::int64_t far_edge = static_cast<std::int64_t>(kernel_detour_holder_base + page_size) -
+		static_cast<std::int64_t>(site + 5);
+
+	return static_cast<std::uint8_t>(near_edge >= -static_cast<std::int64_t>(0x80000000) && far_edge <= 0x7FFFFFFF);
+}
+
+//
+// The shadow page and the next guest page are different EPT pages. An
+// instruction that starts on this page and finishes on the next one is fetched
+// from both. That fetch stops on the boundary and the leftover byte runs as
+// its own instruction. Move the whole instruction into the detour and jump
+// back to the byte after it.
+//
+static std::uint8_t relocate_page_span(std::uint8_t* const shadow_page, const std::uint64_t page_virtual,
+                                      const std::uint64_t patch_offset, const std::uint64_t patch_length)
+{
+	constexpr std::uint64_t tail_bytes = 15;
+	const std::uint64_t minimum_steal = detour_in_rel32(page_virtual) == 1 &&
+	                                    detour_in_rel32(page_virtual + page_size - 5) == 1
+		                                    ? 5
+		                                    : inline_hook_bytes_size;
+	std::vector<std::uint8_t> bytes(page_size + tail_bytes);
+	std::array<std::uint8_t, tail_bytes> tail = {};
+
+	memcpy(bytes.data(), shadow_page, page_size);
+
+	const std::uint64_t read = hypercall::read_guest_virtual_memory(tail.data(), page_virtual + page_size,
+	                                                                sys::current_cr3, tail_bytes);
+
+	if (read != tail_bytes)
+	{
+		return 1;
+	}
+
+	memcpy(bytes.data() + page_size, tail.data(), tail_bytes);
+
+	const hook_disasm::page_span_t span = hook_disasm::find_page_span(bytes.data(), page_size, minimum_steal);
+
+	if (span.byte_count == 0)
+	{
+		return 1;
+	}
+
+	if (patch_length != 0 && span.steal_offset < patch_offset + patch_length && patch_offset < page_size)
+	{
+		return 1;
+	}
+
+	const auto relocated = hook_disasm::get_routine_aligned_bytes(bytes.data() + span.steal_offset, span.byte_count,
+	                                                              page_virtual + span.steal_offset);
+
+	if (relocated.first.empty() || relocated.second < span.byte_count || relocated.first.size() > 0x7fff)
+	{
+		return 0;
+	}
+
+	std::vector<std::uint8_t> trampoline = relocated.first;
+	const std::vector<std::uint8_t> resume = absolute_jump(page_virtual + span.steal_offset + relocated.second);
+
+	trampoline.insert(trampoline.end(), resume.begin(), resume.end());
+
+	void* const buffer = kernel_detour_holder::allocate_memory(static_cast<std::uint16_t>(trampoline.size()));
+
+	if (buffer == nullptr)
+	{
+		return 0;
+	}
+
+	memcpy(buffer, trampoline.data(), trampoline.size());
+	publish_shadow_bytes(buffer, trampoline.size());
+
+	const std::uint64_t detour = kernel_detour_holder_base + kernel_detour_holder::get_allocation_offset(buffer);
+	std::vector<std::uint8_t> jump = {};
+
+	if (minimum_steal == 5)
+	{
+		jump = relative_jump(page_virtual + span.steal_offset, detour);
+	}
+
+	if (jump.empty())
+	{
+		if (page_size - span.steal_offset < inline_hook_bytes_size)
+		{
+			return 0;
+		}
+
+		jump = absolute_jump(detour);
+	}
+
+	const std::uint64_t room = page_size - span.steal_offset;
+
+	memcpy(shadow_page + span.steal_offset, jump.data(), jump.size());
+
+	if (room > jump.size())
+	{
+		memset(shadow_page + span.steal_offset + jump.size(), 0x90, static_cast<std::size_t>(room - jump.size()));
+	}
+
+	return 1;
+}
+
 std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
                                    const std::span<const std::uint8_t> extra_assembled_bytes,
                                    const std::span<const std::uint8_t> post_original_assembled_bytes)
@@ -475,6 +612,32 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 	if (hook_status == 0)
 	{
 		return 0;
+	}
+
+	const std::uint64_t page_virtual = routine_to_hook_virtual & ~(static_cast<std::uint64_t>(page_size) - 1);
+	std::uint64_t patch_length = extra_assembled_bytes.size() + inline_hook_bytes_size;
+
+	if (post_original_assembled_bytes.empty() == false)
+	{
+		patch_length = original_bytes.second;
+	}
+
+	auto* const shadow = static_cast<std::uint8_t*>(shadow_page_virtual);
+	const std::uint64_t page_patch = page_offset + patch_length > page_size ? page_size - page_offset : patch_length;
+
+	if (relocate_page_span(shadow, page_virtual, page_offset, page_patch) == 0)
+	{
+		return 0;
+	}
+
+	if (is_overflow_hook == 1)
+	{
+		const std::uint64_t overflow_patch = page_offset + patch_length - page_size;
+
+		if (relocate_page_span(shadow + page_size, page_virtual + page_size, 0, overflow_patch) == 0)
+		{
+			return 0;
+		}
 	}
 
 	publish_shadow_bytes(shadow_page_virtual, is_overflow_hook == 1 ? (page_size * 2) : page_size);

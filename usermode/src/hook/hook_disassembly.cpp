@@ -601,3 +601,87 @@ std::pair<std::vector<std::uint8_t>, std::uint64_t> hook_disasm::get_routine_ali
 
 	return {aligned_bytes, original_routine_bytes_copied};
 }
+
+hook_disasm::page_span_t hook_disasm::find_page_span(std::uint8_t* const page_and_tail, const std::uint64_t page_bytes,
+                                                    const std::uint64_t minimum_steal)
+{
+	page_span_t span = {};
+	const ZydisDecoder decoder = make_zydis_decoder();
+	std::vector<std::uint64_t> starts;
+	std::uint64_t offset = 0;
+	std::uint64_t cross_start = 0;
+	std::uint64_t cross_end = 0;
+
+	std::uint8_t reliable = 1;
+
+	while (offset < page_bytes)
+	{
+		ZydisDecoderContext decoder_context = {};
+		ZydisDecodedInstruction decoded_instruction = {};
+
+		const std::uint8_t decoded = decode_instruction(&decoder, &decoder_context, &decoded_instruction,
+		                                               page_and_tail + offset);
+
+		if (decoded == 0 || decoded_instruction.length == 0)
+		{
+			offset++;
+			reliable = 0;
+
+			continue;
+		}
+
+		const std::uint64_t end = offset + decoded_instruction.length;
+
+		if (end > page_bytes)
+		{
+			if (reliable == 0)
+			{
+				return span;
+			}
+
+			cross_start = offset;
+			cross_end = end;
+
+			break;
+		}
+
+		if (decoded_instruction.length == 1 && (page_and_tail[offset] == 0xC3 || page_and_tail[offset] == 0xCC))
+		{
+			reliable = 1;
+		}
+
+		starts.push_back(offset);
+		offset = end;
+	}
+
+	if (cross_end == 0)
+	{
+		return span;
+	}
+
+	std::uint64_t steal = cross_start;
+
+	if (page_bytes - cross_start < minimum_steal)
+	{
+		std::uint8_t found_steal = 0;
+
+		for (const std::uint64_t start : starts)
+		{
+			if (start < cross_start && page_bytes - start >= minimum_steal)
+			{
+				steal = start;
+				found_steal = 1;
+			}
+		}
+
+		if (found_steal == 0)
+		{
+			return span;
+		}
+	}
+
+	span.steal_offset = steal;
+	span.byte_count = cross_end - steal;
+
+	return span;
+}
