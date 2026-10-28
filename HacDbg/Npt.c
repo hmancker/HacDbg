@@ -34,7 +34,7 @@
 typedef struct _NPT_HOOK
 {
     volatile UINT64 TargetPage;
-    UINT64 ShadowPage;
+    UINT64 UserPage;
     volatile BOOLEAN Active;
     UINT8 Reserved[7];
 } NPT_HOOK;
@@ -57,6 +57,9 @@ static UINT64 g_SplitPagesCarved;
 static UINT64 g_MainRootPa;
 static UINT64 g_HookRootPa;
 static UINT64 g_DummyPagePa;
+static PVOID g_HookCopyAllocation;
+static PVOID g_HookCopyVa[HACDBG_NPT_MAX_HOOKS];
+static UINT64 g_HookCopyPa[HACDBG_NPT_MAX_HOOKS];
 static NPT_HOOK g_Hooks[HACDBG_NPT_MAX_HOOKS];
 static NPT_HIDDEN_PAGE g_HiddenPages[HACDBG_NPT_MAX_HIDDEN];
 static HACDBG_SPIN_LOCK g_NptLock;
@@ -65,6 +68,11 @@ static BOOLEAN g_Initialized;
 static BOOLEAN
 NptFindHidden(
     _In_ UINT64 Page
+    );
+
+static BOOLEAN
+NptAllocateHookCopies(
+    VOID
     );
 
 // 按页块从非分页池切出 NPT 表，块首强制 4 KiB 对齐。
@@ -352,7 +360,8 @@ NptContainsShadowPage(
 
     for (index = 0; index < HACDBG_NPT_MAX_HOOKS; index++)
     {
-        if (g_Hooks[index].Active != FALSE && g_Hooks[index].ShadowPage == page)
+        if (g_Hooks[index].Active != FALSE &&
+            (g_Hooks[index].UserPage == page || g_HookCopyPa[index] == page))
         {
             found = TRUE;
             break;
@@ -585,6 +594,11 @@ NptInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    if (NptAllocateHookCopies() == FALSE)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     g_Initialized = TRUE;
     return STATUS_SUCCESS;
 }
@@ -613,6 +627,14 @@ NptCleanup(
     g_MainRootPa = 0;
     g_HookRootPa = 0;
     g_DummyPagePa = 0;
+    if (g_HookCopyAllocation != NULL)
+    {
+        ExFreePoolWithTag(g_HookCopyAllocation, HACDBG_NPT_TAG);
+        g_HookCopyAllocation = NULL;
+    }
+
+    RtlZeroMemory(g_HookCopyVa, sizeof(g_HookCopyVa));
+    RtlZeroMemory(g_HookCopyPa, sizeof(g_HookCopyPa));
     g_Initialized = FALSE;
 }
 
@@ -635,7 +657,91 @@ NptFreeTableCount(
                     (HACDBG_NPT_SPLIT_PAGES - g_SplitPagesUsed));
 }
 
-// 在主表中禁止目标页执行，在钩子表中把该页指向影子页。
+//
+// Copies one resident user page into this hook slot's nonpaged page.
+// The caller holds g_NptLock. The temporary window is a host alias.
+//
+static BOOLEAN
+NptCopyUserPage(
+    _In_ UINT64 UserPage,
+    _In_ PVOID KernelView,
+    _In_ BOOLEAN KeepPreviousIfZero
+    )
+{
+    SIZE_T mappedSize = 0;
+    PVOID mapped;
+    const UCHAR* bytes;
+    UINT32 index;
+    BOOLEAN nonzero = FALSE;
+
+    //
+    // INVARIANT: UserPage is one 4 KiB RAM frame. KernelView is a nonpaged
+    // page private to this hook slot and is not a guest mapping.
+    //
+    mapped = PhysicalMemoryMapTemporary(HacDbgGuestPhysicalAddress(UserPage), PAGE_SIZE, &mappedSize);
+    if (mapped == NULL || mappedSize < PAGE_SIZE)
+    {
+        return FALSE;
+    }
+
+    bytes = (const UCHAR*)mapped;
+    for (index = 0; index < PAGE_SIZE; index++)
+    {
+        if (bytes[index] != 0)
+        {
+            nonzero = TRUE;
+            break;
+        }
+    }
+
+    //
+    // A reclaimed user frame is all zeros. Executing it is add [rax], al.
+    // Leave the previous nonpaged bytes in place.
+    //
+    if (nonzero == FALSE)
+    {
+        PhysicalMemoryUnmapTemporary(mapped, mappedSize);
+        return KeepPreviousIfZero;
+    }
+
+    RtlCopyMemory(KernelView, mapped, PAGE_SIZE);
+    PhysicalMemoryUnmapTemporary(mapped, mappedSize);
+    return TRUE;
+}
+
+static BOOLEAN
+NptAllocateHookCopies(
+    VOID
+    )
+{
+    SIZE_T bytes = ((SIZE_T)HACDBG_NPT_MAX_HOOKS * PAGE_SIZE) + PAGE_SIZE;
+    PUCHAR aligned;
+    UINT32 index;
+
+    g_HookCopyAllocation = ExAllocatePool2(POOL_FLAG_NON_PAGED, bytes, HACDBG_NPT_TAG);
+    if (g_HookCopyAllocation == NULL)
+    {
+        return FALSE;
+    }
+
+    aligned = (PUCHAR)(((ULONG_PTR)g_HookCopyAllocation + (PAGE_SIZE - 1)) & ~(ULONG_PTR)(PAGE_SIZE - 1));
+    for (index = 0; index < HACDBG_NPT_MAX_HOOKS; index++)
+    {
+        PHYSICAL_ADDRESS physical;
+
+        g_HookCopyVa[index] = aligned + ((SIZE_T)index * PAGE_SIZE);
+        physical = MmGetPhysicalAddress(g_HookCopyVa[index]);
+        g_HookCopyPa[index] = (UINT64)physical.QuadPart & NPT_ADDRESS_MASK;
+        if (g_HookCopyPa[index] == 0)
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+// 在主表中禁止目标页执行，在钩子表中把该页指向非分页副本。
 BOOLEAN
 NptAddHook(
     _In_ GUEST_PHYSICAL_ADDRESS TargetPage,
@@ -690,16 +796,29 @@ NptAddHook(
         return FALSE;
     }
 
-    g_Hooks[index].TargetPage = target;
-    g_Hooks[index].ShadowPage = shadow;
-    g_Hooks[index].Active = FALSE;
-
     if (PhysicalMemoryFlushPage(HacDbgGuestPhysicalAddress(shadow)) == FALSE)
     {
         HACDBG_LOG("HacDbg: Err, NPT shadow flush failed pa=0x%I64x.\n", shadow);
     }
 
-    *hookPte = (shadow & NPT_ADDRESS_MASK) | NPT_PRESENT | NPT_WRITE | NPT_USER;
+    if (g_HookCopyVa[index] == NULL || g_HookCopyPa[index] == 0 ||
+        NptCopyUserPage(shadow, g_HookCopyVa[index], FALSE) == FALSE)
+    {
+        HACDBG_LOG("HacDbg: Err, NPT hook copy failed target=0x%I64x source=0x%I64x.\n",
+                 target, shadow);
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    g_Hooks[index].TargetPage = target;
+    g_Hooks[index].UserPage = shadow;
+    g_Hooks[index].Active = FALSE;
+
+    //
+    // The guest executes the nonpaged copy. The caller's frame stays
+    // writable for later edits and is copied again on a SLAT flush.
+    //
+    *hookPte = g_HookCopyPa[index] | NPT_PRESENT | NPT_WRITE | NPT_USER;
     NptSetAdjacentExecutable(target);
     KeMemoryBarrier();
     g_Hooks[index].Active = TRUE;
@@ -742,6 +861,8 @@ NptRemoveHook(
     *mainPte &= ~NPT_NX;
     KeMemoryBarrier();
     g_Hooks[index].Active = FALSE;
+    g_Hooks[index].UserPage = 0;
+    g_Hooks[index].TargetPage = 0;
     KeMemoryBarrier();
 
     if (NptFindHidden(target) != FALSE)
@@ -763,6 +884,41 @@ NptRemoveHook(
     HacDbgSpinLockRelease(&g_NptLock);
 
     return TRUE;
+}
+
+VOID
+NptRefreshHookCopies(
+    VOID
+    )
+{
+    UINT32 index;
+    BOOLEAN logged = FALSE;
+
+    if (g_Initialized == FALSE)
+    {
+        return;
+    }
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+
+    for (index = 0; index < HACDBG_NPT_MAX_HOOKS; index++)
+    {
+        if (g_Hooks[index].Active == FALSE || g_Hooks[index].UserPage == 0 ||
+            g_HookCopyVa[index] == NULL)
+        {
+            continue;
+        }
+
+        if (NptCopyUserPage(g_Hooks[index].UserPage, g_HookCopyVa[index], TRUE) == FALSE &&
+            logged == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, NPT hook copy refresh failed pa=0x%I64x.\n",
+                     g_Hooks[index].UserPage);
+            logged = TRUE;
+        }
+    }
+
+    HacDbgSpinLockRelease(&g_NptLock);
 }
 
 // 把目标页在主表和钩子表中替换成零页。

@@ -17,6 +17,7 @@
 #define HacDbgSlatRemoveHook EptRemoveHook
 #define HacDbgSlatHidePage EptHidePage
 #define HacDbgSlatFreePages EptFreeTableCount
+#define HacDbgSlatRefreshHooks EptRefreshHookCopies
 #define HacDbgSlatFlush VmxFlushAllProcessors
 #define HacDbgSlatContainsShadow EptContainsShadowPage
 #define HacDbgSlatContainsHookTarget EptContainsHookTarget
@@ -28,6 +29,7 @@
 #define HacDbgSlatRemoveHook NptRemoveHook
 #define HacDbgSlatHidePage NptHidePage
 #define HacDbgSlatFreePages NptFreeTableCount
+#define HacDbgSlatRefreshHooks NptRefreshHookCopies
 #define HacDbgSlatFlush SvmFlushAllProcessors
 #define HacDbgSlatContainsShadow NptContainsShadowPage
 #define HacDbgSlatContainsHookTarget NptContainsHookTarget
@@ -676,6 +678,7 @@ HypercallExecute(
         break;
 
     case flush_slat_cache:
+        HacDbgSlatRefreshHooks();
         HacDbgSlatFlush();
         result = 1;
         break;

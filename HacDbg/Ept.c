@@ -73,7 +73,7 @@
 typedef struct _EPT_HOOK
 {
     volatile UINT64 TargetPage;
-    UINT64 ShadowPage;
+    UINT64 UserPage;
     volatile BOOLEAN Active;
     UINT8 Reserved[7];
 } EPT_HOOK;
@@ -104,6 +104,9 @@ static UINT64 g_SplitPagesCarved;
 static UINT64 g_MainEptp;
 static UINT64 g_HookEptp;
 static UINT64 g_DummyPagePa;
+static PVOID g_HookCopyAllocation;
+static PVOID g_HookCopyVa[HACDBG_EPT_MAX_HOOKS];
+static UINT64 g_HookCopyPa[HACDBG_EPT_MAX_HOOKS];
 static EPT_HOOK g_Hooks[HACDBG_EPT_MAX_HOOKS];
 static EPT_HIDDEN_PAGE g_HiddenPages[HACDBG_EPT_MAX_HIDDEN];
 static HACDBG_SPIN_LOCK g_EptLock;
@@ -118,6 +121,11 @@ static BOOLEAN g_MtrrFixedEnabled;
 static BOOLEAN
 EptFindHidden(
     _In_ UINT64 Page
+    );
+
+static BOOLEAN
+EptAllocateHookCopies(
+    VOID
     );
 
 // 按页块从非分页池切出 EPT 表，块首强制 4 KiB 对齐。
@@ -649,7 +657,8 @@ EptContainsShadowPage(
 
     for (index = 0; index < HACDBG_EPT_MAX_HOOKS; index++)
     {
-        if (g_Hooks[index].Active != FALSE && g_Hooks[index].ShadowPage == page)
+        if (g_Hooks[index].Active != FALSE &&
+            (g_Hooks[index].UserPage == page || g_HookCopyPa[index] == page))
         {
             found = TRUE;
             break;
@@ -970,6 +979,11 @@ EptInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
+    if (EptAllocateHookCopies() == FALSE)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
     g_MainEptp = (mainPa & EPT_ADDRESS_MASK) | EPT_POINTER_FLAGS;
     g_HookEptp = (hookPa & EPT_ADDRESS_MASK) | EPT_POINTER_FLAGS;
     g_Initialized = TRUE;
@@ -999,6 +1013,14 @@ EptCleanup(
     g_MainEptp = 0;
     g_HookEptp = 0;
     g_DummyPagePa = 0;
+    if (g_HookCopyAllocation != NULL)
+    {
+        ExFreePoolWithTag(g_HookCopyAllocation, HACDBG_EPT_TAG);
+        g_HookCopyAllocation = NULL;
+    }
+
+    RtlZeroMemory(g_HookCopyVa, sizeof(g_HookCopyVa));
+    RtlZeroMemory(g_HookCopyPa, sizeof(g_HookCopyPa));
     g_Initialized = FALSE;
     g_MtrrEnabled = FALSE;
     g_MtrrFixedEnabled = FALSE;
@@ -1037,6 +1059,90 @@ EptFreeTableCount(
 {
     return (UINT32)((HACDBG_EPT_FIXED_PAGES - g_FixedPagesUsed) +
                     (HACDBG_EPT_SPLIT_PAGES - g_SplitPagesUsed));
+}
+
+//
+// Copies one resident user page into this hook slot's nonpaged page.
+// The caller holds g_EptLock. The temporary window is a host alias.
+//
+static BOOLEAN
+EptCopyUserPage(
+    _In_ UINT64 UserPage,
+    _In_ PVOID KernelView,
+    _In_ BOOLEAN KeepPreviousIfZero
+    )
+{
+    SIZE_T mappedSize = 0;
+    PVOID mapped;
+    const UCHAR* bytes;
+    UINT32 index;
+    BOOLEAN nonzero = FALSE;
+
+    //
+    // INVARIANT: UserPage is one 4 KiB RAM frame. KernelView is a nonpaged
+    // page private to this hook slot and is not a guest mapping.
+    //
+    mapped = PhysicalMemoryMapTemporary(HacDbgGuestPhysicalAddress(UserPage), PAGE_SIZE, &mappedSize);
+    if (mapped == NULL || mappedSize < PAGE_SIZE)
+    {
+        return FALSE;
+    }
+
+    bytes = (const UCHAR*)mapped;
+    for (index = 0; index < PAGE_SIZE; index++)
+    {
+        if (bytes[index] != 0)
+        {
+            nonzero = TRUE;
+            break;
+        }
+    }
+
+    //
+    // A reclaimed user frame is all zeros. Executing it is add [rax], al.
+    // Leave the previous nonpaged bytes in place.
+    //
+    if (nonzero == FALSE)
+    {
+        PhysicalMemoryUnmapTemporary(mapped, mappedSize);
+        return KeepPreviousIfZero;
+    }
+
+    RtlCopyMemory(KernelView, mapped, PAGE_SIZE);
+    PhysicalMemoryUnmapTemporary(mapped, mappedSize);
+    return TRUE;
+}
+
+static BOOLEAN
+EptAllocateHookCopies(
+    VOID
+    )
+{
+    SIZE_T bytes = ((SIZE_T)HACDBG_EPT_MAX_HOOKS * PAGE_SIZE) + PAGE_SIZE;
+    PUCHAR aligned;
+    UINT32 index;
+
+    g_HookCopyAllocation = ExAllocatePool2(POOL_FLAG_NON_PAGED, bytes, HACDBG_EPT_TAG);
+    if (g_HookCopyAllocation == NULL)
+    {
+        return FALSE;
+    }
+
+    aligned = (PUCHAR)(((ULONG_PTR)g_HookCopyAllocation + (PAGE_SIZE - 1)) & ~(ULONG_PTR)(PAGE_SIZE - 1));
+    for (index = 0; index < HACDBG_EPT_MAX_HOOKS; index++)
+    {
+        PHYSICAL_ADDRESS physical;
+
+        g_HookCopyVa[index] = aligned + ((SIZE_T)index * PAGE_SIZE);
+        physical = MmGetPhysicalAddress(g_HookCopyVa[index]);
+        g_HookCopyPa[index] = (UINT64)physical.QuadPart & EPT_ADDRESS_MASK;
+        if (g_HookCopyPa[index] == 0)
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
 }
 
 BOOLEAN
@@ -1093,16 +1199,29 @@ EptAddHook(
         return FALSE;
     }
 
-    g_Hooks[index].TargetPage = target;
-    g_Hooks[index].ShadowPage = shadow;
-    g_Hooks[index].Active = FALSE;
-
     if (PhysicalMemoryFlushPage(HacDbgGuestPhysicalAddress(shadow)) == FALSE)
     {
         HACDBG_LOG("HacDbg: Err, EPT shadow flush failed pa=0x%I64x.\n", shadow);
     }
 
-    *hookPte = (shadow & EPT_ADDRESS_MASK) | EptAccessFlags(shadow, TRUE);
+    if (g_HookCopyVa[index] == NULL || g_HookCopyPa[index] == 0 ||
+        EptCopyUserPage(shadow, g_HookCopyVa[index], FALSE) == FALSE)
+    {
+        HACDBG_LOG("HacDbg: Err, EPT hook copy failed target=0x%I64x source=0x%I64x.\n",
+                 target, shadow);
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    g_Hooks[index].TargetPage = target;
+    g_Hooks[index].UserPage = shadow;
+    g_Hooks[index].Active = FALSE;
+
+    //
+    // The guest executes the nonpaged copy. The caller's frame stays
+    // writable for later edits and is copied again on a SLAT flush.
+    //
+    *hookPte = g_HookCopyPa[index] | EptAccessFlags(g_HookCopyPa[index], TRUE);
     EptSetAdjacentExecutable(target);
     KeMemoryBarrier();
     g_Hooks[index].Active = TRUE;
@@ -1143,6 +1262,8 @@ EptRemoveHook(
     *mainPte |= EPT_EXECUTE;
     KeMemoryBarrier();
     g_Hooks[index].Active = FALSE;
+    g_Hooks[index].UserPage = 0;
+    g_Hooks[index].TargetPage = 0;
     KeMemoryBarrier();
 
     if (EptFindHidden(target) != FALSE)
@@ -1157,6 +1278,41 @@ EptRemoveHook(
     KeMemoryBarrier();
     HacDbgSpinLockRelease(&g_EptLock);
     return TRUE;
+}
+
+VOID
+EptRefreshHookCopies(
+    VOID
+    )
+{
+    UINT32 index;
+    BOOLEAN logged = FALSE;
+
+    if (g_Initialized == FALSE)
+    {
+        return;
+    }
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+
+    for (index = 0; index < HACDBG_EPT_MAX_HOOKS; index++)
+    {
+        if (g_Hooks[index].Active == FALSE || g_Hooks[index].UserPage == 0 ||
+            g_HookCopyVa[index] == NULL)
+        {
+            continue;
+        }
+
+        if (EptCopyUserPage(g_Hooks[index].UserPage, g_HookCopyVa[index], TRUE) == FALSE &&
+            logged == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, EPT hook copy refresh failed pa=0x%I64x.\n",
+                     g_Hooks[index].UserPage);
+            logged = TRUE;
+        }
+    }
+
+    HacDbgSpinLockRelease(&g_EptLock);
 }
 
 BOOLEAN

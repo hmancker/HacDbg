@@ -57,6 +57,17 @@ NptAddHook(
     _In_ GUEST_PHYSICAL_ADDRESS ShadowPage
     );
 
+VOID
+/**
+ * @brief Copies active hook sources into their nonpaged execute pages.
+ *
+ * @details Called before a SLAT flush. A failed source read leaves the
+ * previous execute page in place.
+ */
+NptRefreshHookCopies(
+    VOID
+    );
+
 BOOLEAN
 /**
  * @brief Reports whether a physical page is an active execute-hook shadow.
