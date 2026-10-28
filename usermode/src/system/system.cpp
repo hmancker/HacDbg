@@ -79,47 +79,15 @@ static std::uint8_t image_file_matches(const std::vector<std::uint8_t>& file,
 	return 1;
 }
 
+static std::vector<std::uint8_t> load_kernel_image_file(const std::wstring& full_name,
+                                                         const std::string& module_name,
+                                                         const portable_executable::image_t* const memory_image);
+
 static std::vector<std::uint8_t> load_matching_kernel_image(const std::wstring& full_name,
                                                             const std::string& module_name,
                                                             const portable_executable::image_t* const memory_image)
 {
-	std::vector<std::string> candidates;
-
-	const std::string converted = kernel_path_to_win32(full_name);
-
-	if (converted.empty() == false)
-	{
-		candidates.push_back(converted);
-	}
-
-	if (module_name.empty() == false)
-	{
-		char system_directory[MAX_PATH] = {};
-		const UINT length = GetSystemDirectoryA(system_directory, MAX_PATH);
-
-		if (length != 0 && length < MAX_PATH)
-		{
-			candidates.push_back(std::string(system_directory) + "\\" + module_name);
-			candidates.push_back(std::string(system_directory) + "\\drivers\\" + module_name);
-		}
-	}
-
-	for (const std::string& candidate : candidates)
-	{
-		if (sys::fs::exists(candidate) == 0)
-		{
-			continue;
-		}
-
-		std::vector<std::uint8_t> file = sys::fs::read_from_disk(candidate);
-
-		if (image_file_matches(file, memory_image) != 0)
-		{
-			return file;
-		}
-	}
-
-	return {};
+	return load_kernel_image_file(full_name, module_name, memory_image);
 }
 
 static std::uint64_t copy_section_from_file(const std::vector<std::uint8_t>& file,
@@ -209,6 +177,106 @@ static std::uint8_t image_headers_usable(const std::vector<std::uint8_t>& header
 	}
 
 	*section_end_out = section_offset + section_bytes;
+
+	return 1;
+}
+
+static std::uint8_t image_file_acceptable(const std::vector<std::uint8_t>& file)
+{
+	std::uint64_t section_end = 0;
+	constexpr std::uint64_t max_image = 128ull * 1024ull * 1024ull;
+	constexpr std::uint16_t pe32_plus = 0x20b;
+
+	if (image_headers_usable(file, &section_end) == 0)
+	{
+		return 0;
+	}
+
+	const auto* const dos = reinterpret_cast<const portable_executable::dos_header_t*>(file.data());
+	const auto* const nt = reinterpret_cast<const portable_executable::nt_headers_t*>(file.data() + dos->e_lfanew);
+	const std::uint64_t size_of_headers = nt->optional_header.size_of_headers;
+	const std::uint64_t size_of_image = nt->optional_header.size_of_image;
+
+	if (nt->optional_header.magic != pe32_plus || nt->file_header.number_of_sections == 0 ||
+	    size_of_headers < section_end || size_of_headers > size_of_image || size_of_image < page_size ||
+	    size_of_image > max_image || file.size() < size_of_headers)
+	{
+		return 0;
+	}
+
+	return 1;
+}
+
+static std::vector<std::uint8_t> load_kernel_image_file(const std::wstring& full_name,
+                                                         const std::string& module_name,
+                                                         const portable_executable::image_t* const memory_image)
+{
+	std::vector<std::string> candidates;
+
+	const std::string converted = kernel_path_to_win32(full_name);
+
+	if (converted.empty() == false)
+	{
+		candidates.push_back(converted);
+	}
+
+	if (module_name.empty() == false)
+	{
+		char system_directory[MAX_PATH] = {};
+		const UINT length = GetSystemDirectoryA(system_directory, MAX_PATH);
+
+		if (length != 0 && length < MAX_PATH)
+		{
+			candidates.push_back(std::string(system_directory) + "\\" + module_name);
+			candidates.push_back(std::string(system_directory) + "\\drivers\\" + module_name);
+		}
+	}
+
+	for (const std::string& candidate : candidates)
+	{
+		if (sys::fs::exists(candidate) == 0)
+		{
+			continue;
+		}
+
+		std::vector<std::uint8_t> file = sys::fs::read_from_disk(candidate);
+
+		if (memory_image != nullptr)
+		{
+			if (image_file_matches(file, memory_image) != 0)
+			{
+				return file;
+			}
+		}
+		else if (image_file_acceptable(file) != 0)
+		{
+			return file;
+		}
+	}
+
+	return {};
+}
+
+//
+// The guest header page is a software PTE with no frame. The on-disk image
+// still has the PE header at file offset 0. Bytes past SizeOfHeaders in the
+// file are raw section data, so the virtual gap up to the next page stays zero.
+//
+static std::uint8_t copy_headers_from_image_file(std::vector<std::uint8_t>& headers,
+                                                 const std::vector<std::uint8_t>& file)
+{
+	if (image_file_acceptable(file) == 0)
+	{
+		return 0;
+	}
+
+	const auto* const dos = reinterpret_cast<const portable_executable::dos_header_t*>(file.data());
+	const auto* const nt = reinterpret_cast<const portable_executable::nt_headers_t*>(file.data() + dos->e_lfanew);
+	const std::uint64_t size_of_headers = nt->optional_header.size_of_headers;
+	const std::size_t stored = (std::max)(static_cast<std::size_t>(page_size), static_cast<std::size_t>(size_of_headers));
+
+	headers.assign(stored, 0);
+	std::memcpy(headers.data(), file.data(), static_cast<std::size_t>(size_of_headers));
 
 	return 1;
 }
@@ -331,6 +399,8 @@ static std::vector<std::uint8_t> dump_kernel_module(const std::uint64_t module_b
 	constexpr std::uint64_t headers_size = page_size;
 
 	std::vector<std::uint8_t> headers(headers_size);
+	std::vector<std::uint8_t> image_file;
+	std::uint8_t image_file_checked = 0;
 	std::uint32_t failed_sections = 0;
 
 	if (failed_sections_out != nullptr)
@@ -373,17 +443,25 @@ static std::vector<std::uint8_t> dump_kernel_module(const std::uint64_t module_b
 				? 0
 				: hypercall::read_guest_physical_memory(headers.data(), source_physical, headers_size);
 
-		LOG_ERR("kernel module header read failed: base=0x{:x} cr3=0x{:x} source_phys=0x{:x} "
-		        "destination_phys=0x{:x} virtual_bytes={}/{} physical_bytes={}/{}",
-		        module_base_address, sys::current_cr3, source_physical, destination_physical,
-		        bytes_read, headers_size, physical_bytes_read, headers_size);
-
-		if (physical_bytes_read != headers_size)
+		if (physical_bytes_read == headers_size)
 		{
-			return {};
+			bytes_read = physical_bytes_read;
 		}
+		else
+		{
+			image_file_checked = 1;
+			image_file = load_kernel_image_file(full_name, module_name, nullptr);
 
-		bytes_read = physical_bytes_read;
+			if (copy_headers_from_image_file(headers, image_file) == 0)
+			{
+				LOG_ERR("kernel module header read failed: base=0x{:x} cr3=0x{:x} source_phys=0x{:x} "
+				        "destination_phys=0x{:x} virtual_bytes={}/{} physical_bytes={}/{} name={}",
+				        module_base_address, sys::current_cr3, source_physical, destination_physical,
+				        bytes_read, headers_size, physical_bytes_read, headers_size, module_name);
+
+				return {};
+			}
+		}
 	}
 
 	const std::uint16_t magic = *reinterpret_cast<std::uint16_t*>(headers.data());
@@ -399,10 +477,9 @@ static std::vector<std::uint8_t> dump_kernel_module(const std::uint64_t module_b
 	const portable_executable::image_t* image = reinterpret_cast<portable_executable::image_t*>(headers.data());
 
 	std::vector<std::uint8_t> image_buffer(image->nt_headers()->optional_header.size_of_image);
-	std::vector<std::uint8_t> image_file;
-	std::uint8_t image_file_checked = 0;
+	const std::size_t header_bytes = (std::min)(headers.size(), image_buffer.size());
 
-	memcpy(image_buffer.data(), headers.data(), page_size);
+	memcpy(image_buffer.data(), headers.data(), header_bytes);
 
 	for (const auto& current_section : image->sections())
 	{
@@ -413,6 +490,12 @@ static std::vector<std::uint8_t> dump_kernel_module(const std::uint64_t module_b
 
 		const std::uint64_t read_offset = current_section.virtual_address;
 		const std::uint64_t read_size = current_section.virtual_size;
+
+		if (read_offset >= image_buffer.size() || read_size > image_buffer.size() - read_offset)
+		{
+			failed_sections++;
+			continue;
+		}
 
 		std::uint64_t section_copied = 0;
 
@@ -845,9 +928,23 @@ static std::optional<ntoskrnl_information_t> load_ntoskrnl_information()
 
 		if (current_module_name == "ntoskrnl.exe")
 		{
+			std::wstring ntoskrnl_path;
 			std::uint32_t failed_sections = 0;
-			const std::vector<std::uint8_t> ntoskrnl_dump =
-				dump_kernel_module(current_module.image_base, &failed_sections);
+
+			ntoskrnl_path.reserve(sizeof(current_module.full_path_name));
+
+			for (const std::uint8_t character : current_module.full_path_name)
+			{
+				if (character == 0)
+				{
+					break;
+				}
+
+				ntoskrnl_path.push_back(static_cast<wchar_t>(character));
+			}
+
+			const std::vector<std::uint8_t> ntoskrnl_dump = dump_kernel_module(
+				current_module.image_base, &failed_sections, ntoskrnl_path, "ntoskrnl.exe");
 
 			if (ntoskrnl_dump.empty())
 			{
@@ -943,9 +1040,125 @@ static std::uint64_t capture_local_user_cr3()
 }
 
 //
+// Walk one guest directory with physical reads. No other kernel directory is
+// substituted: a missing kernel slot must stay missing so a user directory
+// cannot pass as a kernel directory.
+//
+static std::uint64_t strict_translate(const std::uint64_t directory, const std::uint64_t virtual_address,
+                                      const std::uint8_t level_count)
+{
+	constexpr std::uint64_t frame_mask = 0x000FFFFFFFFFF000ull;
+	constexpr std::uint64_t present = 1ull;
+	constexpr std::uint64_t large = 0x80ull;
+	constexpr std::uint64_t prototype = 1ull << 10;
+	constexpr std::uint64_t transition = 1ull << 11;
+	std::uint64_t table = directory & frame_mask;
+	std::uint64_t shift = level_count == 5 ? 48ull : 39ull;
+
+	if (table == 0 || (level_count != 4 && level_count != 5))
+	{
+		return 0;
+	}
+
+	for (std::uint8_t level = 0; level < level_count; level++, shift -= 9)
+	{
+		const std::uint64_t index = (virtual_address >> shift) & 0x1ffull;
+		std::uint64_t entry = 0;
+
+		if (hypercall::read_guest_physical_memory(&entry, table + (index * sizeof(entry)), sizeof(entry)) !=
+			sizeof(entry))
+		{
+			return 0;
+		}
+
+		//
+		// A not-present PML4 or PDPT is a missing region. Only a 4 KiB leaf
+		// can still name a resident frame through the transition bit.
+		//
+		if ((entry & present) == 0 &&
+			(shift != 12 || (entry & prototype) != 0 || (entry & transition) == 0))
+		{
+			return 0;
+		}
+
+		if (shift == 30 && (entry & large) != 0)
+		{
+			return (entry & 0x000FFFFFC0000000ull) + (virtual_address & 0x3fffffffull);
+		}
+
+		if (shift == 21 && (entry & large) != 0)
+		{
+			return (entry & 0x000FFFFFFFE00000ull) + (virtual_address & 0x1fffffull);
+		}
+
+		if (shift == 12)
+		{
+			const std::uint64_t frame = entry & frame_mask;
+
+			if (frame == 0)
+			{
+				return 0;
+			}
+
+			return frame + (virtual_address & 0xfffull);
+		}
+
+		table = entry & frame_mask;
+
+		if (table == 0)
+		{
+			return 0;
+		}
+	}
+
+	return 0;
+}
+
+//
+// True when this directory, not some other remembered kernel directory, maps
+// the ntoskrnl image. Translation used by the debugger substitutes another
+// directory when the kernel slot is missing, so that result cannot be used
+// here.
+//
+static std::uint8_t directory_maps_ntoskrnl(const std::uint64_t raw_directory, const std::uint64_t kernel_base)
+{
+	constexpr std::uint64_t frame_mask = 0x000FFFFFFFFFF000ull;
+	const std::uint64_t directory = raw_directory & frame_mask;
+	std::uint64_t physical = 0;
+	std::uint16_t magic = 0;
+
+	//
+	// Bits 63:52 of a page-table root are zero. A canonical kernel pointer
+	// left in this slot is a different field; masking it produces a physical
+	// address that is not RAM.
+	//
+	if (directory == 0 || (raw_directory & 0xFFF0000000000000ull) != 0)
+	{
+		return 0;
+	}
+
+	physical = strict_translate(directory, kernel_base, 4);
+
+	if (physical == 0)
+	{
+		physical = strict_translate(directory, kernel_base, 5);
+	}
+
+	if (physical == 0 ||
+		hypercall::read_guest_physical_memory(&magic, physical, sizeof(magic)) != sizeof(magic))
+	{
+		return 0;
+	}
+
+	return static_cast<std::uint8_t>(magic == 0x5a4d);
+}
+
+//
 // The system directory does not map session space. This process's kernel
-// directory does, so win32k can be translated. Keep the system directory
-// when this one cannot translate ntoskrnl.
+// directory does, so win32k can be translated. Another process is not a
+// substitute: the first one in the list is the system process, and its
+// directory has no session image. Keep the current directory when this
+// process already uses it, or when its directory does not itself map ntoskrnl.
 //
 static std::uint64_t capture_session_kernel_directory(const std::uint64_t kernel_base)
 {
@@ -974,36 +1187,37 @@ static std::uint64_t capture_session_kernel_directory(const std::uint64_t kernel
 
 	const std::uint64_t self = GetCurrentProcessId();
 	const std::uint64_t first = eprocess;
-	std::uint64_t fallback = 0;
 
 	for (std::uint64_t count = 0; count < 4096 && eprocess != 0; count++)
 	{
-		std::uint64_t directory = 0;
+		std::uint64_t raw_directory = 0;
 		std::uint64_t pid = 0;
-
-		if (hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base,
-		                                         sys::current_cr3, sizeof(directory)) == sizeof(directory))
-		{
-			directory &= 0x000FFFFFFFFFF000ull;
-
-			if (directory != 0 && directory != sys::current_cr3 &&
-				hypercall::translate_guest_virtual_address(kernel_base, directory) != 0)
-			{
-				if (hypercall::read_guest_virtual_memory(&pid, eprocess + nt->eprocess_unique_process_id,
-				                                         sys::current_cr3, sizeof(pid)) == sizeof(pid) &&
-					pid == self)
-				{
-					return directory;
-				}
-
-				if (fallback == 0)
-				{
-					fallback = directory;
-				}
-			}
-		}
-
 		std::uint64_t flink = 0;
+
+		if (hypercall::read_guest_virtual_memory(&pid, eprocess + nt->eprocess_unique_process_id, sys::current_cr3,
+		                                         sizeof(pid)) == sizeof(pid) &&
+			pid == self)
+		{
+			if (hypercall::read_guest_virtual_memory(&raw_directory, eprocess + nt->eprocess_directory_table_base,
+			                                         sys::current_cr3, sizeof(raw_directory)) != sizeof(raw_directory))
+			{
+				return 0;
+			}
+
+			const std::uint64_t directory = raw_directory & 0x000FFFFFFFFFF000ull;
+
+			if (directory == 0 || directory == (sys::current_cr3 & 0x000FFFFFFFFFF000ull))
+			{
+				return 0;
+			}
+
+			if (directory_maps_ntoskrnl(raw_directory, kernel_base) == 0)
+			{
+				return 0;
+			}
+
+			return directory;
+		}
 
 		if (hypercall::read_guest_virtual_memory(&flink, eprocess + nt->eprocess_active_process_links,
 		                                         sys::current_cr3, sizeof(flink)) != sizeof(flink) || flink == 0)
@@ -1019,7 +1233,7 @@ static std::uint64_t capture_session_kernel_directory(const std::uint64_t kernel
 		}
 	}
 
-	return fallback;
+	return 0;
 }
 
 std::uint8_t sys::set_up()
