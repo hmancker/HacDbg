@@ -169,7 +169,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     continueAction->setToolTip(debugTip(QStringLiteral("继续"), QKeySequence(Qt::Key_F5)));
     stepOverAction->setToolTip(debugTip(QStringLiteral("步过"), QKeySequence(Qt::Key_F10)));
     stepIntoAction->setToolTip(debugTip(QStringLiteral("步入"), QKeySequence(Qt::Key_F11)));
-    cancelAction->setToolTip(QStringLiteral("取消"));
+    cancelAction->setToolTip(debugTip(QStringLiteral("取消"), QKeySequence(Qt::CTRL | Qt::Key_C)));
 
     auto* central = new QWidget(this);
     auto* layout = new QVBoxLayout(central);
@@ -222,6 +222,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     statusBar()->addPermanentWidget(m_version);
 
     connect(m_command, &CommandView::commandSubmitted, this, &MainWindow::executeCommand);
+    connect(m_command, &CommandView::interruptRequested, this, [this] { m_session.cancel(); });
     connect(m_command, &CommandView::quitRequested, this, &QWidget::close);
 
     auto* continueShortcut = new QShortcut(QKeySequence(Qt::Key_F5), this);

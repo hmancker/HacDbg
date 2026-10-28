@@ -33,6 +33,7 @@ public:
 
 signals:
     void commandSubmitted(const QString& command);
+    void interruptRequested();
     void quitRequested();
 
 private:

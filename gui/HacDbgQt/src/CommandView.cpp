@@ -163,6 +163,8 @@ CommandView::CommandView(QWidget* parent)
         acceptCompletion();
     });
     m_input->installEventFilter(this);
+    m_output->installEventFilter(this);
+    m_output->viewport()->installEventFilter(this);
     m_findEdit->installEventFilter(this);
 }
 
@@ -646,6 +648,38 @@ QColor CommandView::colorFor(const QString& line) const
 
 bool CommandView::eventFilter(QObject* watched, QEvent* event)
 {
+    const bool commandSurface = watched == m_input || watched == m_output || watched == m_output->viewport();
+
+    if (commandSurface && (event->type() == QEvent::ShortcutOverride || event->type() == QEvent::KeyPress))
+    {
+        auto* key = static_cast<QKeyEvent*>(event);
+        const Qt::KeyboardModifiers modifiers = key->modifiers();
+        const bool plainControl = modifiers.testFlag(Qt::ControlModifier) &&
+                                  modifiers.testFlag(Qt::AltModifier) == false &&
+                                  modifiers.testFlag(Qt::ShiftModifier) == false &&
+                                  modifiers.testFlag(Qt::MetaModifier) == false;
+
+        if (plainControl && key->key() == Qt::Key_C && key->isAutoRepeat() == false)
+        {
+            if (event->type() == QEvent::ShortcutOverride)
+            {
+                event->accept();
+                return true;
+            }
+
+            closeCompletion();
+
+            if (watched == m_input)
+            {
+                m_input->clear();
+                m_historyIndex = static_cast<int>(m_history.size());
+            }
+
+            emit interruptRequested();
+            return true;
+        }
+    }
+
     if (watched == m_findEdit && event->type() == QEvent::KeyPress)
     {
         auto* key = static_cast<QKeyEvent*>(event);
