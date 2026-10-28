@@ -22,7 +22,6 @@
 #define PHYSICAL_PTE_NX            (1ull << 63)
 #define PHYSICAL_PTE_PROTOTYPE     (1ull << 10)
 #define PHYSICAL_PTE_TRANSITION    (1ull << 11)
-#define PHYSICAL_TRANSITION_PFN    0xFFFFFFFFFull
 #define PHYSICAL_CR4_LA57          (1ull << 12)
 #define PHYSICAL_REGION_SHIFT      30
 //
@@ -970,9 +969,32 @@ PhysicalMemoryCanonicalAddress(
 }
 
 //
-// Windows 软件 PTE。bit 11 优先于 bit 10：置位时页仍在内存里，PFN 在
-// bits 47:12。bit 11 为 0 且 bit 10 置位时，bits 63:16 是原型 PTE 的
-// 虚拟地址，符号扩展后按同一份 CR3 再读。页文件上的页没有 PFN。
+// 页帧必须落在固件 RAM 里。内核指针的 bit 11 也可能置位，按过渡页
+// 取出的 36 位会变成 0xb882........ 这种不在 RAM 中的地址。
+//
+static SOFTWARE_PTE_RESULT
+PhysicalMemoryMapResidentFrame(
+    _In_ UINT64 Frame,
+    _In_ UINT64 PageOffset,
+    _Out_ GUEST_PHYSICAL_ADDRESS* PhysicalAddress
+    )
+{
+    UINT64 available = 0;
+
+    if (Frame == 0 || PhysicalMemoryFindRange(Frame, &available) == FALSE)
+    {
+        return SOFTWARE_PTE_NOT_RESIDENT;
+    }
+
+    PhysicalAddress->Value = Frame + PageOffset;
+    return SOFTWARE_PTE_MAPPED;
+}
+
+//
+// Windows 软件 PTE。bit 10 置位时，bit 11 是 Combined 或 ColdPage，
+// bits 63:16 是原型 PTE 的虚拟地址，符号扩展后按同一份 CR3 再读。
+// bit 10 为 0 且 bit 11 置位时，页仍在内存里，页帧在 bits 51:12。
+// 页文件上的页没有 PFN。
 //
 static SOFTWARE_PTE_RESULT
 PhysicalMemoryResolveSoftwarePte(
@@ -987,21 +1009,12 @@ PhysicalMemoryResolveSoftwarePte(
 
     if ((Entry & PHYSICAL_PTE_PRESENT) != 0)
     {
-        PhysicalAddress->Value = (Entry & PHYSICAL_PTE_FRAME) + pageOffset;
-        return SOFTWARE_PTE_MAPPED;
+        return PhysicalMemoryMapResidentFrame(Entry & PHYSICAL_PTE_FRAME, pageOffset, PhysicalAddress);
     }
 
-    if ((Entry & PHYSICAL_PTE_TRANSITION) != 0)
+    if ((Entry & PHYSICAL_PTE_PROTOTYPE) == 0 && (Entry & PHYSICAL_PTE_TRANSITION) != 0)
     {
-        UINT64 frame = (Entry >> PAGE_SHIFT) & PHYSICAL_TRANSITION_PFN;
-
-        if (frame == 0)
-        {
-            return SOFTWARE_PTE_NOT_RESIDENT;
-        }
-
-        PhysicalAddress->Value = (frame << PAGE_SHIFT) + pageOffset;
-        return SOFTWARE_PTE_MAPPED;
+        return PhysicalMemoryMapResidentFrame(Entry & PHYSICAL_PTE_FRAME, pageOffset, PhysicalAddress);
     }
 
     //
@@ -1099,15 +1112,31 @@ PhysicalMemoryWalk(
 
         if (shift == 30 && (entry & PHYSICAL_PTE_LARGE) != 0)
         {
+            UINT64 available = 0;
+
             offset = VirtualAddress.Value & 0x3fffffffull;
             PhysicalAddress->Value = (entry & 0x000FFFFFC0000000ull) + offset;
+            if (PhysicalMemoryFindRange(PhysicalAddress->Value, &available) == FALSE)
+            {
+                PhysicalAddress->Value = 0;
+                return PHYSICAL_WALK_NOT_PRESENT;
+            }
+
             return PHYSICAL_WALK_MAPPED;
         }
 
         if (shift == 21 && (entry & PHYSICAL_PTE_LARGE) != 0)
         {
+            UINT64 available = 0;
+
             offset = VirtualAddress.Value & 0x1fffffull;
             PhysicalAddress->Value = (entry & 0x000FFFFFFFE00000ull) + offset;
+            if (PhysicalMemoryFindRange(PhysicalAddress->Value, &available) == FALSE)
+            {
+                PhysicalAddress->Value = 0;
+                return PHYSICAL_WALK_NOT_PRESENT;
+            }
+
             return PHYSICAL_WALK_MAPPED;
         }
 
@@ -1136,7 +1165,18 @@ PhysicalMemoryWalk(
     }
 
     offset = VirtualAddress.Value & 0xfffull;
-    PhysicalAddress->Value = (entry & PHYSICAL_PTE_FRAME) + offset;
+    {
+        UINT64 available = 0;
+        UINT64 frame = entry & PHYSICAL_PTE_FRAME;
+
+        if (PhysicalMemoryFindRange(frame, &available) == FALSE)
+        {
+            return PHYSICAL_WALK_NOT_PRESENT;
+        }
+
+        PhysicalAddress->Value = frame + offset;
+    }
+
     return PHYSICAL_WALK_MAPPED;
 }
 
