@@ -631,6 +631,9 @@ HypercallExecute(
         break;
 
     case log_current_state:
+    {
+        UINT64 logRip = 0;
+
         if (GuestContext->InGuest == FALSE)
         {
             break;
@@ -638,13 +641,19 @@ HypercallExecute(
 
         if ((Information->call_reserved_data & hypercall_log_breakpoint_flag) != 0)
         {
-            HypercallLogState(GuestContext, HACDBG_LOG_POPPED_THREE, registers->R8, registers->Rdx);
+            logRip = registers->R8;
+            HypercallLogState(GuestContext, HACDBG_LOG_POPPED_THREE, logRip, registers->Rdx);
         }
         else
         {
-            HypercallLogState(GuestContext, HACDBG_LOG_POPPED_ONE, GuestContext->Rip, 0);
+            logRip = GuestContext->Rip;
+            HypercallLogState(GuestContext, HACDBG_LOG_POPPED_ONE, logRip, 0);
         }
+
+        HACDBG_LOG("HacDbg: monitor rip=0x%I64x cr3=0x%I64x.\n", logRip, GuestContext->Cr3);
+
         break;
+    }
 
     case flush_logs:
         if (Information->call_reserved_data == flush_logs_register_mailbox)
