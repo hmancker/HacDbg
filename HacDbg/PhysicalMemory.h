@@ -81,6 +81,27 @@ PhysicalMemoryRememberKernelDirectory(
     _In_ UINT64 Cr3
     );
 
+UINT64
+/**
+ * @brief Returns a kernel directory that still maps ntoskrnl.
+ *
+ * @param Preferred Directory to keep when it is still usable.
+ *
+ * @return A directory whose kernel-image slot is present, or 0 when none
+ * of the recorded directories are.
+ *
+ * @details A recorded CR3 is dropped when that slot is not present. The
+ * physical page is reused after the owning process exits, and walking it
+ * then reads a user directory or ordinary code. A failed physical read
+ * keeps Preferred.
+ *
+ * @warning Do not call above DISPATCH_LEVEL. The temporary map rejects
+ * that IRQL and this function then keeps Preferred.
+ */
+PhysicalMemorySelectLiveKernelDirectory(
+    _In_ UINT64 Preferred
+    );
+
 VOID
 /**
  * @brief Releases the RAM range table.

@@ -521,7 +521,101 @@ PhysicalMemorySetGuestRunning(
     }
 }
 
-// 记下一份 CPL 0 的内核页表根。表满后不再替换，避免把早期的会话目录挤掉。
+#define PHYSICAL_IMAGE_LIVE    1
+#define PHYSICAL_IMAGE_ABSENT  0
+#define PHYSICAL_IMAGE_UNREAD  (-1)
+
+//
+// 内核映像槽不在位时返回 ABSENT。物理读失败时返回 UNREAD，调用方必须
+// 保留原来的目录。进程退出后 CR3 页会被用户页表或代码复用，槽里会出现
+// 0 或指令字节，那种目录不能再用来翻译 ntoskrnl。
+//
+static INT
+PhysicalMemoryQueryKernelImage(
+    _In_ UINT64 Cr3
+    )
+{
+    UINT64 table = Cr3 & PHYSICAL_PTE_FRAME;
+    UINT64 entry = 0;
+    UINT64 available = 0;
+    GUEST_PHYSICAL_ADDRESS entryAddress;
+    SIZE_T read;
+
+    if (table == 0)
+    {
+        return PHYSICAL_IMAGE_ABSENT;
+    }
+
+    if (g_FiveLevelPaging != FALSE)
+    {
+        entryAddress = HacDbgGuestPhysicalAddress(table + (PHYSICAL_KERNEL_PML5_INDEX * sizeof(UINT64)));
+
+        //
+        // INVARIANT: table is a guest CR3 page read through the temporary
+        // RAM map. It is not a guest-visible host alias.
+        //
+        read = PhysicalMemoryRead(entryAddress, &entry, sizeof(entry));
+        if (read != sizeof(entry))
+        {
+            return PHYSICAL_IMAGE_UNREAD;
+        }
+
+        if ((entry & PHYSICAL_PTE_PRESENT) == 0 ||
+            PhysicalMemoryFindRange(entry & PHYSICAL_PTE_FRAME, &available) == FALSE)
+        {
+            return PHYSICAL_IMAGE_ABSENT;
+        }
+
+        table = entry & PHYSICAL_PTE_FRAME;
+    }
+
+    entryAddress = HacDbgGuestPhysicalAddress(table + (PHYSICAL_KERNEL_IMAGE_INDEX * sizeof(UINT64)));
+
+    //
+    // INVARIANT: entryAddress is the kernel-image slot in the directory
+    // selected above. A not-present slot is a KPTI user directory or a
+    // physical page that no longer holds that directory.
+    //
+    read = PhysicalMemoryRead(entryAddress, &entry, sizeof(entry));
+    if (read != sizeof(entry))
+    {
+        return PHYSICAL_IMAGE_UNREAD;
+    }
+
+    if ((entry & PHYSICAL_PTE_PRESENT) == 0 ||
+        PhysicalMemoryFindRange(entry & PHYSICAL_PTE_FRAME, &available) == FALSE)
+    {
+        return PHYSICAL_IMAGE_ABSENT;
+    }
+
+    return PHYSICAL_IMAGE_LIVE;
+}
+
+static VOID
+PhysicalMemoryDropKernelDirectory(
+    _In_ UINT64 Directory
+    )
+{
+    ULONG index;
+
+    Directory &= PHYSICAL_PTE_FRAME;
+    if (Directory == 0)
+    {
+        return;
+    }
+
+    for (index = 0; index < HACDBG_KERNEL_DIRECTORY_SLOTS; index++)
+    {
+        InterlockedCompareExchange64(&g_KernelDirectories[index], 0, (LONG64)Directory);
+    }
+
+    for (index = 0; index < 512; index++)
+    {
+        InterlockedCompareExchange64(&g_DirectoryForPml4[index], 0, (LONG64)Directory);
+    }
+}
+
+// 记下一份 CPL 0 的内核页表根。表满后只替换已经不能翻译内核映像的目录。
 VOID
 PhysicalMemoryRememberKernelDirectory(
     _In_ UINT64 Cr3
@@ -529,6 +623,7 @@ PhysicalMemoryRememberKernelDirectory(
 {
     UINT64 directory = Cr3 & PHYSICAL_PTE_FRAME;
     ULONG index;
+    ULONG stale = HACDBG_KERNEL_DIRECTORY_SLOTS;
 
     if (directory == 0)
     {
@@ -548,6 +643,23 @@ PhysicalMemoryRememberKernelDirectory(
             InterlockedCompareExchange64(&g_KernelDirectories[index], (LONG64)directory, 0) == 0)
         {
             return;
+        }
+
+        if (stale == HACDBG_KERNEL_DIRECTORY_SLOTS && current != 0 &&
+            PhysicalMemoryQueryKernelImage((UINT64)current) == PHYSICAL_IMAGE_ABSENT)
+        {
+            stale = index;
+        }
+    }
+
+    if (stale < HACDBG_KERNEL_DIRECTORY_SLOTS)
+    {
+        LONG64 current = g_KernelDirectories[stale];
+
+        if (current != 0 && (UINT64)current != directory &&
+            InterlockedCompareExchange64(&g_KernelDirectories[stale], (LONG64)directory, current) == current)
+        {
+            PhysicalMemoryDropKernelDirectory((UINT64)current);
         }
     }
 }
@@ -1087,44 +1199,51 @@ PhysicalMemoryMapsKernelImage(
     _In_ UINT64 Cr3
     )
 {
-    UINT64 table = Cr3 & PHYSICAL_PTE_FRAME;
-    UINT64 entry = 0;
-    GUEST_PHYSICAL_ADDRESS entryAddress;
+    return PhysicalMemoryQueryKernelImage(Cr3) == PHYSICAL_IMAGE_LIVE;
+}
 
-    if (table == 0)
+UINT64
+PhysicalMemorySelectLiveKernelDirectory(
+    _In_ UINT64 Preferred
+    )
+{
+    UINT64 preferred = Preferred & PHYSICAL_PTE_FRAME;
+    INT state;
+    ULONG index;
+
+    state = PhysicalMemoryQueryKernelImage(preferred);
+    if (state == PHYSICAL_IMAGE_LIVE || (state == PHYSICAL_IMAGE_UNREAD && preferred != 0))
     {
-        return FALSE;
+        return preferred;
     }
 
-    if (g_FiveLevelPaging != FALSE)
+    if (state == PHYSICAL_IMAGE_ABSENT)
     {
-        entryAddress = HacDbgGuestPhysicalAddress(table + (PHYSICAL_KERNEL_PML5_INDEX * sizeof(UINT64)));
+        PhysicalMemoryDropKernelDirectory(preferred);
+    }
 
-        //
-        // INVARIANT: table is the guest CR3 page. It is RAM and is read
-        // through the temporary map, not through a guest-visible host alias.
-        //
-        if (PhysicalMemoryRead(entryAddress, &entry, sizeof(entry)) != sizeof(entry) ||
-            (entry & PHYSICAL_PTE_PRESENT) == 0)
+    for (index = 0; index < HACDBG_KERNEL_DIRECTORY_SLOTS; index++)
+    {
+        UINT64 candidate = (UINT64)g_KernelDirectories[index] & PHYSICAL_PTE_FRAME;
+
+        if (candidate == 0 || candidate == preferred)
         {
-            return FALSE;
+            continue;
         }
 
-        table = entry & PHYSICAL_PTE_FRAME;
+        state = PhysicalMemoryQueryKernelImage(candidate);
+        if (state == PHYSICAL_IMAGE_LIVE)
+        {
+            return candidate;
+        }
+
+        if (state == PHYSICAL_IMAGE_ABSENT)
+        {
+            PhysicalMemoryDropKernelDirectory(candidate);
+        }
     }
 
-    entryAddress = HacDbgGuestPhysicalAddress(table + (PHYSICAL_KERNEL_IMAGE_INDEX * sizeof(UINT64)));
-
-    //
-    // INVARIANT: entryAddress is one slot in the guest page-table page
-    // selected above. A not-present slot is a KPTI user directory.
-    //
-    if (PhysicalMemoryRead(entryAddress, &entry, sizeof(entry)) != sizeof(entry))
-    {
-        return FALSE;
-    }
-
-    return (entry & PHYSICAL_PTE_PRESENT) != 0;
+    return 0;
 }
 
 // 只接受已经在位的 4 KiB 页，并记下叶子 PTE 的物理地址。
@@ -1299,21 +1418,37 @@ GuestVirtualToPhysical(
         preferred = (UINT64)g_DirectoryForPml4[pml4Index];
         if (preferred != 0 && preferred != primary)
         {
-            if (PhysicalMemoryWalk(preferred, VirtualAddress, PhysicalAddress) == PHYSICAL_WALK_MAPPED)
+            INT preferredState = PhysicalMemoryQueryKernelImage(preferred);
+
+            if (preferredState == PHYSICAL_IMAGE_ABSENT)
+            {
+                PhysicalMemoryDropKernelDirectory(preferred);
+            }
+            else if (PhysicalMemoryWalk(preferred, VirtualAddress, PhysicalAddress) == PHYSICAL_WALK_MAPPED)
             {
                 return TRUE;
             }
-
-            InterlockedCompareExchange64(&g_DirectoryForPml4[pml4Index], 0, (LONG64)preferred);
+            else
+            {
+                InterlockedCompareExchange64(&g_DirectoryForPml4[pml4Index], 0, (LONG64)preferred);
+            }
         }
     }
 
     for (index = 0; index < HACDBG_KERNEL_DIRECTORY_SLOTS; index++)
     {
         UINT64 alternate = (UINT64)g_KernelDirectories[index];
+        INT alternateState;
 
         if (alternate == 0 || alternate == primary)
         {
+            continue;
+        }
+
+        alternateState = PhysicalMemoryQueryKernelImage(alternate);
+        if (alternateState == PHYSICAL_IMAGE_ABSENT)
+        {
+            PhysicalMemoryDropKernelDirectory(alternate);
             continue;
         }
 

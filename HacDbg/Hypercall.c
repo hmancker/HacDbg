@@ -587,6 +587,14 @@ HypercallExecute(
     }
 
     case read_guest_cr3:
+    {
+        UINT64 selected = PhysicalMemorySelectLiveKernelDirectory(g_KernelCr3);
+
+        if (selected != g_KernelCr3)
+        {
+            g_KernelCr3 = selected;
+        }
+
         if (g_KernelCr3 == 0)
         {
             HACDBG_LOG("HacDbg: Err, read_guest_cr3 has no kernel directory current=0x%I64x.\n",
@@ -595,6 +603,7 @@ HypercallExecute(
 
         result = g_KernelCr3;
         break;
+    }
 
     case add_slat_code_hook:
         result = HacDbgSlatAddHook(HacDbgGuestPhysicalAddress(registers->Rdx),
