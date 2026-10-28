@@ -1116,6 +1116,20 @@ PhysicalMemoryIsKernelAddress(
 }
 
 static BOOLEAN
+PhysicalMemoryIsKernelImageAddress(
+    _In_ UINT64 VirtualAddress
+    )
+{
+    if (g_FiveLevelPaging != FALSE &&
+        ((VirtualAddress >> 48) & 0x1ffull) != PHYSICAL_KERNEL_PML5_INDEX)
+    {
+        return FALSE;
+    }
+
+    return ((VirtualAddress >> 39) & 0x1ffull) == PHYSICAL_KERNEL_IMAGE_INDEX;
+}
+
+static BOOLEAN
 PhysicalMemoryHasKernelDirectory(
     VOID
     )
@@ -1386,13 +1400,23 @@ GuestVirtualToPhysical(
         return TRUE;
     }
 
-    if (status == PHYSICAL_WALK_NOT_RESIDENT)
+    if (status == PHYSICAL_WALK_NOT_RESIDENT || status == PHYSICAL_WALK_NOT_PRESENT)
     {
+        //
+        // 页目录或叶子不在位，是客户地址没有映射。单步和调用栈会探测这种
+        // 地址。页表本身读失败才是驱动故障。
+        //
         if (NotResident != NULL)
         {
             *NotResident = TRUE;
         }
 
+        return FALSE;
+    }
+
+    if (status == PHYSICAL_WALK_READ_FAILED)
+    {
+        PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
         return FALSE;
     }
 
@@ -1406,7 +1430,15 @@ GuestVirtualToPhysical(
         PhysicalMemoryIsKernelAddress(VirtualAddress.Value) == FALSE ||
         PhysicalMemoryHasKernelDirectory() == FALSE)
     {
-        PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
+        if (PhysicalMemoryIsKernelImageAddress(VirtualAddress.Value) != FALSE)
+        {
+            PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
+        }
+        else if (NotResident != NULL)
+        {
+            *NotResident = TRUE;
+        }
+
         return FALSE;
     }
 
@@ -1464,7 +1496,15 @@ GuestVirtualToPhysical(
         }
     }
 
-    PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
+    if (PhysicalMemoryIsKernelImageAddress(VirtualAddress.Value) != FALSE)
+    {
+        PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
+    }
+    else if (NotResident != NULL)
+    {
+        *NotResident = TRUE;
+    }
+
     return FALSE;
 }
 

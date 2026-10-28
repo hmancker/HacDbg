@@ -179,8 +179,10 @@ _Success_(return != FALSE)
  * @param Cr3 Guest page table root.
  * @param VirtualAddress Guest virtual address.
  * @param PhysicalAddress Receives the translated guest physical address.
- * @param NotResident Receives TRUE when the leaf was read and has no PFN.
- * A page that was never faulted in is not a driver fault.
+ * @param NotResident Receives TRUE when the address is not mapped, or the
+ * leaf was read and has no PFN. A debugger probe of that address is not a
+ * driver fault. Stays FALSE when a page-table read fails, or the kernel
+ * image region cannot be translated.
  *
  * @return TRUE when a mapping exists; otherwise FALSE.
  */
