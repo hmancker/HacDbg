@@ -3,6 +3,7 @@
 #include "Format.h"
 
 #include <QHeaderView>
+#include <QStandardItem>
 #include <QStandardItemModel>
 
 StackView::StackView(QWidget* parent)
@@ -34,11 +35,16 @@ void StackView::setFrames(const HACDBG_CORE_STACK_FRAME* frames, std::uint32_t c
 {
     m_model->removeRows(0, m_model->rowCount());
     m_addresses.clear();
+    m_topRip = 0;
+    m_topSymbol.clear();
 
-    if (frames == nullptr)
+    if (frames == nullptr || count == 0)
     {
         return;
     }
+
+    m_topRip = frames[0].InstructionPointer;
+    m_topSymbol = fromField(frames[0].Symbol, HACDBG_CORE_SYMBOL_SIZE);
 
     for (std::uint32_t index = 0; index < count; ++index)
     {
@@ -53,4 +59,74 @@ void StackView::setFrames(const HACDBG_CORE_STACK_FRAME* frames, std::uint32_t c
             new QStandardItem(symbol),
         });
     }
+}
+
+bool StackView::hasFrames() const
+{
+    return m_model->rowCount() > 0;
+}
+
+void StackView::setTopSymbol(const QString& symbol)
+{
+    QStandardItem* item = m_model->item(0, 3);
+
+    if (item == nullptr || item->text() == symbol)
+    {
+        return;
+    }
+
+    item->setText(symbol);
+}
+
+QString StackView::adjustedTopSymbol(std::uint64_t rip) const
+{
+    if (m_topSymbol.isEmpty() || rip == 0 || rip == m_topRip || m_topSymbol.contains(QLatin1Char('!')) == false)
+    {
+        return m_topSymbol;
+    }
+
+    QString name = m_topSymbol;
+    std::uint64_t displacement = 0;
+    const int plus = m_topSymbol.lastIndexOf(QStringLiteral("+0x"));
+    const int bang = m_topSymbol.indexOf(QLatin1Char('!'));
+
+    if (plus > bang)
+    {
+        bool ok = false;
+        displacement = m_topSymbol.mid(plus + 3).toULongLong(&ok, 16);
+
+        if (ok == false || m_topRip < displacement)
+        {
+            return m_topSymbol;
+        }
+
+        name = m_topSymbol.left(plus);
+    }
+
+    const std::uint64_t base = m_topRip - displacement;
+
+    if (rip < base)
+    {
+        return m_topSymbol;
+    }
+
+    const std::uint64_t updated = rip - base;
+
+    //
+    // A jump that stays at the same RSP can land in another function. Keep
+    // the previous text instead of showing a huge displacement.
+    //
+    constexpr std::uint64_t kMaxAdjustedDisplacement = 0x1000000;
+
+    if (updated > kMaxAdjustedDisplacement)
+    {
+        return m_topSymbol;
+    }
+
+    if (updated == 0)
+    {
+        return name;
+    }
+
+    return name + QStringLiteral("+0x") + QString::number(updated, 16);
 }

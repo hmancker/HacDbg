@@ -15,6 +15,15 @@ namespace commands
 	void clear_cancel();
 	std::uint8_t interrupt_requested();
 
+	//
+	// The core worker installs this while a structured view runs. A nonzero
+	// return means a command is already queued. The view stops and is put
+	// back so that command runs before the view is tried again.
+	//
+	void set_view_preempt(std::uint8_t (*preempt)());
+	void clear_view_preempted();
+	std::uint8_t view_was_preempted();
+
 	struct symbol_load_progress_t
 	{
 		std::uint32_t active = 0;

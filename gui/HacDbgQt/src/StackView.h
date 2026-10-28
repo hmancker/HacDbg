@@ -17,6 +17,9 @@ public:
     explicit StackView(QWidget* parent = nullptr);
 
     void setFrames(const HACDBG_CORE_STACK_FRAME* frames, std::uint32_t count);
+    bool hasFrames() const;
+    void setTopSymbol(const QString& symbol);
+    QString adjustedTopSymbol(std::uint64_t rip) const;
 
 signals:
     void addressActivated(std::uint64_t address);
@@ -24,4 +27,6 @@ signals:
 private:
     QStandardItemModel* m_model = nullptr;
     std::vector<std::uint64_t> m_addresses;
+    std::uint64_t m_topRip = 0;
+    QString m_topSymbol;
 };

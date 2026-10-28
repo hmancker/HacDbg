@@ -196,8 +196,53 @@ namespace
 		copy_text(status.Message, error);
 	}
 
+	HACDBG_CORE* g_preempt_core = nullptr;
+
+	std::uint8_t view_command_pending()
+	{
+		if (g_preempt_core == nullptr)
+		{
+			return 0;
+		}
+
+		std::lock_guard<std::mutex> lock(g_preempt_core->command_mutex);
+
+		return g_preempt_core->commands.empty() == true ? 0 : 1;
+	}
+
+	void requeue_preempted_view(HACDBG_CORE* const core, const core_view_request_t& request)
+	{
+		std::lock_guard<std::mutex> lock(core->view_mutex);
+		core_view_request_t& slot = core->view_requests[request.view];
+
+		if (slot.pending != 0 && slot.id != request.id)
+		{
+			return;
+		}
+
+		slot = request;
+		slot.pending = 1;
+
+		HACDBG_CORE_VIEW_STATUS& status = core->view_status[request.view];
+		status.RequestId = request.id;
+		status.Pending = 1;
+		status.Failed = 0;
+		status.Message[0] = '\0';
+	}
+
 	void publish_view_error(HACDBG_CORE* const core, const core_view_request_t& request, const std::string& error)
 	{
+		//
+		// A step was queued while this view was still reading the guest.
+		// Keep the same request id pending so the step runs first.
+		//
+		if (commands::view_was_preempted() != 0)
+		{
+			requeue_preempted_view(core, request);
+
+			return;
+		}
+
 		std::lock_guard<std::mutex> lock(core->view_mutex);
 		complete_view_locked(core, request, 0, 0, error);
 	}
@@ -806,6 +851,8 @@ namespace
 
 	void worker_loop(HACDBG_CORE* const core)
 	{
+		commands::set_view_preempt(view_command_pending);
+
 		while (true)
 		{
 			std::string command;
@@ -944,19 +991,48 @@ namespace
 
 			if (take_view_request(core, view_request) == true)
 			{
+				commands::clear_view_preempted();
+				g_preempt_core = core;
+
 				try
 				{
 					execute_view_request(core, view_request);
 				}
 				catch (const std::exception& error)
 				{
-					publish_view_error(core, view_request, error.what());
+					g_preempt_core = nullptr;
+
+					if (commands::view_was_preempted() == 0)
+					{
+						publish_view_error(core, view_request, error.what());
+					}
+					else
+					{
+						requeue_preempted_view(core, view_request);
+					}
+
+					commands::clear_view_preempted();
+					continue;
 				}
 				catch (...)
 				{
-					publish_view_error(core, view_request, "view request failed");
+					g_preempt_core = nullptr;
+
+					if (commands::view_was_preempted() == 0)
+					{
+						publish_view_error(core, view_request, "view request failed");
+					}
+					else
+					{
+						requeue_preempted_view(core, view_request);
+					}
+
+					commands::clear_view_preempted();
+					continue;
 				}
 
+				g_preempt_core = nullptr;
+				commands::clear_view_preempted();
 				continue;
 			}
 		}

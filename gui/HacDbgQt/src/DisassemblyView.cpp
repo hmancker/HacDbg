@@ -147,9 +147,59 @@ void DisassemblyView::setRows(std::vector<Row> rows, std::uint64_t rip, const st
 
 void DisassemblyView::setRip(std::uint64_t rip, const std::vector<std::uint64_t>& breakpoints)
 {
+    const bool sameRip = m_rip == rip;
+    const bool sameBreakpoints = m_breakpoints == breakpoints;
+
+    if (sameRip && sameBreakpoints)
+    {
+        return;
+    }
+
     m_rip = rip;
     m_breakpoints = breakpoints;
+
+    if (sameRip == false && rip != 0)
+    {
+        for (int index = 0; index < static_cast<int>(m_rows.size()); ++index)
+        {
+            if (m_rows[static_cast<std::size_t>(index)].address != rip)
+            {
+                continue;
+            }
+
+            const bool selectionMoved = m_selected != index;
+            m_selected = index;
+            scrollToRow(index);
+            viewport()->update();
+
+            if (selectionMoved)
+            {
+                emit selectionChanged();
+            }
+
+            return;
+        }
+    }
+
     viewport()->update();
+}
+
+bool DisassemblyView::containsAddress(std::uint64_t address) const
+{
+    if (address == 0)
+    {
+        return false;
+    }
+
+    for (const Row& row : m_rows)
+    {
+        if (row.address == address)
+        {
+            return true;
+        }
+    }
+
+    return false;
 }
 
 const DisassemblyView::Row* DisassemblyView::selectedRow() const

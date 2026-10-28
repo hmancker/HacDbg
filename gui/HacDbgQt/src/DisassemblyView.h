@@ -25,6 +25,7 @@ public:
 
     void setRows(std::vector<Row> rows, std::uint64_t rip, const std::vector<std::uint64_t>& breakpoints);
     void setRip(std::uint64_t rip, const std::vector<std::uint64_t>& breakpoints);
+    bool containsAddress(std::uint64_t address) const;
     const Row* selectedRow() const;
     std::uint64_t firstAddress() const;
     std::uint64_t lastEnd() const;

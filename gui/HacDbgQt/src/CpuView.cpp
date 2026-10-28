@@ -13,12 +13,14 @@
 #include <QPushButton>
 #include <QShortcut>
 #include <QSplitter>
+#include <QTimer>
 #include <QVBoxLayout>
 
 namespace
 {
 constexpr int kMemoryRowBytes = 16;
 constexpr int kMemoryCacheLimit = 32;
+constexpr int kFollowDelayMs = 80;
 constexpr std::uint32_t kInstructionCount = 64;
 
 std::uint64_t alignRow(std::uint64_t address)
@@ -119,6 +121,11 @@ CpuView::CpuView(QWidget* parent)
     memoryEsc->setContext(Qt::WidgetWithChildrenShortcut);
     connect(memoryEsc, &QShortcut::activated, m_memoryGoto, &QWidget::hide);
 
+    m_followTimer = new QTimer(this);
+    m_followTimer->setSingleShot(true);
+    m_followTimer->setInterval(kFollowDelayMs);
+    connect(m_followTimer, &QTimer::timeout, this, &CpuView::flushFollow);
+
     connect(m_disassembly, &DisassemblyView::selectionChanged, this, &CpuView::noteSelection);
     connect(m_stack, &StackView::addressActivated, this, [this](std::uint64_t address)
     {
@@ -183,30 +190,77 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
         m_paused = false;
         m_pausedCr3 = 0;
         m_lastRip = 0;
+        m_lastRsp = 0;
+        m_stackRsp = 0;
+        m_stackCr3 = 0;
+        m_disassemblyStale = false;
+        m_stackStale = false;
+        m_followTimer->stop();
         m_disassembly->setRip(0, breakpoints);
         return;
     }
 
     const bool entered = m_paused == false;
     const std::uint64_t rip = state.Registers.Rip;
-    const bool changed = entered || m_lastRip != rip;
+    const std::uint64_t rsp = state.Registers.Rsp;
+    const std::uint64_t cr3 = state.Registers.Cr3;
+    const bool ripChanged = entered || m_lastRip != rip;
+    const bool rspChanged = entered || m_lastRsp != rsp;
+    const bool cr3Changed = entered || m_pausedCr3 != cr3;
     m_paused = true;
-    m_pausedCr3 = state.Registers.Cr3;
+    m_pausedCr3 = cr3;
     m_lastRip = rip;
+    m_lastRsp = rsp;
     m_disassembly->setRip(rip, breakpoints);
 
-    if (changed == false || m_session == nullptr || m_session->isStarted() == false)
+    if ((ripChanged == false && rspChanged == false && cr3Changed == false) || m_session == nullptr || m_session->isStarted() == false)
     {
         return;
     }
 
-    m_stackRequest = m_session->requestStack(32);
-    m_stackStatus->setText(m_stackRequest == 0 ? QStringLiteral("无法排队") : QStringLiteral("读取中..."));
+    if (rip == 0)
+    {
+        m_disassemblyStale = false;
+        m_stackStale = false;
+        m_followTimer->stop();
+        return;
+    }
 
-    if (rip != 0)
+    const bool ripVisible = m_disassemblyCr3 == cr3 && m_disassembly->containsAddress(rip);
+
+    if (ripVisible == false)
     {
         hideGoto();
-        requestDisassembly(rip, m_pausedCr3);
+        m_disassemblyStale = true;
+    }
+    else
+    {
+        m_disassemblyStale = false;
+    }
+
+    const bool stackFresh = m_stack->hasFrames() && m_stackRsp == rsp && m_stackCr3 == cr3;
+
+    if (stackFresh)
+    {
+        m_stackStale = false;
+        m_stack->setTopSymbol(m_stack->adjustedTopSymbol(rip));
+    }
+    else if (m_stackRequest != 0)
+    {
+        m_stackStale = false;
+    }
+    else
+    {
+        m_stackStale = true;
+    }
+
+    if (m_disassemblyStale || m_stackStale)
+    {
+        scheduleFollow();
+    }
+    else
+    {
+        m_followTimer->stop();
     }
 }
 
@@ -303,6 +357,16 @@ void CpuView::poll()
                 m_disassembly->setRows(std::move(rows), m_lastRip, m_breakpoints);
                 m_suppressSelection = false;
                 noteSelection();
+
+                if (m_followRip && m_paused && m_lastRip != 0 && m_disassembly->containsAddress(m_lastRip) == false)
+                {
+                    m_disassemblyStale = true;
+                    scheduleFollow();
+                }
+                else
+                {
+                    m_disassemblyStale = false;
+                }
             }
         }
     }
@@ -347,6 +411,11 @@ void CpuView::poll()
 
     if (takeCompleted(HacDbgViewStack, &m_stackRequest, &status))
     {
+        if (m_paused == false)
+        {
+            return;
+        }
+
         if (status.Failed != 0)
         {
             m_stack->setFrames(nullptr, 0);
@@ -361,9 +430,18 @@ void CpuView::poll()
             {
                 m_stackStatus->setText(QStringLiteral("复制调用栈失败"));
             }
+            else if (count > 0 && frames[0].InstructionPointer != m_lastRip)
+            {
+                m_stackStale = true;
+                m_stackStatus->setText(QStringLiteral("读取中..."));
+                scheduleFollow();
+            }
             else
             {
                 m_stack->setFrames(frames, count);
+                m_stackRsp = m_lastRsp;
+                m_stackCr3 = m_pausedCr3;
+                m_stackStale = false;
                 m_stackStatus->setText(status.Truncated != 0 ? QStringLiteral("%1 帧，已截断").arg(count) : QStringLiteral("%1 帧").arg(count));
             }
         }
@@ -474,15 +552,91 @@ void CpuView::submitGoto(bool memory)
     setStatus(m_resolveRequest == 0 ? QStringLiteral("无法排队") : QStringLiteral("解析中..."));
 }
 
-void CpuView::requestDisassembly(std::uint64_t address, std::uint64_t cr3)
+void CpuView::scheduleFollow()
+{
+    //
+    // Disassembly and the stack walk share the worker with the step command.
+    // Queue them only after a burst of steps pauses, so F10/F11 is not stuck
+    // behind symbol lookup and the user-module walk.
+    //
+    m_followTimer->start();
+}
+
+void CpuView::flushFollow()
+{
+    if (m_paused == false || m_session == nullptr || m_session->isStarted() == false)
+    {
+        m_disassemblyStale = false;
+        m_stackStale = false;
+        return;
+    }
+
+    if (m_disassemblyStale)
+    {
+        if (m_lastRip != 0 && m_disassemblyCr3 == m_pausedCr3 && m_disassembly->containsAddress(m_lastRip))
+        {
+            m_disassemblyStale = false;
+        }
+        else if (m_lastRip == 0)
+        {
+            m_disassemblyStale = false;
+        }
+        else if (m_disassemblyRequest != 0 && m_followRip)
+        {
+            m_disassemblyStale = true;
+        }
+        else
+        {
+            hideGoto();
+            requestDisassembly(m_lastRip, m_pausedCr3, true);
+        }
+    }
+
+    if (m_stackStale == false || m_stackRequest != 0)
+    {
+        return;
+    }
+
+    if (m_stack->hasFrames() && m_stackRsp == m_lastRsp && m_stackCr3 == m_pausedCr3)
+    {
+        m_stackStale = false;
+        m_stack->setTopSymbol(m_stack->adjustedTopSymbol(m_lastRip));
+        return;
+    }
+
+    m_stackStale = false;
+    m_stackRequest = m_session->requestStack(32);
+    m_stackStatus->setText(m_stackRequest == 0 ? QStringLiteral("无法排队") : QStringLiteral("读取中..."));
+}
+
+void CpuView::requestDisassembly(std::uint64_t address, std::uint64_t cr3, bool follow)
 {
     if (m_session == nullptr || m_session->isStarted() == false || address == 0)
     {
         return;
     }
 
+    if (follow && m_followRip && m_disassemblyRequest != 0)
+    {
+        m_disassemblyStale = true;
+        return;
+    }
+
+    m_followRip = follow;
+
+    if (follow == false)
+    {
+        m_disassemblyStale = false;
+    }
+
     m_disassemblyCr3 = cr3;
     m_disassemblyRequest = m_session->requestDisassembly(address, cr3, kInstructionCount);
+
+    if (follow && m_disassemblyRequest != 0)
+    {
+        m_disassemblyStale = false;
+    }
+
     setDisassemblyStatus(m_disassemblyRequest == 0 ? QStringLiteral("无法排队") : QStringLiteral("读取中..."));
 }
 

@@ -12,6 +12,7 @@ class HexDumpView;
 class QLabel;
 class QLineEdit;
 class QPushButton;
+class QTimer;
 class RegisterView;
 class StackView;
 
@@ -38,8 +39,10 @@ private:
     void showGoto();
     void hideGoto();
     void submitGoto(bool memory);
-    void requestDisassembly(std::uint64_t address, std::uint64_t cr3);
+    void requestDisassembly(std::uint64_t address, std::uint64_t cr3, bool follow = false);
     void requestMemory(std::uint64_t address, std::uint64_t cr3, int highlightBytes);
+    void scheduleFollow();
+    void flushFollow();
     void showMemory(const MemoryPage& page);
     void noteSelection();
     bool takeCompleted(std::uint32_t view, std::uint64_t* requestId, HACDBG_CORE_VIEW_STATUS* status);
@@ -62,6 +65,7 @@ private:
     QLabel* m_memoryStatus = nullptr;
     QLabel* m_stackStatus = nullptr;
 
+    QTimer* m_followTimer = nullptr;
     std::uint64_t m_disassemblyRequest = 0;
     std::uint64_t m_memoryRequest = 0;
     std::uint64_t m_stackRequest = 0;
@@ -70,6 +74,12 @@ private:
     std::uint64_t m_disassemblyCr3 = 0;
     std::uint64_t m_pausedCr3 = 0;
     std::uint64_t m_lastRip = 0;
+    std::uint64_t m_lastRsp = 0;
+    std::uint64_t m_stackRsp = 0;
+    std::uint64_t m_stackCr3 = 0;
+    bool m_followRip = false;
+    bool m_disassemblyStale = false;
+    bool m_stackStale = false;
     std::uint64_t m_memoryCursor = 0;
     std::uint64_t m_memoryCr3 = 0;
     int m_memoryCursorBytes = 1;

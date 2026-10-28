@@ -38,6 +38,8 @@
 
 #include "../script/script.h"
 
+static std::uint8_t preempt_view();
+
 constexpr std::uint64_t command_memory_size_limit = 0x1000000;
 
 #define INVOKE_COMMAND_PROCESSOR(command) process_##command(command)
@@ -1410,6 +1412,14 @@ static std::uint8_t build_disassembly(const unassemble_request_t& request, const
 
 	while (offset < bytes_read)
 	{
+		if (preempt_view() != 0)
+		{
+			instructions_out.clear();
+			error_out.clear();
+
+			return 0;
+		}
+
 		const std::uint64_t instruction_address = request.start_address + offset;
 
 		if (request.is_range == 1)
@@ -4200,6 +4210,13 @@ static std::uint8_t collect_user_modules(const std::uint64_t cr3, std::vector<re
 
 	for (std::uint64_t count = 0; count < 1024 && entry != head && entry != 0; count++)
 	{
+		if (preempt_view() != 0)
+		{
+			modules_out.clear();
+
+			return 0;
+		}
+
 		std::uint64_t base = 0;
 		std::uint32_t image_size = 0;
 		std::uint16_t name_length = 0;
@@ -8522,10 +8539,21 @@ static void collect_stack_modules(const std::uint64_t cr3, std::vector<stack_mod
 {
 	modules_out.clear();
 	extra_cr3_out = 0;
+
+	if (preempt_view() != 0)
+	{
+		return;
+	}
+
 	std::vector<reload_module_t> user_modules = {};
 
 	if (collect_user_modules(cr3, user_modules) == 0)
 	{
+		if (preempt_view() != 0)
+		{
+			return;
+		}
+
 		const std::uint64_t eprocess = eprocess_for_cr3(cr3);
 		const std::uint64_t user_cr3 = cr3_for_user_modules(eprocess);
 
@@ -8534,6 +8562,11 @@ static void collect_stack_modules(const std::uint64_t cr3, std::vector<stack_mod
 			extra_cr3_out = user_cr3;
 			collect_user_modules(user_cr3, user_modules);
 		}
+	}
+
+	if (preempt_view() != 0)
+	{
+		return;
 	}
 
 	for (const reload_module_t& module : user_modules)
@@ -8604,6 +8637,12 @@ static std::uint8_t build_stack_frames(const breakpoint::registers_t& registers,
 
 	frames_out.clear();
 	collect_stack_modules(registers.cr3, modules, extra_cr3);
+
+	if (preempt_view() != 0)
+	{
+		return 0;
+	}
+
 	load_stack_regs(registers, regs);
 
 	if (regs.rsp == 0 || canonical_code_address(regs.rip) == 0)
@@ -8613,6 +8652,13 @@ static std::uint8_t build_stack_frames(const breakpoint::registers_t& registers,
 
 	for (std::uint64_t index = 0; index < frame_count; index++)
 	{
+		if (preempt_view() != 0)
+		{
+			frames_out.clear();
+
+			return 0;
+		}
+
 		stack_frame_t frame = {};
 		frame.rip = regs.rip;
 		std::uint64_t child_sp = 0;
@@ -9826,6 +9872,11 @@ std::uint8_t commands::views::modules(std::vector<module_t>& modules_out, std::s
 		collect_user_modules(user_cr3, user_modules);
 	}
 
+	if (preempt_view() != 0)
+	{
+		return 0;
+	}
+
 	const std::vector<symbol_parser::module_status_t> loaded = symbol_parser::loaded_modules();
 	const auto add_modules = [&](const std::vector<reload_module_t>& modules, const std::uint8_t kernel)
 	{
@@ -9994,6 +10045,11 @@ std::uint8_t commands::views::stack(const std::uint32_t frame_count, std::vector
 
 	if (build_stack_frames(registers, frame_count == 0 ? 20 : frame_count, frames) == 0)
 	{
+		if (preempt_view() != 0)
+		{
+			return 0;
+		}
+
 		error_out = "failed to read the stack";
 
 		return 0;
@@ -10001,6 +10057,13 @@ std::uint8_t commands::views::stack(const std::uint32_t frame_count, std::vector
 
 	for (const ::stack_frame_t& frame : frames)
 	{
+		if (preempt_view() != 0)
+		{
+			frames_out.clear();
+
+			return 0;
+		}
+
 		commands::views::stack_frame_t entry = {};
 
 		entry.symbol = stack_call_site(frame.rip);
@@ -10495,6 +10558,30 @@ static void announce_breakpoint_hit()
 }
 
 static std::atomic<std::uint8_t> console_cancel = 0;
+static std::uint8_t (*g_view_preempt)() = nullptr;
+static std::uint8_t g_view_preempted = 0;
+
+static std::uint8_t preempt_view()
+{
+	if (g_view_preempt == nullptr)
+	{
+		return 0;
+	}
+
+	if (g_view_preempted != 0)
+	{
+		return 1;
+	}
+
+	if (g_view_preempt() != 0)
+	{
+		g_view_preempted = 1;
+
+		return 1;
+	}
+
+	return 0;
+}
 static std::atomic<std::uint8_t> f11_step = 0;
 static HHOOK keyboard_hook = nullptr;
 static std::vector<std::string> console_history = {};
@@ -10578,6 +10665,21 @@ void commands::clear_cancel()
 std::uint8_t commands::interrupt_requested()
 {
 	return console_cancel.load();
+}
+
+void commands::set_view_preempt(std::uint8_t (*preempt)())
+{
+	g_view_preempt = preempt;
+}
+
+void commands::clear_view_preempted()
+{
+	g_view_preempted = 0;
+}
+
+std::uint8_t commands::view_was_preempted()
+{
+	return g_view_preempted;
 }
 
 static BOOL WINAPI console_ctrl_handler(const DWORD type)
