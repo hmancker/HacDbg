@@ -991,8 +991,9 @@ PhysicalMemoryMapResidentFrame(
 }
 
 //
-// Windows 软件 PTE。bit 10 置位时，bit 11 是 Combined 或 ColdPage，
-// bits 63:16 是原型 PTE 的虚拟地址，符号扩展后按同一份 CR3 再读。
+// Windows 软件 PTE。硬件页表项 bit 10 置位时，bit 11 是 Combined 或
+// ColdPage，bits 63:16 是原型 PTE 的虚拟地址，符号扩展后按同一份 CR3 再读。
+// 读到的原型项如果仍然 bit 10 置位，它指向 SUBSECTION，页还在映像文件里。
 // bit 10 为 0 且 bit 11 置位时，页仍在内存里，页帧在 bits 51:12。
 // 页文件上的页没有 PFN。
 //
@@ -1018,11 +1019,11 @@ PhysicalMemoryResolveSoftwarePte(
     }
 
     //
-    // 0xA0 这类项没有 PFN。页还在映像文件里，没有调入内存。
+    // 0xA0 和原型项里的 SUBSECTION 都没有 PFN。页还在映像文件里。
     //
-    if ((Entry & PHYSICAL_PTE_PROTOTYPE) == 0 || Depth >= 3)
+    if ((Entry & PHYSICAL_PTE_PROTOTYPE) == 0 || Depth > 0)
     {
-        return (Entry & PHYSICAL_PTE_PROTOTYPE) == 0 ? SOFTWARE_PTE_NOT_RESIDENT : SOFTWARE_PTE_FAILED;
+        return SOFTWARE_PTE_NOT_RESIDENT;
     }
 
     {
@@ -1030,10 +1031,16 @@ PhysicalMemoryResolveSoftwarePte(
             PhysicalMemoryCanonicalAddress(Entry >> 16));
         GUEST_PHYSICAL_ADDRESS prototypePhysical;
         UINT64 prototypeEntry = 0;
+        PHYSICAL_WALK_STATUS protoStatus = PhysicalMemoryWalk(Cr3, prototype, &prototypePhysical);
 
-        if (PhysicalMemoryWalk(Cr3, prototype, &prototypePhysical) != PHYSICAL_WALK_MAPPED)
+        if (protoStatus == PHYSICAL_WALK_READ_FAILED)
         {
             return SOFTWARE_PTE_FAILED;
+        }
+
+        if (protoStatus != PHYSICAL_WALK_MAPPED)
+        {
+            return SOFTWARE_PTE_NOT_RESIDENT;
         }
 
         if (PhysicalMemoryRead(prototypePhysical, &prototypeEntry, sizeof(prototypeEntry)) !=
@@ -1475,20 +1482,6 @@ GuestVirtualToPhysical(
         return TRUE;
     }
 
-    if (status == PHYSICAL_WALK_NOT_RESIDENT || status == PHYSICAL_WALK_NOT_PRESENT)
-    {
-        //
-        // 页目录或叶子不在位，是客户地址没有映射。单步和调用栈会探测这种
-        // 地址。页表本身读失败才是驱动故障。
-        //
-        if (NotResident != NULL)
-        {
-            *NotResident = TRUE;
-        }
-
-        return FALSE;
-    }
-
     if (status == PHYSICAL_WALK_READ_FAILED)
     {
         PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
@@ -1496,25 +1489,42 @@ GuestVirtualToPhysical(
     }
 
     //
-    // 系统进程的内核目录没有会话空间。win32k 的 PML4E 在那里是 0。
-    // KPTI 用户目录的内核映像槽也是 0。这两种缺失都是 1 GiB 以上的区域，
-    // 改用已经记下的内核目录。用户地址和已经不在内存里的页不改目录，
-    // 避免读到另一个进程的页。
+    // 系统进程目录没有会话空间时，win32k 的 PML4E 是 0，这是 1 GiB 以上的
+    // 缺失。KPTI 用户目录更常见的是内核映像槽已经挂着一份不完整的页表：
+    // PML4 或 PDPT 在位，ntoskrnl 头所在的页不在位。那种状态不是缺失区域，
+    // 但这一页仍然不在这份目录里。两种情况都改用记下的内核目录。用户地址
+    // 和其它内核缺页不改目录，避免读到另一个进程的页。
     //
-    if (status != PHYSICAL_WALK_MISSING_REGION ||
-        PhysicalMemoryIsKernelAddress(VirtualAddress.Value) == FALSE ||
-        PhysicalMemoryHasKernelDirectory() == FALSE)
     {
-        if (PhysicalMemoryIsKernelImageAddress(VirtualAddress.Value) != FALSE)
+        BOOLEAN tryAlternate = FALSE;
+
+        if (status == PHYSICAL_WALK_MISSING_REGION &&
+            PhysicalMemoryIsKernelAddress(VirtualAddress.Value) != FALSE &&
+            PhysicalMemoryHasKernelDirectory() != FALSE)
         {
-            PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
+            tryAlternate = TRUE;
         }
-        else if (NotResident != NULL)
+        else if ((status == PHYSICAL_WALK_NOT_PRESENT || status == PHYSICAL_WALK_NOT_RESIDENT) &&
+                 PhysicalMemoryIsKernelImageAddress(VirtualAddress.Value) != FALSE &&
+                 PhysicalMemoryHasKernelDirectory() != FALSE)
         {
-            *NotResident = TRUE;
+            tryAlternate = TRUE;
         }
 
-        return FALSE;
+        if (tryAlternate == FALSE)
+        {
+            if (status == PHYSICAL_WALK_MISSING_REGION &&
+                PhysicalMemoryIsKernelImageAddress(VirtualAddress.Value) != FALSE)
+            {
+                PhysicalMemoryLogWalkFailure(Cr3, VirtualAddress);
+            }
+            else if (NotResident != NULL)
+            {
+                *NotResident = TRUE;
+            }
+
+            return FALSE;
+        }
     }
 
     if (g_FiveLevelPaging == FALSE)
@@ -1569,6 +1579,20 @@ GuestVirtualToPhysical(
 
             return TRUE;
         }
+    }
+
+    //
+    // 叶子是没有页帧的软件 PTE。别的内核目录也没有把它调入内存。
+    // 这一页在映像文件或页文件里，三环从磁盘补，不记成页表走失败。
+    //
+    if (status == PHYSICAL_WALK_NOT_RESIDENT)
+    {
+        if (NotResident != NULL)
+        {
+            *NotResident = TRUE;
+        }
+
+        return FALSE;
     }
 
     if (PhysicalMemoryIsKernelImageAddress(VirtualAddress.Value) != FALSE)

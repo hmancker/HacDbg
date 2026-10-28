@@ -197,8 +197,9 @@ _Success_(return != FALSE)
  * @param PhysicalAddress Receives the translated guest physical address.
  * @param NotResident Receives TRUE when the address is not mapped, or the
  * leaf was read and has no PFN. A debugger probe of that address is not a
- * driver fault. Stays FALSE when a page-table read fails, or the kernel
- * image region cannot be translated.
+ * driver fault. Stays FALSE when a page-table read fails. A kernel image
+ * address whose leaf is missing in this directory is tried in the other
+ * recorded kernel directories before this is set.
  *
  * @return TRUE when a mapping exists; otherwise FALSE.
  */
