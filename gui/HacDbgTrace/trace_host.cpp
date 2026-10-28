@@ -114,7 +114,7 @@ namespace
 				return 0;
 
 			case VK_ESCAPE:
-				// Let ImGui close popups or edit text before returning focus to WPF.
+				// Let ImGui close popups or edit text before returning focus to the GUI.
 				if (ImGui::GetCurrentContext() != nullptr &&
 				    ImGui::GetIO().WantTextInput == false &&
 				    ImGui::IsPopupOpen(nullptr,
@@ -447,7 +447,7 @@ bool trace_host_start(HACDBG_TRACE* const trace)
 {
 	try
 	{
-		// The render thread creates a child of the WPF-owned host window. Do
+		// The render thread creates a child of the GUI-owned host window. Do
 		// not wait here: the UI thread must remain free to answer the window
 		// manager messages raised while that child is created.
 		trace->render_thread = std::thread(render_thread_main, trace);

@@ -1,6 +1,6 @@
 /**
  * @file core_api.cpp
- * @brief C ABI session wrapper for the WPF GUI.
+ * @brief C ABI session wrapper for the GUI.
  *
  * @author HacDbg
  */

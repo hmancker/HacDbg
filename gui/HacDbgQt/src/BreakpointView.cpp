@@ -1,0 +1,88 @@
+#include "BreakpointView.h"
+
+#include "Format.h"
+
+#include <QHeaderView>
+#include <QStandardItemModel>
+#include <QTableView>
+#include <QVBoxLayout>
+
+namespace
+{
+void prepareTable(QTableView* table)
+{
+    QFont font(QStringLiteral("Cascadia Mono"));
+    font.setStyleHint(QFont::Monospace);
+    font.setPointSize(10);
+    table->setFont(font);
+    table->setShowGrid(false);
+    table->setAlternatingRowColors(true);
+    table->setSelectionBehavior(QAbstractItemView::SelectRows);
+    table->setSelectionMode(QAbstractItemView::SingleSelection);
+    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    table->verticalHeader()->hide();
+    table->horizontalHeader()->setStretchLastSection(true);
+    table->setWordWrap(false);
+}
+}
+
+BreakpointView::BreakpointView(QWidget* parent)
+    : QWidget(parent)
+{
+    auto* layout = new QVBoxLayout(this);
+    layout->setContentsMargins(0, 0, 0, 0);
+    m_table = new QTableView(this);
+    prepareTable(m_table);
+    m_model = new QStandardItemModel(this);
+    m_model->setHorizontalHeaderLabels(
+        {QStringLiteral("ID"), QStringLiteral("地址"), QStringLiteral("CR3"), QStringLiteral("状态"), QStringLiteral("暂停")});
+    m_table->setModel(m_model);
+    layout->addWidget(m_table);
+    connect(m_table, &QTableView::doubleClicked, this, [this](const QModelIndex& index)
+    {
+        if (index.row() < 0 || index.row() >= static_cast<int>(m_rows.size()))
+        {
+            return;
+        }
+
+        const HACDBG_CORE_BREAKPOINT& row = m_rows[static_cast<std::size_t>(index.row())];
+        emit addressActivated(row.Address, row.Cr3);
+    });
+}
+
+void BreakpointView::setBreakpoints(const HACDBG_CORE_BREAKPOINT* breakpoints, std::uint32_t count)
+{
+    if (count > HACDBG_CORE_MAX_BREAKPOINTS)
+    {
+        count = HACDBG_CORE_MAX_BREAKPOINTS;
+    }
+
+    bool same = count == m_rows.size();
+
+    for (std::uint32_t index = 0; same && index < count; ++index)
+    {
+        const HACDBG_CORE_BREAKPOINT& next = breakpoints[index];
+        const HACDBG_CORE_BREAKPOINT& previous = m_rows[index];
+        same = next.Id == previous.Id && next.Address == previous.Address && next.Cr3 == previous.Cr3 &&
+               next.Enabled == previous.Enabled && next.PausesThread == previous.PausesThread;
+    }
+
+    if (same)
+    {
+        return;
+    }
+
+    m_rows.assign(breakpoints, breakpoints + count);
+    m_model->removeRows(0, m_model->rowCount());
+
+    for (const HACDBG_CORE_BREAKPOINT& row : m_rows)
+    {
+        m_model->appendRow({
+            new QStandardItem(QString::number(row.Id)),
+            new QStandardItem(hex16(row.Address)),
+            new QStandardItem(row.Cr3 == 0 ? QStringLiteral("—") : hex16(row.Cr3)),
+            new QStandardItem(row.Enabled != 0 ? QStringLiteral("启用") : QStringLiteral("禁用")),
+            new QStandardItem(row.PausesThread != 0 ? QStringLiteral("暂停") : QString()),
+        });
+    }
+}

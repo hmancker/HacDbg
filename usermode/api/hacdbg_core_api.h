@@ -2,7 +2,7 @@
 
 /**
  * @file hacdbg_core_api.h
- * @brief C ABI between the WPF GUI and the native debugger core.
+ * @brief C ABI between the GUI and the native debugger core.
  *
  * @author HacDbg
  */

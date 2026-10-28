@@ -950,7 +950,7 @@ void trace_view::draw_events()
 
 	if ((current_.Flags & HACDBG_TRACE_FLAG_EVENTS_ENABLED) == 0)
 	{
-		ImGui::TextDisabled("Event capture is off. Enable event mode in the WPF toolbar.");
+		ImGui::TextDisabled("Event capture is off. Enable event mode in the trace toolbar.");
 		ImGui::EndChild();
 		return;
 	}
@@ -1019,7 +1019,7 @@ void trace_view::draw_empty_state()
 	ImGui::Dummy(ImVec2(0.0f, 24.0f));
 
 	const char* const title = "Waiting for the first trace snapshot";
-	const char* const detail = "Enable counters or event mode in the WPF trace toolbar.";
+	const char* const detail = "Enable counters or event mode in the trace toolbar.";
 	const float title_width = ImGui::CalcTextSize(title).x;
 	const float detail_width = ImGui::CalcTextSize(detail).x;
 	const float content_width = ImGui::GetContentRegionAvail().x;

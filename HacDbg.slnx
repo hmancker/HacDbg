@@ -12,7 +12,7 @@
   <Project Path="gui/HacDbgTrace/HacDbgTrace.vcxproj" Id="c81a7d45-3f66-4d91-9c4a-58e2f1d6b7a3">
     <Platform Solution="*|x64" Project="x64" />
   </Project>
-  <Project Path="gui/HacDbgGui/HacDbgGui.csproj">
+  <Project Path="gui/HacDbgQt/HacDbgQt.vcxproj" Id="a4c8e2b1-7d55-4e19-8f30-6b1c9d2e4a70">
     <Platform Solution="*|x64" Project="x64" />
   </Project>
   <Project Path="tools/trace-probe/HacDbgTraceProbe.vcxproj" Id="6f6d2e1a-8e2b-4c7d-9a31-5b4c8d2e1f77">

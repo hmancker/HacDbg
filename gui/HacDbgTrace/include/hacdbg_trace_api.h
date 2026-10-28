@@ -56,7 +56,7 @@ typedef enum _HACDBG_TRACE_ACTION
 } HACDBG_TRACE_ACTION;
 
 /**
- * @brief Colors copied from the WPF theme. Colors are packed 0xAARRGGBB.
+ * @brief Theme colors packed as 0xAARRGGBB.
  */
 typedef struct _HACDBG_TRACE_THEME
 {
