@@ -8,9 +8,11 @@
 #include <vector>
 
 class CoreSession;
+class MonitorLogModel;
 class QLabel;
-class QStandardItemModel;
-class QTableView;
+class QListView;
+class QTableWidget;
+class RegisterView;
 
 class MonitorView : public QWidget
 {
@@ -27,16 +29,14 @@ signals:
 
 private:
     bool nearBottom() const;
-    void appendHit(const HACDBG_CORE_MONITOR_HIT& hit);
-    void trimRows();
+    void showSelected();
     void updateStatus();
 
     CoreSession* m_session = nullptr;
     QLabel* m_status = nullptr;
-    QTableView* m_table = nullptr;
-    QStandardItemModel* m_model = nullptr;
-    std::vector<std::uint64_t> m_addresses;
-    std::uint64_t m_shown = 0;
-    std::uint64_t m_skipped = 0;
-    bool m_sizedColumns = false;
+    QListView* m_log = nullptr;
+    MonitorLogModel* m_model = nullptr;
+    RegisterView* m_registers = nullptr;
+    QTableWidget* m_stack = nullptr;
+    std::vector<HACDBG_CORE_MONITOR_HIT> m_copy;
 };

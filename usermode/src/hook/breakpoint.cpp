@@ -18,6 +18,7 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <string_view>
 #include <vector>
 
@@ -3739,7 +3740,7 @@ std::vector<breakpoint::info_t> breakpoint::list()
 }
 
 std::vector<breakpoint::monitor_site_t> monitor_site_list = {};
-std::vector<breakpoint::monitor_hit_t> monitor_hit_list = {};
+std::deque<breakpoint::monitor_hit_t> monitor_hit_list = {};
 
 void breakpoint::clean_up()
 {
@@ -3760,7 +3761,7 @@ void breakpoint::clean_up()
 	}
 }
 
-std::vector<trap_frame_log_t> pending_logs = {};
+std::deque<trap_frame_log_t> pending_logs = {};
 
 constexpr std::size_t monitor_site_limit = 64;
 constexpr std::size_t monitor_hit_limit = 2048;
@@ -3803,7 +3804,7 @@ void note_one_monitor_log(const trap_frame_log_t& log)
 
 		if (monitor_hit_list.size() == monitor_hit_limit)
 		{
-			monitor_hit_list.erase(monitor_hit_list.begin());
+			monitor_hit_list.pop_front();
 		}
 
 		breakpoint::monitor_hit_t hit = {};
@@ -3833,7 +3834,7 @@ void remember_flushed_logs(const trap_frame_log_t* const logs, const std::uint64
 
 		if (pending_logs.size() == pending_log_limit)
 		{
-			pending_logs.erase(pending_logs.begin());
+			pending_logs.pop_front();
 		}
 
 		pending_logs.push_back(logs[index]);
@@ -3877,7 +3878,7 @@ void discard_stale_pause_logs(const breakpoint_t* const breakpoint)
 		kept.push_back(log);
 	}
 
-	pending_logs = std::move(kept);
+	pending_logs.assign(kept.begin(), kept.end());
 }
 
 std::uint8_t flush_into_pause_state(const std::uint8_t report_error, const std::uint8_t observe)
@@ -3921,7 +3922,9 @@ std::uint8_t reconsider_pending_logs()
 		return pause_state.valid;
 	}
 
-	observe_logs_impl(pending_logs.data(), pending_logs.size());
+	const std::vector<trap_frame_log_t> logs(pending_logs.begin(), pending_logs.end());
+
+	observe_logs_impl(logs.data(), logs.size());
 
 	return pause_state.valid;
 }
@@ -4049,7 +4052,7 @@ std::vector<breakpoint::monitor_site_t> breakpoint::monitor_sites()
 
 std::vector<breakpoint::monitor_hit_t> breakpoint::take_monitor_hits()
 {
-	std::vector<monitor_hit_t> hits = std::move(monitor_hit_list);
+	std::vector<monitor_hit_t> hits(monitor_hit_list.begin(), monitor_hit_list.end());
 
 	monitor_hit_list.clear();
 
@@ -4068,7 +4071,7 @@ std::uint64_t breakpoint::paused_breakpoint_id()
 
 std::vector<trap_frame_log_t> breakpoint::take_pending_logs()
 {
-	std::vector<trap_frame_log_t> logs = std::move(pending_logs);
+	std::vector<trap_frame_log_t> logs(pending_logs.begin(), pending_logs.end());
 
 	pending_logs.clear();
 

@@ -2,50 +2,175 @@
 
 #include "CoreSession.h"
 #include "Format.h"
+#include "RegisterView.h"
 
+#include <QAbstractItemView>
+#include <QAbstractListModel>
 #include <QHeaderView>
 #include <QLabel>
+#include <QListView>
 #include <QScrollBar>
-#include <QStandardItemModel>
-#include <QTableView>
+#include <QSplitter>
+#include <QTableWidget>
 #include <QVBoxLayout>
 
 namespace
 {
-constexpr int kMaximumRows = 500;
+constexpr int kMaximumRows = 20000;
 constexpr std::uint32_t kCopyCapacity = 2048;
 
-void prepareTable(QTableView* table)
+QString monitorLine(const HACDBG_CORE_MONITOR_HIT& hit)
+{
+    return QStringLiteral("HacDbg: monitor rip=0x%1 cr3=0x%2.")
+        .arg(QString::number(hit.Rip, 16), QString::number(hit.Cr3, 16));
+}
+}
+
+class MonitorLogModel : public QAbstractListModel
+{
+public:
+    explicit MonitorLogModel(QObject* parent)
+        : QAbstractListModel(parent)
+    {
+    }
+
+    int rowCount(const QModelIndex& parent = QModelIndex()) const override
+    {
+        if (parent.isValid())
+        {
+            return 0;
+        }
+
+        return static_cast<int>(m_rows.size());
+    }
+
+    QVariant data(const QModelIndex& index, int role = Qt::DisplayRole) const override
+    {
+        if (index.isValid() == false || index.row() < 0 || index.row() >= rowCount())
+        {
+            return {};
+        }
+
+        if (role != Qt::DisplayRole)
+        {
+            return {};
+        }
+
+        return m_rows[static_cast<std::size_t>(index.row())].line;
+    }
+
+    void append(const HACDBG_CORE_MONITOR_HIT* hits, int count)
+    {
+        if (hits == nullptr || count <= 0)
+        {
+            return;
+        }
+
+        if (count > kMaximumRows)
+        {
+            m_dropped += static_cast<std::uint64_t>(count - kMaximumRows);
+            hits += count - kMaximumRows;
+            count = kMaximumRows;
+        }
+
+        const int size = rowCount();
+
+        if (size + count <= kMaximumRows)
+        {
+            beginInsertRows(QModelIndex(), size, size + count - 1);
+            m_rows.reserve(static_cast<std::size_t>(size + count));
+
+            for (int index = 0; index < count; ++index)
+            {
+                m_rows.push_back(makeRow(hits[index]));
+            }
+
+            endInsertRows();
+            return;
+        }
+
+        const int drop = size + count - kMaximumRows;
+        m_dropped += static_cast<std::uint64_t>(drop);
+        beginResetModel();
+        m_rows.erase(m_rows.begin(), m_rows.begin() + drop);
+        m_rows.reserve(static_cast<std::size_t>(kMaximumRows));
+
+        for (int index = 0; index < count; ++index)
+        {
+            m_rows.push_back(makeRow(hits[index]));
+        }
+
+        endResetModel();
+    }
+
+    bool hit(int row, HACDBG_CORE_MONITOR_HIT* out) const
+    {
+        if (out == nullptr || row < 0 || row >= rowCount())
+        {
+            return false;
+        }
+
+        *out = m_rows[static_cast<std::size_t>(row)].hit;
+        return true;
+    }
+
+    std::uint64_t dropped() const
+    {
+        return m_dropped;
+    }
+
+private:
+    struct Row
+    {
+        HACDBG_CORE_MONITOR_HIT hit = {};
+        QString line;
+    };
+
+    static Row makeRow(const HACDBG_CORE_MONITOR_HIT& hit)
+    {
+        Row row;
+        row.hit = hit;
+        row.line = monitorLine(hit);
+        return row;
+    }
+
+    std::vector<Row> m_rows;
+    std::uint64_t m_dropped = 0;
+};
+
+namespace
+{
+QFont monoFont()
 {
     QFont font(QStringLiteral("Cascadia Mono"));
     font.setStyleHint(QFont::Monospace);
     font.setPointSize(10);
-    table->setFont(font);
-    table->setShowGrid(false);
-    table->setAlternatingRowColors(true);
-    table->setSelectionBehavior(QAbstractItemView::SelectRows);
-    table->setSelectionMode(QAbstractItemView::SingleSelection);
-    table->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    table->verticalHeader()->hide();
-    table->horizontalHeader()->setStretchLastSection(true);
-    table->setWordWrap(false);
+    return font;
 }
 
-QString stackText(const HACDBG_CORE_MONITOR_HIT& hit)
+HACDBG_CORE_REGISTERS registersFromHit(const HACDBG_CORE_MONITOR_HIT& hit)
 {
-    QString text;
-
-    for (std::uint32_t index = 0; index < HACDBG_CORE_MONITOR_STACK; ++index)
-    {
-        if (index != 0)
-        {
-            text.append(QStringLiteral(" "));
-        }
-
-        text.append(hex16(hit.Stack[index]));
-    }
-
-    return text;
+    HACDBG_CORE_REGISTERS registers = {};
+    registers.Rax = hit.Rax;
+    registers.Rcx = hit.Rcx;
+    registers.Rdx = hit.Rdx;
+    registers.Rbx = hit.Rbx;
+    registers.Rsp = hit.Rsp;
+    registers.Rbp = hit.Rbp;
+    registers.Rsi = hit.Rsi;
+    registers.Rdi = hit.Rdi;
+    registers.R8 = hit.R8;
+    registers.R9 = hit.R9;
+    registers.R10 = hit.R10;
+    registers.R11 = hit.R11;
+    registers.R12 = hit.R12;
+    registers.R13 = hit.R13;
+    registers.R14 = hit.R14;
+    registers.R15 = hit.R15;
+    registers.Rip = hit.Rip;
+    registers.Cr3 = hit.Cr3;
+    registers.RflagsKnown = 0;
+    return registers;
 }
 }
 
@@ -55,45 +180,68 @@ MonitorView::MonitorView(QWidget* parent)
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
-    m_status = new QLabel(QStringLiteral("监控记录来自日志邮箱，不必执行 fl。表里保留最近 500 条。"), this);
+    m_status = new QLabel(this);
     m_status->setContentsMargins(8, 4, 8, 4);
-    m_table = new QTableView(this);
-    prepareTable(m_table);
-    m_model = new QStandardItemModel(this);
-    m_model->setHorizontalHeaderLabels({
-        QStringLiteral("#"),
-        QStringLiteral("函数"),
-        QStringLiteral("RIP"),
-        QStringLiteral("CR3"),
-        QStringLiteral("RAX"),
-        QStringLiteral("RCX"),
-        QStringLiteral("RDX"),
-        QStringLiteral("RBX"),
-        QStringLiteral("RSP"),
-        QStringLiteral("RBP"),
-        QStringLiteral("RSI"),
-        QStringLiteral("RDI"),
-        QStringLiteral("R8"),
-        QStringLiteral("R9"),
-        QStringLiteral("R10"),
-        QStringLiteral("R11"),
-        QStringLiteral("R12"),
-        QStringLiteral("R13"),
-        QStringLiteral("R14"),
-        QStringLiteral("R15"),
-        QStringLiteral("栈"),
-    });
-    m_table->setModel(m_model);
-    layout->addWidget(m_status);
-    layout->addWidget(m_table, 1);
-    connect(m_table, &QTableView::doubleClicked, this, [this](const QModelIndex& index)
+    m_log = new QListView(this);
+    m_model = new MonitorLogModel(this);
+    m_log->setModel(m_model);
+    m_log->setFont(monoFont());
+    m_log->setUniformItemSizes(true);
+    m_log->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_log->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_log->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_log->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
+    m_log->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+    m_log->setTextElideMode(Qt::ElideNone);
+    m_registers = new RegisterView(this);
+    m_stack = new QTableWidget(HACDBG_CORE_MONITOR_STACK, 2, this);
+    m_stack->setFont(monoFont());
+    m_stack->setHorizontalHeaderLabels({QStringLiteral("地址"), QStringLiteral("值")});
+    m_stack->verticalHeader()->hide();
+    m_stack->verticalHeader()->setDefaultSectionSize(m_stack->fontMetrics().height() + 4);
+    m_stack->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    m_stack->setSelectionMode(QAbstractItemView::NoSelection);
+    m_stack->setFocusPolicy(Qt::NoFocus);
+    m_stack->setShowGrid(false);
+    m_stack->horizontalHeader()->setStretchLastSection(true);
+    m_stack->horizontalHeader()->setSectionResizeMode(0, QHeaderView::ResizeToContents);
+
+    for (int row = 0; row < HACDBG_CORE_MONITOR_STACK; ++row)
     {
-        if (index.row() < 0 || index.row() >= static_cast<int>(m_addresses.size()))
+        m_stack->setItem(row, 0, new QTableWidgetItem);
+        m_stack->setItem(row, 1, new QTableWidgetItem);
+    }
+
+    auto* split = new QSplitter(Qt::Horizontal, this);
+    auto* right = new QSplitter(Qt::Vertical, split);
+    right->setChildrenCollapsible(false);
+    right->addWidget(m_registers);
+    right->addWidget(m_stack);
+    right->setStretchFactor(0, 3);
+    right->setStretchFactor(1, 2);
+    split->setChildrenCollapsible(false);
+    split->addWidget(m_log);
+    split->addWidget(right);
+    split->setStretchFactor(0, 3);
+    split->setStretchFactor(1, 2);
+    layout->addWidget(m_status);
+    layout->addWidget(split, 1);
+    updateStatus();
+
+    connect(m_log->selectionModel(), &QItemSelectionModel::currentChanged, this, [this](const QModelIndex&, const QModelIndex&)
+    {
+        showSelected();
+    });
+    connect(m_log, &QListView::doubleClicked, this, [this](const QModelIndex& index)
+    {
+        HACDBG_CORE_MONITOR_HIT hit = {};
+
+        if (m_model->hit(index.row(), &hit) == false || hit.Rip == 0)
         {
             return;
         }
 
-        emit addressActivated(m_addresses[static_cast<std::size_t>(index.row())], 0);
+        emit addressActivated(hit.Rip, hit.Cr3);
     });
 }
 
@@ -104,65 +252,58 @@ void MonitorView::setSession(CoreSession* session)
 
 bool MonitorView::nearBottom() const
 {
-    const QScrollBar* bar = m_table->verticalScrollBar();
-    const int line = qMax(1, m_table->fontMetrics().lineSpacing());
+    const QScrollBar* bar = m_log->verticalScrollBar();
 
-    return bar->maximum() - bar->value() <= line * 2;
-}
-
-void MonitorView::appendHit(const HACDBG_CORE_MONITOR_HIT& hit)
-{
-    ++m_shown;
-    m_addresses.push_back(hit.Address);
-    m_model->appendRow({
-        new QStandardItem(QString::number(m_shown)),
-        new QStandardItem(hex16(hit.Address)),
-        new QStandardItem(hex16(hit.Rip)),
-        new QStandardItem(hex16(hit.Cr3)),
-        new QStandardItem(hex16(hit.Rax)),
-        new QStandardItem(hex16(hit.Rcx)),
-        new QStandardItem(hex16(hit.Rdx)),
-        new QStandardItem(hex16(hit.Rbx)),
-        new QStandardItem(hex16(hit.Rsp)),
-        new QStandardItem(hex16(hit.Rbp)),
-        new QStandardItem(hex16(hit.Rsi)),
-        new QStandardItem(hex16(hit.Rdi)),
-        new QStandardItem(hex16(hit.R8)),
-        new QStandardItem(hex16(hit.R9)),
-        new QStandardItem(hex16(hit.R10)),
-        new QStandardItem(hex16(hit.R11)),
-        new QStandardItem(hex16(hit.R12)),
-        new QStandardItem(hex16(hit.R13)),
-        new QStandardItem(hex16(hit.R14)),
-        new QStandardItem(hex16(hit.R15)),
-        new QStandardItem(stackText(hit)),
-    });
-}
-
-void MonitorView::trimRows()
-{
-    const int extra = m_model->rowCount() - kMaximumRows;
-
-    if (extra <= 0)
+    if (bar->maximum() <= 0)
     {
+        return true;
+    }
+
+    return bar->maximum() - bar->value() <= qMax(bar->singleStep(), m_log->fontMetrics().lineSpacing());
+}
+
+void MonitorView::showSelected()
+{
+    HACDBG_CORE_MONITOR_HIT hit = {};
+    const bool selected = m_model->hit(m_log->currentIndex().row(), &hit);
+
+    if (selected == false)
+    {
+        m_registers->setRegisters({}, false);
+
+        for (int row = 0; row < HACDBG_CORE_MONITOR_STACK; ++row)
+        {
+            m_stack->item(row, 0)->setText({});
+            m_stack->item(row, 1)->setText({});
+        }
+
         return;
     }
 
-    m_model->removeRows(0, extra);
-    m_addresses.erase(m_addresses.begin(), m_addresses.begin() + extra);
-    m_skipped += static_cast<std::uint64_t>(extra);
+    m_registers->setRegisters(registersFromHit(hit), true);
+
+    for (int row = 0; row < HACDBG_CORE_MONITOR_STACK; ++row)
+    {
+        const std::uint64_t address = hit.Rsp + static_cast<std::uint64_t>(row) * 8;
+        m_stack->item(row, 0)->setText(hex16(address));
+        m_stack->item(row, 1)->setText(hex16(hit.Stack[row]));
+    }
 }
 
 void MonitorView::updateStatus()
 {
-    if (m_skipped == 0)
+    const std::uint64_t dropped = m_model->dropped();
+
+    if (dropped == 0)
     {
-        m_status->setText(QStringLiteral("监控记录来自日志邮箱，不必执行 fl。表里保留最近 500 条。"));
+        m_status->setText(QStringLiteral("监控日志来自日志邮箱，不必执行 fl。选中一行后，右侧显示这一次的寄存器和栈。列表保留最近 %1 条。")
+                              .arg(kMaximumRows));
         return;
     }
 
-    m_status->setText(QStringLiteral("监控记录来自日志邮箱，不必执行 fl。表里保留最近 500 条，较早的 %1 条已丢掉。")
-                          .arg(m_skipped));
+    m_status->setText(QStringLiteral("监控日志来自日志邮箱，不必执行 fl。选中一行后，右侧显示这一次的寄存器和栈。列表保留最近 %1 条，较早的 %2 条已丢掉。")
+                          .arg(kMaximumRows)
+                          .arg(dropped));
 }
 
 void MonitorView::poll()
@@ -172,42 +313,26 @@ void MonitorView::poll()
         return;
     }
 
-    std::vector<HACDBG_CORE_MONITOR_HIT> hits(kCopyCapacity);
+    if (m_copy.size() != kCopyCapacity)
+    {
+        m_copy.resize(kCopyCapacity);
+    }
+
     std::uint32_t count = 0;
 
-    if (m_session->copyMonitorHits(hits.data(), kCopyCapacity, &count) == false || count == 0)
+    if (m_session->copyMonitorHits(m_copy.data(), kCopyCapacity, &count) == false || count == 0)
     {
         return;
     }
 
-    const bool follow = nearBottom();
-    m_table->setUpdatesEnabled(false);
+    const bool follow = nearBottom() || m_log->selectionModel()->currentIndex().isValid() == false;
+    m_model->append(m_copy.data(), static_cast<int>(count));
 
-    std::uint32_t begin = 0;
-
-    if (count > static_cast<std::uint32_t>(kMaximumRows))
+    if (follow && m_model->rowCount() > 0)
     {
-        begin = count - static_cast<std::uint32_t>(kMaximumRows);
-        m_skipped += begin;
-    }
-
-    for (std::uint32_t index = begin; index < count; ++index)
-    {
-        appendHit(hits[index]);
-    }
-
-    trimRows();
-    m_table->setUpdatesEnabled(true);
-
-    if (m_sizedColumns == false && m_model->rowCount() > 0)
-    {
-        m_table->resizeColumnsToContents();
-        m_sizedColumns = true;
-    }
-
-    if (follow)
-    {
-        m_table->scrollToBottom();
+        const QModelIndex last = m_model->index(m_model->rowCount() - 1, 0);
+        m_log->setCurrentIndex(last);
+        m_log->scrollTo(last, QAbstractItemView::PositionAtBottom);
     }
 
     updateStatus();
