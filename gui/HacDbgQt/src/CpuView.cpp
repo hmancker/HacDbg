@@ -191,10 +191,15 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
         m_pausedCr3 = 0;
         m_lastRip = 0;
         m_lastRsp = 0;
+        m_commandSequence = state.CommandSequence;
         m_stackRsp = 0;
         m_stackCr3 = 0;
+        m_stackCommand = 0;
+        m_stackWindowBase = 0;
         m_disassemblyStale = false;
         m_stackStale = false;
+        m_stackBytesStale = false;
+        m_memoryStale = false;
         m_followTimer->stop();
         m_disassembly->setRip(0, breakpoints);
         return;
@@ -207,13 +212,15 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
     const bool ripChanged = entered || m_lastRip != rip;
     const bool rspChanged = entered || m_lastRsp != rsp;
     const bool cr3Changed = entered || m_pausedCr3 != cr3;
+    const bool commandChanged = entered || m_commandSequence != state.CommandSequence;
     m_paused = true;
     m_pausedCr3 = cr3;
     m_lastRip = rip;
     m_lastRsp = rsp;
+    m_commandSequence = state.CommandSequence;
     m_disassembly->setRip(rip, breakpoints);
 
-    if ((ripChanged == false && rspChanged == false && cr3Changed == false) || m_session == nullptr || m_session->isStarted() == false)
+    if (m_session == nullptr || m_session->isStarted() == false)
     {
         return;
     }
@@ -222,35 +229,67 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
     {
         m_disassemblyStale = false;
         m_stackStale = false;
+        m_stackBytesStale = false;
+        m_memoryStale = false;
         m_followTimer->stop();
         return;
     }
 
-    const bool ripVisible = m_disassemblyCr3 == cr3 && m_disassembly->containsAddress(rip);
-
-    if (ripVisible == false)
+    if (ripChanged || cr3Changed)
     {
-        hideGoto();
-        m_disassemblyStale = true;
-    }
-    else
-    {
-        m_disassemblyStale = false;
+        const bool ripVisible = m_disassemblyCr3 == cr3 && m_disassembly->containsAddress(rip);
+
+        if (ripVisible == false)
+        {
+            hideGoto();
+            m_disassemblyStale = true;
+        }
+        else
+        {
+            m_disassemblyStale = false;
+        }
     }
 
-    const bool stackFresh = m_stack->hasFrames() && m_stackRsp == rsp && m_stackCr3 == cr3;
+    //
+    // mov [rsp+8] writes a stack slot without moving RSP. The qword window
+    // has to be read again. The frame walk stays tied to RSP and CR3.
+    //
+    const bool stackContextSame = m_stack->hasFrames() && m_stackRsp == rsp && m_stackCr3 == cr3;
+    const bool stackCommandSame = stackContextSame && m_stackCommand == state.CommandSequence;
 
-    if (stackFresh)
+    if (stackCommandSame)
     {
         m_stackStale = false;
+        m_stackBytesStale = false;
     }
-    else if (m_stackRequest != 0)
-    {
-        m_stackStale = false;
-    }
-    else
+    else if (m_stackRequest != 0 &&
+             (m_stackRequestCommand != state.CommandSequence || m_stackRequestRsp != rsp || m_stackRequestCr3 != cr3))
     {
         m_stackStale = true;
+    }
+    else if (m_stackRequest == 0 && stackContextSame && (commandChanged || ripChanged))
+    {
+        if (m_stackWindowBase == 0)
+        {
+            m_stackStale = true;
+            m_stackBytesStale = false;
+        }
+        else
+        {
+            m_stackBytesStale = true;
+            m_stackStale = false;
+            m_followTimer->stop();
+        }
+    }
+    else if (m_stackRequest == 0 && (entered || rspChanged || cr3Changed || stackContextSame == false))
+    {
+        m_stackStale = true;
+        m_stackBytesStale = false;
+    }
+
+    if (m_shownMemory && (commandChanged || cr3Changed))
+    {
+        m_memoryStale = true;
     }
 
     if (m_stepBurst)
@@ -264,14 +303,24 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
         queueDisassembly();
     }
 
-    if (m_stackStale)
+    if (m_stackStale && m_stackRequest == 0)
     {
-        scheduleStack();
+        if (commandChanged && ripChanged == false && rspChanged == false && cr3Changed == false)
+        {
+            m_followTimer->stop();
+            flushStack();
+        }
+        else if (m_followTimer->isActive() == false)
+        {
+            scheduleStack();
+        }
     }
-    else
+    else if (m_stackStale == false && m_stackBytesStale == false)
     {
         m_followTimer->stop();
     }
+
+    pumpMemoryReads();
 }
 
 void CpuView::setStepBurst(bool burst)
@@ -295,6 +344,8 @@ void CpuView::setStepBurst(bool burst)
     {
         flushStack();
     }
+
+    pumpMemoryReads();
 }
 
 void CpuView::poll()
@@ -406,39 +457,25 @@ void CpuView::poll()
 
     if (takeCompleted(HacDbgViewMemory, &m_memoryRequest, &status))
     {
-        if (status.Failed != 0)
+        if (m_memoryReadKind == MemoryReadKind::StackBytes)
         {
-            setMemoryStatus(fromField(status.Message, HACDBG_CORE_MESSAGE_SIZE));
+            applyStackByteRead(status);
         }
         else
         {
-            HACDBG_CORE_MEMORY memory = {};
+            applyDumpRead(status);
+        }
 
-            if (m_session->copyMemory(&memory) == false)
+        m_memoryReadKind = MemoryReadKind::None;
+
+        if (m_stepBurst == false)
+        {
+            if (m_stackStale && m_stackRequest == 0 && m_followTimer->isActive() == false)
             {
-                setMemoryStatus(QStringLiteral("复制内存失败"));
+                flushStack();
             }
-            else
-            {
-                MemoryPage page;
-                page.address = memory.Address;
-                page.cr3 = memory.Cr3;
-                const std::uint32_t length = memory.BytesValid < HACDBG_CORE_MAX_MEMORY_BYTES ? memory.BytesValid : HACDBG_CORE_MAX_MEMORY_BYTES;
-                page.bytes.assign(memory.Data, memory.Data + length);
-                m_memoryCache.push_back(page);
 
-                if (m_memoryCache.size() > kMemoryCacheLimit)
-                {
-                    m_memoryCache.erase(m_memoryCache.begin());
-                }
-
-                showMemory(page);
-                setMemoryStatus(QStringLiteral("%1/%2 字节 · %3 · CR3 %4")
-                                    .arg(memory.BytesValid)
-                                    .arg(memory.Requested)
-                                    .arg(hex16(m_memoryCursor))
-                                    .arg(hex16(memory.Cr3)));
-            }
+            pumpMemoryReads();
         }
     }
 
@@ -463,7 +500,9 @@ void CpuView::poll()
             {
                 m_stackStatus->setText(QStringLiteral("复制调用栈失败"));
             }
-            else if (count > 0 && frames[0].InstructionPointer != m_lastRip)
+            else if (count > 0 && (frames[0].InstructionPointer != m_lastRip ||
+                                   m_stackRequestCommand != m_commandSequence || m_stackRequestRsp != m_lastRsp ||
+                                   m_stackRequestCr3 != m_pausedCr3))
             {
                 m_stackStale = true;
                 m_stackStatus->setText(QStringLiteral("读取中..."));
@@ -481,7 +520,10 @@ void CpuView::poll()
                                      haveWindow ? window.Data : nullptr, haveWindow ? window.BytesValid : 0);
                 m_stackRsp = m_lastRsp;
                 m_stackCr3 = m_pausedCr3;
+                m_stackCommand = m_stackRequestCommand;
+                m_stackWindowBase = haveWindow && window.BytesValid >= 8 ? window.Address : 0;
                 m_stackStale = false;
+                m_stackBytesStale = false;
                 m_stackStatus->setText(status.Truncated != 0 ? QStringLiteral("%1 帧，已截断").arg(count) : QStringLiteral("%1 帧").arg(count));
             }
         }
@@ -637,15 +679,24 @@ void CpuView::flushStack()
         return;
     }
 
-    if (m_stack->hasFrames() && m_stackRsp == m_lastRsp && m_stackCr3 == m_pausedCr3)
+    if (m_stack->hasFrames() && m_stackRsp == m_lastRsp && m_stackCr3 == m_pausedCr3 && m_stackCommand == m_commandSequence)
     {
         m_stackStale = false;
         return;
     }
 
     m_stackStale = false;
+    m_stackBytesStale = false;
+    m_stackRequestCommand = m_commandSequence;
+    m_stackRequestRsp = m_lastRsp;
+    m_stackRequestCr3 = m_pausedCr3;
     m_stackRequest = m_session->requestStack(32);
     m_stackStatus->setText(m_stackRequest == 0 ? QStringLiteral("无法排队") : QStringLiteral("读取中..."));
+
+    if (m_stackRequest == 0)
+    {
+        m_stackStale = true;
+    }
 }
 
 void CpuView::requestDisassembly(std::uint64_t address, std::uint64_t cr3, bool follow)
@@ -686,11 +737,183 @@ void CpuView::requestMemory(std::uint64_t address, std::uint64_t cr3, int highli
         return;
     }
 
+    if (m_memoryRequest != 0 && m_memoryReadKind == MemoryReadKind::StackBytes)
+    {
+        m_stackBytesStale = true;
+    }
+
     m_memoryCursor = address;
     m_memoryCr3 = cr3;
     m_memoryCursorBytes = highlightBytes < 1 ? 1 : highlightBytes;
-    m_memoryRequest = m_session->requestMemory(alignRow(address), cr3, HACDBG_CORE_MAX_MEMORY_BYTES);
+    m_shownMemory = true;
+    m_shownMemoryBase = alignRow(address);
+    m_shownMemoryCr3 = cr3;
+    m_memoryStale = false;
+    m_memoryQuiet = false;
+    m_memoryReadKind = MemoryReadKind::Dump;
+    m_memoryRequestCommand = m_commandSequence;
+    m_memoryRequest = m_session->requestMemory(m_shownMemoryBase, cr3, HACDBG_CORE_MAX_MEMORY_BYTES);
     setMemoryStatus(m_memoryRequest == 0 ? QStringLiteral("无法排队") : QStringLiteral("读取中..."));
+}
+
+void CpuView::pumpMemoryReads()
+{
+    if (m_stepBurst || m_memoryRequest != 0 || m_session == nullptr || m_session->isStarted() == false)
+    {
+        return;
+    }
+
+    if (m_memoryStale && m_shownMemory)
+    {
+        m_memoryReadKind = MemoryReadKind::Dump;
+        m_memoryQuiet = true;
+        m_memoryStale = false;
+        m_memoryRequestCommand = m_commandSequence;
+        m_memoryRequest = m_session->requestMemory(m_shownMemoryBase, m_shownMemoryCr3, HACDBG_CORE_MAX_MEMORY_BYTES);
+
+        if (m_memoryRequest == 0)
+        {
+            m_memoryStale = true;
+            m_memoryReadKind = MemoryReadKind::None;
+            setMemoryStatus(QStringLiteral("无法排队"));
+        }
+
+        return;
+    }
+
+    if (m_stackBytesStale == false || m_stackStale || m_stackWindowBase == 0 || m_paused == false ||
+        m_stack->hasFrames() == false || m_stackRsp != m_lastRsp || m_stackCr3 != m_pausedCr3)
+    {
+        return;
+    }
+
+    m_memoryReadKind = MemoryReadKind::StackBytes;
+    m_stackBytesStale = false;
+    m_memoryRequestCommand = m_commandSequence;
+    m_memoryRequestRsp = m_lastRsp;
+    m_memoryRequestCr3 = m_pausedCr3;
+    m_memoryRequest = m_session->requestMemory(m_stackWindowBase, m_pausedCr3, HACDBG_CORE_MAX_MEMORY_BYTES);
+
+    if (m_memoryRequest == 0)
+    {
+        m_stackBytesStale = true;
+        m_memoryReadKind = MemoryReadKind::None;
+        m_stackStatus->setText(QStringLiteral("无法排队"));
+    }
+}
+
+void CpuView::applyDumpRead(const HACDBG_CORE_VIEW_STATUS& status)
+{
+    if (status.Failed != 0)
+    {
+        setMemoryStatus(fromField(status.Message, HACDBG_CORE_MESSAGE_SIZE));
+    }
+    else
+    {
+        HACDBG_CORE_MEMORY memory = {};
+
+        if (m_session->copyMemory(&memory) == false)
+        {
+            setMemoryStatus(QStringLiteral("复制内存失败"));
+        }
+        else
+        {
+            MemoryPage page;
+            page.address = memory.Address;
+            page.cr3 = memory.Cr3;
+            const std::uint32_t length = memory.BytesValid < HACDBG_CORE_MAX_MEMORY_BYTES ? memory.BytesValid : HACDBG_CORE_MAX_MEMORY_BYTES;
+            page.bytes.assign(memory.Data, memory.Data + length);
+            storeMemoryPage(std::move(page));
+            showMemory(m_memoryCache.back());
+
+            if (m_memoryQuiet == false)
+            {
+                setMemoryStatus(QStringLiteral("%1/%2 字节 · %3 · CR3 %4")
+                                    .arg(memory.BytesValid)
+                                    .arg(memory.Requested)
+                                    .arg(hex16(m_memoryCursor))
+                                    .arg(hex16(memory.Cr3)));
+            }
+        }
+    }
+
+    if (m_memoryRequestCommand != m_commandSequence)
+    {
+        m_memoryStale = true;
+    }
+}
+
+void CpuView::applyStackByteRead(const HACDBG_CORE_VIEW_STATUS& status)
+{
+    const bool current = m_paused && m_memoryRequestCommand == m_commandSequence && m_memoryRequestRsp == m_lastRsp &&
+                         m_memoryRequestCr3 == m_pausedCr3;
+
+    if (status.Failed != 0 || current == false)
+    {
+        if (current == false && m_paused && m_stackRsp == m_lastRsp && m_stackCr3 == m_pausedCr3)
+        {
+            m_stackBytesStale = true;
+        }
+        else if (current == false)
+        {
+            m_stackStale = true;
+        }
+        else
+        {
+            m_stackStatus->setText(fromField(status.Message, HACDBG_CORE_MESSAGE_SIZE));
+        }
+
+        return;
+    }
+
+    HACDBG_CORE_MEMORY memory = {};
+
+    if (m_session->copyMemory(&memory) == false)
+    {
+        m_stackStatus->setText(QStringLiteral("复制内存失败"));
+        return;
+    }
+
+    const std::uint32_t length = memory.BytesValid < HACDBG_CORE_MAX_MEMORY_BYTES ? memory.BytesValid : HACDBG_CORE_MAX_MEMORY_BYTES;
+
+    if (memory.Address == m_stackWindowBase && m_stack->replaceBytes(memory.Address, m_lastRsp, memory.Data, length))
+    {
+        m_stackCommand = m_memoryRequestCommand;
+        m_stackBytesStale = false;
+        return;
+    }
+
+    m_stackStale = true;
+    m_stackBytesStale = false;
+}
+
+void CpuView::storeMemoryPage(MemoryPage page)
+{
+    for (std::size_t index = 0; index < m_memoryCache.size(); ++index)
+    {
+        if (m_memoryCache[index].address != page.address || m_memoryCache[index].cr3 != page.cr3)
+        {
+            continue;
+        }
+
+        m_memoryCache[index].bytes = std::move(page.bytes);
+
+        if (index + 1 != m_memoryCache.size())
+        {
+            MemoryPage updated = std::move(m_memoryCache[index]);
+            m_memoryCache.erase(m_memoryCache.begin() + static_cast<std::ptrdiff_t>(index));
+            m_memoryCache.push_back(std::move(updated));
+        }
+
+        return;
+    }
+
+    m_memoryCache.push_back(std::move(page));
+
+    if (m_memoryCache.size() > kMemoryCacheLimit)
+    {
+        m_memoryCache.erase(m_memoryCache.begin());
+    }
 }
 
 void CpuView::showMemory(const MemoryPage& page)

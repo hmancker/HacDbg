@@ -24,13 +24,20 @@ HexDumpView::HexDumpView(QWidget* parent)
 
 void HexDumpView::setBytes(std::uint64_t base, std::uint64_t cursor, int cursorBytes, std::vector<std::uint8_t> bytes)
 {
+    const int nextCursorBytes = cursorBytes < 1 ? 1 : cursorBytes;
+    const bool keepScroll = base == m_base && cursor == m_cursor && nextCursorBytes == m_cursorBytes;
+    const int scroll = verticalScrollBar()->value();
     m_base = base;
     m_cursor = cursor;
-    m_cursorBytes = cursorBytes < 1 ? 1 : cursorBytes;
+    m_cursorBytes = nextCursorBytes;
     m_bytes = std::move(bytes);
     updateScroll();
 
-    if (m_cursor >= m_base && m_cursor - m_base < m_bytes.size())
+    if (keepScroll)
+    {
+        verticalScrollBar()->setValue(scroll);
+    }
+    else if (m_cursor >= m_base && m_cursor - m_base < m_bytes.size())
     {
         const int row = static_cast<int>((m_cursor - m_base) / 16);
         const int visible = qMax(1, viewport()->height() / rowHeight());

@@ -91,6 +91,9 @@ void StackView::setSnapshot(const HACDBG_CORE_STACK_FRAME* frames, std::uint32_t
     std::vector<Note> notes;
     std::vector<Span> spans;
     std::vector<std::uint32_t> order;
+    const bool keepPlace = base != 0 && base == m_base && rsp == m_rsp && m_rows.empty() == false;
+    const int previousScroll = verticalScrollBar()->value();
+    const int previousSelected = m_selected;
 
     m_rows.clear();
     m_selected = -1;
@@ -187,9 +190,59 @@ void StackView::setSnapshot(const HACDBG_CORE_STACK_FRAME* frames, std::uint32_t
         }
     }
 
+    const bool haveBytes = bytes != nullptr && byteCount >= 8 && base != 0 && m_rows.empty() == false;
+    m_base = haveBytes ? base : 0;
+    m_rsp = rsp;
     updateScroll();
-    verticalScrollBar()->setValue(0);
+
+    if (keepPlace)
+    {
+        if (previousSelected >= 0 && previousSelected < static_cast<int>(m_rows.size()))
+        {
+            m_selected = previousSelected;
+        }
+
+        verticalScrollBar()->setValue(previousScroll);
+    }
+    else
+    {
+        verticalScrollBar()->setValue(0);
+    }
+
     viewport()->update();
+}
+
+bool StackView::replaceBytes(std::uint64_t base, std::uint64_t rsp, const std::uint8_t* bytes, std::uint32_t byteCount)
+{
+    if (bytes == nullptr || base == 0 || base != m_base || m_rows.empty())
+    {
+        return false;
+    }
+
+    const std::uint32_t usable = byteCount & ~std::uint32_t{7};
+
+    if (usable < 8 || static_cast<std::size_t>(usable / 8) != m_rows.size())
+    {
+        return false;
+    }
+
+    if (m_rows.front().address != base || m_rows.back().address != base + usable - 8)
+    {
+        return false;
+    }
+
+    for (std::uint32_t offset = 0; offset < usable; offset += 8)
+    {
+        std::uint64_t value = 0;
+        std::memcpy(&value, bytes + offset, sizeof(value));
+        Row& row = m_rows[offset / 8];
+        row.value = value;
+        row.rsp = rsp != 0 && row.address == (rsp & ~static_cast<std::uint64_t>(7));
+    }
+
+    m_rsp = rsp;
+    viewport()->update();
+    return true;
 }
 
 bool StackView::hasFrames() const

@@ -40,11 +40,22 @@ private:
     void showGoto();
     void hideGoto();
     void submitGoto(bool memory);
+    enum class MemoryReadKind
+    {
+        None,
+        Dump,
+        StackBytes
+    };
+
     void requestDisassembly(std::uint64_t address, std::uint64_t cr3, bool follow = false);
     void requestMemory(std::uint64_t address, std::uint64_t cr3, int highlightBytes);
     void queueDisassembly();
     void scheduleStack();
     void flushStack();
+    void pumpMemoryReads();
+    void applyDumpRead(const HACDBG_CORE_VIEW_STATUS& status);
+    void applyStackByteRead(const HACDBG_CORE_VIEW_STATUS& status);
+    void storeMemoryPage(MemoryPage page);
     void showMemory(const MemoryPage& page);
     void noteSelection();
     bool takeCompleted(std::uint32_t view, std::uint64_t* requestId, HACDBG_CORE_VIEW_STATUS* status);
@@ -77,15 +88,31 @@ private:
     std::uint64_t m_pausedCr3 = 0;
     std::uint64_t m_lastRip = 0;
     std::uint64_t m_lastRsp = 0;
+    std::uint64_t m_commandSequence = 0;
     std::uint64_t m_stackRsp = 0;
     std::uint64_t m_stackCr3 = 0;
+    std::uint64_t m_stackCommand = 0;
+    std::uint64_t m_stackWindowBase = 0;
+    std::uint64_t m_stackRequestCommand = 0;
+    std::uint64_t m_stackRequestRsp = 0;
+    std::uint64_t m_stackRequestCr3 = 0;
     bool m_followRip = false;
     bool m_stepBurst = false;
     bool m_disassemblyStale = false;
     bool m_stackStale = false;
+    bool m_stackBytesStale = false;
     std::uint64_t m_memoryCursor = 0;
     std::uint64_t m_memoryCr3 = 0;
     int m_memoryCursorBytes = 1;
+    bool m_shownMemory = false;
+    bool m_memoryStale = false;
+    bool m_memoryQuiet = false;
+    std::uint64_t m_shownMemoryBase = 0;
+    std::uint64_t m_shownMemoryCr3 = 0;
+    std::uint64_t m_memoryRequestCommand = 0;
+    std::uint64_t m_memoryRequestRsp = 0;
+    std::uint64_t m_memoryRequestCr3 = 0;
+    MemoryReadKind m_memoryReadKind = MemoryReadKind::None;
     bool m_resolveForMemory = false;
     bool m_paused = false;
     bool m_suppressSelection = false;

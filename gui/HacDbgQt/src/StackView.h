@@ -19,6 +19,7 @@ public:
 
     void setSnapshot(const HACDBG_CORE_STACK_FRAME* frames, std::uint32_t count, std::uint64_t base, std::uint64_t rsp,
                      const std::uint8_t* bytes, std::uint32_t byteCount);
+    bool replaceBytes(std::uint64_t base, std::uint64_t rsp, const std::uint8_t* bytes, std::uint32_t byteCount);
     bool hasFrames() const;
 
 signals:
@@ -62,4 +63,6 @@ private:
 
     std::vector<Row> m_rows;
     int m_selected = -1;
+    std::uint64_t m_base = 0;
+    std::uint64_t m_rsp = 0;
 };
