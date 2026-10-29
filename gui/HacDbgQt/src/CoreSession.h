@@ -51,6 +51,7 @@ public:
     bool copyProcesses(HACDBG_CORE_PROCESS* processes, std::uint32_t capacity, std::uint32_t* count) const;
     bool copyThreads(HACDBG_CORE_THREAD* threads, std::uint32_t capacity, std::uint32_t* count) const;
     bool copyStack(HACDBG_CORE_STACK_FRAME* frames, std::uint32_t capacity, std::uint32_t* count) const;
+    bool copyStackWindow(HACDBG_CORE_STACK_WINDOW* window) const;
     bool copyMemory(HACDBG_CORE_MEMORY* memory) const;
     bool copyDisassembly(HACDBG_CORE_INSTRUCTION* instructions, std::uint32_t capacity, std::uint32_t* count) const;
     bool copyResolvedAddress(HACDBG_CORE_RESOLVED_ADDRESS* address) const;
@@ -107,6 +108,7 @@ private:
     std::uint32_t (*m_copyProcesses)(HACDBG_CORE* core, HACDBG_CORE_PROCESS* processes, std::uint32_t capacity, std::uint32_t* count) = nullptr;
     std::uint32_t (*m_copyThreads)(HACDBG_CORE* core, HACDBG_CORE_THREAD* threads, std::uint32_t capacity, std::uint32_t* count) = nullptr;
     std::uint32_t (*m_copyStack)(HACDBG_CORE* core, HACDBG_CORE_STACK_FRAME* frames, std::uint32_t capacity, std::uint32_t* count) = nullptr;
+    std::uint32_t (*m_copyStackWindow)(HACDBG_CORE* core, HACDBG_CORE_STACK_WINDOW* window) = nullptr;
     std::uint32_t (*m_copyMemory)(HACDBG_CORE* core, HACDBG_CORE_MEMORY* memory) = nullptr;
     std::uint32_t (*m_copyDisassembly)(HACDBG_CORE* core, HACDBG_CORE_INSTRUCTION* instructions, std::uint32_t capacity, std::uint32_t* count) = nullptr;
     std::uint32_t (*m_copyResolvedAddress)(HACDBG_CORE* core, HACDBG_CORE_RESOLVED_ADDRESS* address) = nullptr;

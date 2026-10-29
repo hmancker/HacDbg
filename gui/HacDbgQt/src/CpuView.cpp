@@ -88,7 +88,7 @@ CpuView::CpuView(QWidget* parent)
     auto* stackLayout = new QVBoxLayout(stackPane);
     stackLayout->setContentsMargins(0, 0, 0, 0);
     stackLayout->setSpacing(2);
-    m_stackStatus = new QLabel(QStringLiteral("调用栈"), stackPane);
+    m_stackStatus = new QLabel(QStringLiteral("堆栈"), stackPane);
     m_stack = new StackView(stackPane);
     stackLayout->addWidget(m_stackStatus);
     stackLayout->addWidget(m_stack, 1);
@@ -183,7 +183,7 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
     {
         if (m_paused)
         {
-            m_stack->setFrames(nullptr, 0);
+            m_stack->setSnapshot(nullptr, 0, 0, 0, nullptr, 0);
             m_stackStatus->setText(QStringLiteral("没有暂停线程"));
         }
 
@@ -243,7 +243,6 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
     if (stackFresh)
     {
         m_stackStale = false;
-        m_stack->setTopSymbol(m_stack->adjustedTopSymbol(rip));
     }
     else if (m_stackRequest != 0)
     {
@@ -452,7 +451,7 @@ void CpuView::poll()
 
         if (status.Failed != 0)
         {
-            m_stack->setFrames(nullptr, 0);
+            m_stack->setSnapshot(nullptr, 0, 0, 0, nullptr, 0);
             m_stackStatus->setText(fromField(status.Message, HACDBG_CORE_MESSAGE_SIZE));
         }
         else
@@ -476,7 +475,10 @@ void CpuView::poll()
             }
             else
             {
-                m_stack->setFrames(frames, count);
+                HACDBG_CORE_STACK_WINDOW window = {};
+                const bool haveWindow = m_session->copyStackWindow(&window);
+                m_stack->setSnapshot(frames, count, haveWindow ? window.Address : 0, haveWindow ? window.Rsp : m_lastRsp,
+                                     haveWindow ? window.Data : nullptr, haveWindow ? window.BytesValid : 0);
                 m_stackRsp = m_lastRsp;
                 m_stackCr3 = m_pausedCr3;
                 m_stackStale = false;
@@ -638,7 +640,6 @@ void CpuView::flushStack()
     if (m_stack->hasFrames() && m_stackRsp == m_lastRsp && m_stackCr3 == m_pausedCr3)
     {
         m_stackStale = false;
-        m_stack->setTopSymbol(m_stack->adjustedTopSymbol(m_lastRip));
         return;
     }
 

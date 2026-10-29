@@ -124,7 +124,8 @@ namespace commands
 		std::uint8_t processes(std::vector<process_t>& processes_out, std::string& error_out);
 		std::uint8_t threads(std::uint64_t eprocess, std::vector<thread_t>& threads_out,
 		                     std::uint8_t& truncated_out, std::string& error_out);
-		std::uint8_t stack(std::uint32_t frame_count, std::vector<stack_frame_t>& frames_out, std::string& error_out);
+		std::uint8_t stack(std::uint32_t frame_count, std::vector<stack_frame_t>& frames_out, memory_t& window_out,
+		                   std::uint64_t& rsp_out, std::string& error_out);
 		std::uint8_t read_memory(std::uint64_t address, std::uint64_t cr3, std::uint32_t size, memory_t& memory_out,
 		                         std::string& error_out);
 		std::uint8_t disassemble(std::uint64_t address, std::uint64_t cr3, std::uint32_t instruction_count,

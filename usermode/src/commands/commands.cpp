@@ -8088,6 +8088,8 @@ static std::uint8_t canonical_code_address(const std::uint64_t address)
 	return static_cast<std::uint8_t>(address != 0 && (sign == 0 || sign == 0x1FFFFull));
 }
 
+static std::uint8_t instruction_before_is_call(std::uint64_t address, std::uint64_t extra_cr3);
+
 static std::uint8_t gpr_index(const ZydisRegister reg, std::uint8_t& index_out)
 {
 	const ZydisRegister largest = ZydisRegisterGetLargestEnclosing(ZYDIS_MACHINE_MODE_LONG_64, reg);
@@ -8626,20 +8628,15 @@ static std::uint8_t unwind_with_pdata(std::vector<stack_module_t>& modules, stac
 		return 0;
 	}
 
-	child_sp_out = regs.rsp;
-	ret_out = ret;
-	regs.rsp += 8;
-	regs.rip = ret;
-
-	return 1;
-}
-
-static std::uint8_t leaf_unwind(stack_regs_t& regs, const std::uint64_t extra_cr3, std::uint64_t& child_sp_out, std::uint64_t& ret_out)
-{
-	std::uint64_t ret = 0;
-
-	if ((regs.rsp & 7) != 0 || read_paused_block(regs.rsp, &ret, sizeof(ret), extra_cr3) == 0 || canonical_code_address(ret) == 0)
+	//
+	// Unwind info can still point at a slot written by push. Keep the frame
+	// only when that slot is the instruction after a call. An unreadable
+	// predecessor stays, because the unwind codes already named the slot.
+	//
+	if (instruction_before_is_call(ret, extra_cr3) == 0)
 	{
+		regs = saved;
+
 		return 0;
 	}
 
@@ -8649,6 +8646,103 @@ static std::uint8_t leaf_unwind(stack_regs_t& regs, const std::uint64_t extra_cr
 	regs.rip = ret;
 
 	return 1;
+}
+
+static std::uint8_t instruction_before_is_call(const std::uint64_t address, const std::uint64_t extra_cr3)
+{
+	constexpr std::uint64_t kBack = 15;
+
+	if (canonical_code_address(address) == 0 || address < 2)
+	{
+		return 0;
+	}
+
+	std::uint8_t bytes[kBack] = {};
+	std::uint64_t available = 0;
+
+	if (address >= kBack && read_paused_block(address - kBack, bytes, kBack, extra_cr3) == 1)
+	{
+		available = kBack;
+	}
+	else if (address >= 5 && read_paused_block(address - 5, bytes + (kBack - 5), 5, extra_cr3) == 1)
+	{
+		available = 5;
+	}
+	else
+	{
+		return 2;
+	}
+
+	ZydisDecoder decoder = {};
+
+	if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64)))
+	{
+		return 2;
+	}
+
+	std::uint8_t matched = 0;
+	std::uint64_t best = 0;
+
+	for (std::uint64_t length = 1; length <= available; length++)
+	{
+		ZydisDecoderContext context = {};
+		ZydisDecodedInstruction instruction = {};
+		const std::uint8_t* const start = bytes + (kBack - length);
+
+		if (ZYAN_FAILED(ZydisDecoderDecodeInstruction(&decoder, &context, start, length, &instruction)))
+		{
+			continue;
+		}
+
+		if (instruction.length != length || length < best)
+		{
+			continue;
+		}
+
+		best = length;
+		matched = static_cast<std::uint8_t>(instruction.mnemonic == ZYDIS_MNEMONIC_CALL);
+	}
+
+	return matched;
+}
+
+static std::uint8_t leaf_unwind(stack_regs_t& regs, const std::uint64_t extra_cr3, std::uint64_t& child_sp_out, std::uint64_t& ret_out)
+{
+	constexpr std::uint32_t kSlots = 16;
+
+	if ((regs.rsp & 7) != 0)
+	{
+		return 0;
+	}
+
+	//
+	// A push stores a register. Skip those slots and take the first value
+	// whose preceding instruction is a call. That is the return address.
+	//
+	for (std::uint32_t slot = 0; slot < kSlots; slot++)
+	{
+		const std::uint64_t address = regs.rsp + static_cast<std::uint64_t>(slot) * 8;
+		std::uint64_t ret = 0;
+
+		if (read_paused_block(address, &ret, sizeof(ret), extra_cr3) == 0)
+		{
+			return 0;
+		}
+
+		if (instruction_before_is_call(ret, extra_cr3) != 1)
+		{
+			continue;
+		}
+
+		child_sp_out = address;
+		ret_out = ret;
+		regs.rsp = address + 8;
+		regs.rip = ret;
+
+		return 1;
+	}
+
+	return 0;
 }
 
 static void collect_stack_modules(const std::uint64_t cr3, std::vector<stack_module_t>& modules_out, std::uint64_t& extra_cr3_out)
@@ -10136,9 +10230,11 @@ std::uint8_t commands::views::threads(const std::uint64_t eprocess, std::vector<
 }
 
 std::uint8_t commands::views::stack(const std::uint32_t frame_count, std::vector<stack_frame_t>& frames_out,
-                                    std::string& error_out)
+                                    memory_t& window_out, std::uint64_t& rsp_out, std::string& error_out)
 {
 	frames_out.clear();
+	window_out = {};
+	rsp_out = 0;
 	error_out.clear();
 
 	if (breakpoint::has_paused_thread() == 0)
@@ -10202,6 +10298,24 @@ std::uint8_t commands::views::stack(const std::uint32_t frame_count, std::vector
 		error_out = "failed to read the stack";
 
 		return 0;
+	}
+
+	rsp_out = registers.rsp;
+
+	//
+	// One contiguous read keeps the qword dump off the command path. Skip it
+	// when a step is already waiting so this walk does not grow the wait.
+	//
+	if (preempt_view() == 0)
+	{
+		constexpr std::uint32_t kStackWindowBytes = 4096;
+		const std::uint64_t base = registers.rsp & ~static_cast<std::uint64_t>(7);
+		std::string memory_error = {};
+
+		if (base != 0 && read_memory(base, registers.cr3, kStackWindowBytes, window_out, memory_error) == 0)
+		{
+			window_out = {};
+		}
 	}
 
 	return 1;

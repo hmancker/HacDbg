@@ -24,6 +24,7 @@ EXPORTS
     HacDbgCoreCopyProcesses
     HacDbgCoreCopyThreads
     HacDbgCoreCopyStack
+    HacDbgCoreCopyStackWindow
     HacDbgCoreCopyMemory
     HacDbgCoreCopyDisassembly
     HacDbgCoreCopyResolvedAddress

@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define HACDBG_CORE_API_VERSION 5u
+#define HACDBG_CORE_API_VERSION 6u
 #define HACDBG_CORE_MAX_MONITORS 64u
 #define HACDBG_CORE_MONITOR_STACK 5u
 #define HACDBG_CORE_MAX_BREAKPOINTS 64u
@@ -96,7 +96,8 @@ typedef enum _HACDBG_CORE_STRUCTURE
     HacDbgStructureCompletion = 10,
     HacDbgStructureCompletionStatus = 11,
     HacDbgStructureMonitor = 12,
-    HacDbgStructureMonitorHit = 13
+    HacDbgStructureMonitorHit = 13,
+    HacDbgStructureStackWindow = 14
 } HACDBG_CORE_STRUCTURE;
 
 /**
@@ -268,6 +269,21 @@ typedef struct _HACDBG_CORE_STACK_FRAME
     char Symbol[HACDBG_CORE_SYMBOL_SIZE];
 } HACDBG_CORE_STACK_FRAME;
 
+/**
+ * @brief Qwords on the paused thread's stack, read from an aligned RSP.
+ *
+ * @details Address is 8-byte aligned and is the first byte of Data. Rsp is the
+ * paused stack pointer. BytesValid is the number of readable bytes in Data.
+ */
+typedef struct _HACDBG_CORE_STACK_WINDOW
+{
+    uint64_t Address;
+    uint64_t Rsp;
+    uint32_t BytesValid;
+    uint32_t Reserved;
+    uint8_t Data[HACDBG_CORE_MAX_MEMORY_BYTES];
+} HACDBG_CORE_STACK_WINDOW;
+
 typedef struct _HACDBG_CORE_MEMORY
 {
     uint64_t Address;
@@ -381,6 +397,7 @@ uint32_t HacDbgCoreCopyThreads(HACDBG_CORE* Core, HACDBG_CORE_THREAD* Threads, u
                                uint32_t* CountOut);
 uint32_t HacDbgCoreCopyStack(HACDBG_CORE* Core, HACDBG_CORE_STACK_FRAME* Frames, uint32_t Capacity,
                              uint32_t* CountOut);
+uint32_t HacDbgCoreCopyStackWindow(HACDBG_CORE* Core, HACDBG_CORE_STACK_WINDOW* WindowOut);
 uint32_t HacDbgCoreCopyMemory(HACDBG_CORE* Core, HACDBG_CORE_MEMORY* MemoryOut);
 uint32_t HacDbgCoreCopyDisassembly(HACDBG_CORE* Core, HACDBG_CORE_INSTRUCTION* Instructions,
                                    uint32_t Capacity, uint32_t* CountOut);

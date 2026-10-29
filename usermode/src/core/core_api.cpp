@@ -96,6 +96,7 @@ struct HACDBG_CORE
 	HACDBG_CORE_STACK_FRAME stack[HACDBG_CORE_MAX_STACK_FRAMES] = {};
 	std::uint32_t stack_count = 0;
 	std::uint32_t stack_truncated = 0;
+	HACDBG_CORE_STACK_WINDOW stack_window = {};
 
 	HACDBG_CORE_MEMORY memory = {};
 	HACDBG_CORE_INSTRUCTION disassembly[HACDBG_CORE_MAX_DISASSEMBLY_LINES] = {};
@@ -460,8 +461,10 @@ namespace
 		case HacDbgViewStack:
 		{
 			std::vector<commands::views::stack_frame_t> frames = {};
+			commands::views::memory_t window = {};
+			std::uint64_t rsp = 0;
 
-			if (commands::views::stack(request.arg2, frames, error) == 0)
+			if (commands::views::stack(request.arg2, frames, window, rsp, error) == 0)
 			{
 				publish_view_error(core, request, error);
 
@@ -490,6 +493,18 @@ namespace
 
 			core->stack_count = count;
 			core->stack_truncated = static_cast<std::uint32_t>(frames.size() > count);
+			core->stack_window = {};
+			core->stack_window.Address = window.address;
+			core->stack_window.Rsp = rsp;
+			const std::uint32_t window_bytes = static_cast<std::uint32_t>(
+				(std::min)(window.bytes.size(), static_cast<std::size_t>(HACDBG_CORE_MAX_MEMORY_BYTES)));
+			core->stack_window.BytesValid = window_bytes;
+
+			if (window_bytes != 0)
+			{
+				std::memcpy(core->stack_window.Data, window.bytes.data(), window_bytes);
+			}
+
 			complete_view_locked(core, request, count, core->stack_truncated, error);
 
 			return;
@@ -1179,6 +1194,9 @@ uint32_t HacDbgCoreStructureSize(const uint32_t structure)
 	case HacDbgStructureMonitorHit:
 		return static_cast<uint32_t>(sizeof(HACDBG_CORE_MONITOR_HIT));
 
+	case HacDbgStructureStackWindow:
+		return static_cast<uint32_t>(sizeof(HACDBG_CORE_STACK_WINDOW));
+
 	default:
 		return 0;
 	}
@@ -1705,6 +1723,19 @@ uint32_t HacDbgCoreCopyStack(HACDBG_CORE* const core, HACDBG_CORE_STACK_FRAME* c
 	}
 
 	*count_out = count;
+
+	return HacDbgCoreStatusOk;
+}
+
+uint32_t HacDbgCoreCopyStackWindow(HACDBG_CORE* const core, HACDBG_CORE_STACK_WINDOW* const window_out)
+{
+	if (core == nullptr || window_out == nullptr)
+	{
+		return HacDbgCoreStatusArgument;
+	}
+
+	std::lock_guard<std::mutex> lock(core->view_mutex);
+	*window_out = core->stack_window;
 
 	return HacDbgCoreStatusOk;
 }

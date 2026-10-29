@@ -101,6 +101,7 @@ int CoreSession::checkAbi(const wchar_t* directory, QString* error)
                         structureMatches(structureSize, HacDbgStructureProcess, sizeof(HACDBG_CORE_PROCESS)) &&
                         structureMatches(structureSize, HacDbgStructureThread, sizeof(HACDBG_CORE_THREAD)) &&
                         structureMatches(structureSize, HacDbgStructureStackFrame, sizeof(HACDBG_CORE_STACK_FRAME)) &&
+                        structureMatches(structureSize, HacDbgStructureStackWindow, sizeof(HACDBG_CORE_STACK_WINDOW)) &&
                         structureMatches(structureSize, HacDbgStructureMemory, sizeof(HACDBG_CORE_MEMORY)) &&
                         structureMatches(structureSize, HacDbgStructureInstruction, sizeof(HACDBG_CORE_INSTRUCTION)) &&
                         structureMatches(structureSize, HacDbgStructureResolvedAddress, sizeof(HACDBG_CORE_RESOLVED_ADDRESS)) &&
@@ -176,6 +177,7 @@ bool CoreSession::load(const QString& directory, QString* error)
         bindProc(module, "HacDbgCoreCopyProcesses", &m_copyProcesses) &&
         bindProc(module, "HacDbgCoreCopyThreads", &m_copyThreads) &&
         bindProc(module, "HacDbgCoreCopyStack", &m_copyStack) &&
+        bindProc(module, "HacDbgCoreCopyStackWindow", &m_copyStackWindow) &&
         bindProc(module, "HacDbgCoreCopyMemory", &m_copyMemory) &&
         bindProc(module, "HacDbgCoreCopyDisassembly", &m_copyDisassembly) &&
         bindProc(module, "HacDbgCoreCopyResolvedAddress", &m_copyResolvedAddress) &&
@@ -458,6 +460,12 @@ bool CoreSession::copyStack(HACDBG_CORE_STACK_FRAME* frames, std::uint32_t capac
 {
     return m_started && m_copyStack != nullptr &&
            m_copyStack(m_core, frames, capacity, count) == HacDbgCoreStatusOk;
+}
+
+bool CoreSession::copyStackWindow(HACDBG_CORE_STACK_WINDOW* window) const
+{
+    return m_started && m_copyStackWindow != nullptr && window != nullptr &&
+           m_copyStackWindow(m_core, window) == HacDbgCoreStatusOk;
 }
 
 bool CoreSession::copyMemory(HACDBG_CORE_MEMORY* memory) const

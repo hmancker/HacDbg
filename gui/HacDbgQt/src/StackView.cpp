@@ -2,131 +2,364 @@
 
 #include "Format.h"
 
-#include <QHeaderView>
-#include <QStandardItem>
-#include <QStandardItemModel>
+#include <QEvent>
+#include <QMouseEvent>
+#include <QPainter>
+#include <QScrollBar>
+
+#include <algorithm>
+#include <cstring>
+
+namespace
+{
+constexpr std::uint64_t kUserAddressLimit = 0x00007FFFFFFFFFFFull;
+
+QString hexSlot(std::uint64_t value)
+{
+    return QStringLiteral("%1").arg(value, 16, 16, QLatin1Char('0')).toUpper();
+}
+
+}
+
+void StackView::addRow(std::uint64_t address, std::uint64_t value, std::uint64_t rsp, const std::vector<Note>& notes,
+                       const std::vector<Span>& spans)
+{
+    Row row;
+    row.address = address;
+    row.value = value;
+    row.rsp = rsp != 0 && address == (rsp & ~static_cast<std::uint64_t>(7));
+
+    for (const Note& note : notes)
+    {
+        if (note.slot == address)
+        {
+            row.comment = note.text;
+            row.isReturn = true;
+            break;
+        }
+    }
+
+    for (const Span& span : spans)
+    {
+        if (address < span.start || address >= span.end)
+        {
+            continue;
+        }
+
+        row.kernel = span.kernel;
+
+        if (address == span.start)
+        {
+            row.bracket |= 1;
+        }
+
+        if (address + 8 >= span.end)
+        {
+            row.bracket |= 2;
+        }
+
+        if (row.bracket == 0)
+        {
+            row.bracket = 4;
+        }
+
+        break;
+    }
+
+    m_rows.push_back(std::move(row));
+}
 
 StackView::StackView(QWidget* parent)
-    : QTableView(parent)
+    : QAbstractScrollArea(parent)
 {
     QFont font(QStringLiteral("Cascadia Mono"));
     font.setStyleHint(QFont::Monospace);
     font.setPointSize(10);
     setFont(font);
-    setShowGrid(false);
-    setSelectionBehavior(QAbstractItemView::SelectRows);
-    setSelectionMode(QAbstractItemView::SingleSelection);
-    setEditTriggers(QAbstractItemView::NoEditTriggers);
-    verticalHeader()->hide();
-    horizontalHeader()->setStretchLastSection(true);
-    m_model = new QStandardItemModel(this);
-    m_model->setHorizontalHeaderLabels({QStringLiteral("#"), QStringLiteral("Child SP"), QStringLiteral("返回"), QStringLiteral("符号")});
-    setModel(m_model);
-    connect(this, &QTableView::doubleClicked, this, [this](const QModelIndex& index)
-    {
-        if (index.row() >= 0 && index.row() < static_cast<int>(m_addresses.size()))
-        {
-            emit addressActivated(m_addresses[static_cast<std::size_t>(index.row())]);
-        }
-    });
+    setFocusPolicy(Qt::StrongFocus);
+    setFrameShape(QFrame::NoFrame);
+    viewport()->installEventFilter(this);
+    QPalette pal = viewport()->palette();
+    pal.setColor(QPalette::Base, QColor(0xFF, 0xF8, 0xF0));
+    viewport()->setPalette(pal);
+    viewport()->setAutoFillBackground(true);
 }
 
-void StackView::setFrames(const HACDBG_CORE_STACK_FRAME* frames, std::uint32_t count)
+void StackView::setSnapshot(const HACDBG_CORE_STACK_FRAME* frames, std::uint32_t count, std::uint64_t base,
+                            std::uint64_t rsp, const std::uint8_t* bytes, std::uint32_t byteCount)
 {
-    m_model->removeRows(0, m_model->rowCount());
-    m_addresses.clear();
-    m_topRip = 0;
-    m_topSymbol.clear();
+    std::vector<Note> notes;
+    std::vector<Span> spans;
+    std::vector<std::uint32_t> order;
 
-    if (frames == nullptr || count == 0)
+    m_rows.clear();
+    m_selected = -1;
+
+    if (frames != nullptr && count > 0)
     {
-        return;
-    }
+        notes.reserve(count);
+        order.reserve(count);
 
-    m_topRip = frames[0].InstructionPointer;
-    m_topSymbol = fromField(frames[0].Symbol, HACDBG_CORE_SYMBOL_SIZE);
+        for (std::uint32_t index = 0; index < count; ++index)
+        {
+            order.push_back(index);
+            const HACDBG_CORE_STACK_FRAME& frame = frames[index];
 
-    for (std::uint32_t index = 0; index < count; ++index)
-    {
-        const HACDBG_CORE_STACK_FRAME& frame = frames[index];
-        const std::uint64_t address = frame.HasReturn != 0 ? frame.ReturnAddress : frame.InstructionPointer;
-        m_addresses.push_back(address);
-        const QString symbol = fromField(frame.Symbol, HACDBG_CORE_SYMBOL_SIZE);
-        m_model->appendRow({
-            new QStandardItem(QStringLiteral("%1").arg(index, 2, 10, QLatin1Char('0'))),
-            new QStandardItem(hex16(frame.ChildSp)),
-            new QStandardItem(frame.HasReturn != 0 ? hex16(frame.ReturnAddress) : QStringLiteral("????????????????")),
-            new QStandardItem(symbol),
+            if (frame.HasReturn == 0 || frame.ChildSp == 0)
+            {
+                continue;
+            }
+
+            QString target;
+
+            if (index + 1 < count)
+            {
+                target = fromField(frames[index + 1].Symbol, HACDBG_CORE_SYMBOL_SIZE);
+            }
+
+            if (target.isEmpty())
+            {
+                target = hexSlot(frame.ReturnAddress);
+            }
+
+            notes.push_back(Note{frame.ChildSp, QStringLiteral("return to ") + target});
+        }
+
+        std::sort(order.begin(), order.end(), [frames](std::uint32_t left, std::uint32_t right)
+        {
+            return frames[left].ChildSp < frames[right].ChildSp;
         });
+
+        for (std::size_t index = 0; index < order.size(); ++index)
+        {
+            const HACDBG_CORE_STACK_FRAME& frame = frames[order[index]];
+
+            if (frame.HasReturn == 0 || frame.ChildSp == 0)
+            {
+                continue;
+            }
+
+            std::uint64_t end = frame.ChildSp + 8;
+
+            for (std::size_t next = index + 1; next < order.size(); ++next)
+            {
+                const std::uint64_t child = frames[order[next]].ChildSp;
+
+                if (child > frame.ChildSp)
+                {
+                    end = child;
+                    break;
+                }
+            }
+
+            spans.push_back(Span{frame.ChildSp, end, frame.InstructionPointer > kUserAddressLimit});
+        }
     }
+
+    if (bytes != nullptr && byteCount >= 8 && base != 0)
+    {
+        const std::uint32_t usable = byteCount & ~std::uint32_t{7};
+        m_rows.reserve(usable / 8);
+
+        for (std::uint32_t offset = 0; offset < usable; offset += 8)
+        {
+            std::uint64_t value = 0;
+            std::memcpy(&value, bytes + offset, sizeof(value));
+            addRow(base + offset, value, rsp, notes, spans);
+        }
+    }
+    else
+    {
+        for (const Note& note : notes)
+        {
+            std::uint64_t value = 0;
+
+            for (std::uint32_t index = 0; frames != nullptr && index < count; ++index)
+            {
+                if (frames[index].ChildSp == note.slot && frames[index].HasReturn != 0)
+                {
+                    value = frames[index].ReturnAddress;
+                    break;
+                }
+            }
+
+            addRow(note.slot, value, rsp, notes, spans);
+        }
+    }
+
+    updateScroll();
+    verticalScrollBar()->setValue(0);
+    viewport()->update();
 }
 
 bool StackView::hasFrames() const
 {
-    return m_model->rowCount() > 0;
+    return m_rows.empty() == false;
 }
 
-void StackView::setTopSymbol(const QString& symbol)
+void StackView::resizeEvent(QResizeEvent* event)
 {
-    QStandardItem* item = m_model->item(0, 3);
-
-    if (item == nullptr || item->text() == symbol)
-    {
-        return;
-    }
-
-    item->setText(symbol);
+    QAbstractScrollArea::resizeEvent(event);
+    updateScroll();
 }
 
-QString StackView::adjustedTopSymbol(std::uint64_t rip) const
+bool StackView::eventFilter(QObject* watched, QEvent* event)
 {
-    if (m_topSymbol.isEmpty() || rip == 0 || rip == m_topRip || m_topSymbol.contains(QLatin1Char('!')) == false)
+    if (watched != viewport())
     {
-        return m_topSymbol;
+        return QAbstractScrollArea::eventFilter(watched, event);
     }
 
-    QString name = m_topSymbol;
-    std::uint64_t displacement = 0;
-    const int plus = m_topSymbol.lastIndexOf(QStringLiteral("+0x"));
-    const int bang = m_topSymbol.indexOf(QLatin1Char('!'));
-
-    if (plus > bang)
+    if (event->type() == QEvent::MouseButtonPress)
     {
-        bool ok = false;
-        displacement = m_topSymbol.mid(plus + 3).toULongLong(&ok, 16);
+        auto* mouse = static_cast<QMouseEvent*>(event);
+        const int row = rowAt(static_cast<int>(mouse->position().y()));
 
-        if (ok == false || m_topRip < displacement)
+        if (row >= 0)
         {
-            return m_topSymbol;
+            m_selected = row;
+            setFocus(Qt::MouseFocusReason);
+            viewport()->update();
         }
 
-        name = m_topSymbol.left(plus);
+        return true;
     }
 
-    const std::uint64_t base = m_topRip - displacement;
-
-    if (rip < base)
+    if (event->type() == QEvent::MouseButtonDblClick)
     {
-        return m_topSymbol;
+        auto* mouse = static_cast<QMouseEvent*>(event);
+        const int row = rowAt(static_cast<int>(mouse->position().y()));
+
+        if (row >= 0 && m_rows[static_cast<std::size_t>(row)].value != 0)
+        {
+            m_selected = row;
+            viewport()->update();
+            emit addressActivated(m_rows[static_cast<std::size_t>(row)].value);
+        }
+
+        return true;
     }
 
-    const std::uint64_t updated = rip - base;
-
-    //
-    // A jump that stays at the same RSP can land in another function. Keep
-    // the previous text instead of showing a huge displacement.
-    //
-    constexpr std::uint64_t kMaxAdjustedDisplacement = 0x1000000;
-
-    if (updated > kMaxAdjustedDisplacement)
+    if (event->type() != QEvent::Paint)
     {
-        return m_topSymbol;
+        return QAbstractScrollArea::eventFilter(watched, event);
     }
 
-    if (updated == 0)
+    QPainter painter(viewport());
+    paintRows(painter);
+    return true;
+}
+
+int StackView::rowHeight() const
+{
+    return fontMetrics().height() + 4;
+}
+
+int StackView::rowAt(int y) const
+{
+    if (y < 0 || m_rows.empty())
     {
-        return name;
+        return -1;
     }
 
-    return name + QStringLiteral("+0x") + QString::number(updated, 16);
+    const int row = verticalScrollBar()->value() + y / rowHeight();
+
+    if (row < 0 || row >= static_cast<int>(m_rows.size()))
+    {
+        return -1;
+    }
+
+    return row;
+}
+
+void StackView::updateScroll()
+{
+    const int visible = qMax(1, viewport()->height() / rowHeight());
+    verticalScrollBar()->setRange(0, qMax(0, static_cast<int>(m_rows.size()) - visible));
+    verticalScrollBar()->setPageStep(visible);
+    verticalScrollBar()->setSingleStep(1);
+}
+
+void StackView::paintRows(QPainter& painter) const
+{
+    painter.fillRect(viewport()->rect(), QColor(0xFF, 0xF8, 0xF0));
+    painter.setFont(font());
+    const int height = rowHeight();
+    const QFontMetrics metrics(font());
+    const int addressWidth = metrics.horizontalAdvance(QStringLiteral("0000000000000000")) + 8;
+    const int valueWidth = addressWidth;
+    const int bracketWidth = 12;
+    const int first = verticalScrollBar()->value();
+    const QColor returnColor(0xFF, 0x00, 0x00);
+
+    for (int row = first; row < static_cast<int>(m_rows.size()); ++row)
+    {
+        const int y = (row - first) * height;
+
+        if (y > viewport()->height())
+        {
+            break;
+        }
+
+        const Row& item = m_rows[static_cast<std::size_t>(row)];
+        const bool selected = row == m_selected;
+
+        if (selected)
+        {
+            painter.fillRect(0, y, viewport()->width(), height, QColor(0xC0, 0xC0, 0xC0));
+        }
+
+        if (item.rsp)
+        {
+            painter.fillRect(2, y, addressWidth, height, Qt::black);
+            painter.setPen(Qt::white);
+        }
+        else
+        {
+            painter.setPen(QColor(0x80, 0x80, 0x80));
+        }
+
+        painter.drawText(6, y, addressWidth - 4, height, Qt::AlignVCenter | Qt::AlignLeft, hexSlot(item.address));
+
+        const int bracketX = 4 + addressWidth;
+        const int valueX = bracketX + bracketWidth;
+
+        if (item.bracket != 0)
+        {
+            painter.setPen(QPen(item.kernel ? QColor(0x00, 0x00, 0xFF) : Qt::black, 2));
+            const int mid = y + height / 2;
+            const int tick = y + height / 4;
+            const int lower = y + (height * 3) / 4;
+
+            if ((item.bracket & 1) != 0)
+            {
+                painter.drawLine(bracketX + 7, tick, bracketX + 2, tick);
+                painter.drawLine(bracketX + 2, tick, bracketX + 2, mid);
+            }
+            else
+            {
+                painter.drawLine(bracketX + 2, y, bracketX + 2, mid);
+            }
+
+            if ((item.bracket & 2) != 0)
+            {
+                painter.drawLine(bracketX + 7, lower, bracketX + 2, lower);
+                painter.drawLine(bracketX + 2, lower, bracketX + 2, mid);
+            }
+            else
+            {
+                painter.drawLine(bracketX + 2, y + height, bracketX + 2, mid);
+            }
+        }
+
+        painter.setPen(item.isReturn ? returnColor : Qt::black);
+        painter.drawText(valueX, y, valueWidth, height, Qt::AlignVCenter | Qt::AlignLeft, hexSlot(item.value));
+
+        if (item.comment.isEmpty() == false)
+        {
+            painter.setPen(returnColor);
+            painter.drawText(valueX + valueWidth + 8, y, viewport()->width() - valueX - valueWidth - 12, height,
+                             Qt::AlignVCenter | Qt::AlignLeft, item.comment);
+        }
+    }
 }
