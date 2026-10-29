@@ -32,6 +32,8 @@
 namespace
 {
 constexpr std::uint32_t kExpectedHypercallAbi = 2;
+constexpr int kIdlePollMs = 100;
+constexpr int kStepPollMs = 16;
 
 enum DebugIcon
 {
@@ -155,17 +157,17 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     auto* viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
     viewMenu->addAction(QStringLiteral("实时 trace"), this, &MainWindow::openTrace);
     auto* debugMenu = menuBar()->addMenu(QStringLiteral("调试"));
-    debugMenu->addAction(debugIcon(IconContinue), QStringLiteral("继续"), this, [this] { executeCommand(QStringLiteral("g")); });
-    debugMenu->addAction(debugIcon(IconStepOver), QStringLiteral("步过"), this, [this] { executeCommand(QStringLiteral("p")); });
-    debugMenu->addAction(debugIcon(IconStepInto), QStringLiteral("步入"), this, [this] { executeCommand(QStringLiteral("t")); });
+    debugMenu->addAction(debugIcon(IconContinue), QStringLiteral("继续"), this, [this] { executeDebug(QStringLiteral("g")); });
+    debugMenu->addAction(debugIcon(IconStepOver), QStringLiteral("步过"), this, [this] { executeDebug(QStringLiteral("p")); });
+    debugMenu->addAction(debugIcon(IconStepInto), QStringLiteral("步入"), this, [this] { executeDebug(QStringLiteral("t")); });
     debugMenu->addAction(debugIcon(IconCancel), QStringLiteral("取消"), this, [this] { m_session.cancel(); });
 
     auto* toolbar = addToolBar(QStringLiteral("调试"));
     toolbar->setToolButtonStyle(Qt::ToolButtonIconOnly);
     toolbar->setIconSize(QSize(18, 18));
-    QAction* continueAction = toolbar->addAction(debugIcon(IconContinue), QStringLiteral("继续"), this, [this] { executeCommand(QStringLiteral("g")); });
-    QAction* stepOverAction = toolbar->addAction(debugIcon(IconStepOver), QStringLiteral("步过"), this, [this] { executeCommand(QStringLiteral("p")); });
-    QAction* stepIntoAction = toolbar->addAction(debugIcon(IconStepInto), QStringLiteral("步入"), this, [this] { executeCommand(QStringLiteral("t")); });
+    QAction* continueAction = toolbar->addAction(debugIcon(IconContinue), QStringLiteral("继续"), this, [this] { executeDebug(QStringLiteral("g")); });
+    QAction* stepOverAction = toolbar->addAction(debugIcon(IconStepOver), QStringLiteral("步过"), this, [this] { executeDebug(QStringLiteral("p")); });
+    QAction* stepIntoAction = toolbar->addAction(debugIcon(IconStepInto), QStringLiteral("步入"), this, [this] { executeDebug(QStringLiteral("t")); });
     QAction* cancelAction = toolbar->addAction(debugIcon(IconCancel), QStringLiteral("取消"), this, [this] { m_session.cancel(); });
     continueAction->setToolTip(debugTip(QStringLiteral("继续"), QKeySequence(Qt::Key_F5)));
     stepOverAction->setToolTip(debugTip(QStringLiteral("步过"), QKeySequence(Qt::Key_F10)));
@@ -233,13 +235,17 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     continueShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     stepOverShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     stepIntoShortcut->setContext(Qt::WidgetWithChildrenShortcut);
-    connect(continueShortcut, &QShortcut::activated, this, [this] { executeCommand(QStringLiteral("g")); });
-    connect(stepOverShortcut, &QShortcut::activated, this, [this] { executeCommand(QStringLiteral("p")); });
-    connect(stepIntoShortcut, &QShortcut::activated, this, [this] { executeCommand(QStringLiteral("t")); });
+    connect(continueShortcut, &QShortcut::activated, this, [this] { executeDebug(QStringLiteral("g")); });
+    connect(stepOverShortcut, &QShortcut::activated, this, [this] { executeDebug(QStringLiteral("p")); });
+    connect(stepIntoShortcut, &QShortcut::activated, this, [this] { executeDebug(QStringLiteral("t")); });
 
     m_timer = new QTimer(this);
-    m_timer->setInterval(100);
+    m_timer->setInterval(kIdlePollMs);
     connect(m_timer, &QTimer::timeout, this, &MainWindow::tick);
+    m_debugIdle = new QTimer(this);
+    m_debugIdle->setSingleShot(true);
+    m_debugIdle->setInterval(300);
+    connect(m_debugIdle, &QTimer::timeout, this, &MainWindow::refreshDebugViews);
 }
 
 MainWindow::~MainWindow()
@@ -279,6 +285,87 @@ void MainWindow::executeCommand(const QString& command)
 
     m_command->appendEcho(trimmed);
     m_session.execute(trimmed);
+}
+
+void MainWindow::executeDebug(const QString& command)
+{
+    const QString trimmed = command.trimmed();
+
+    if (trimmed.isEmpty())
+    {
+        return;
+    }
+
+    if (m_session.isStarted() == false)
+    {
+        m_command->appendLocalError(QStringLiteral("debugger is not connected"));
+        return;
+    }
+
+    if (m_debugBusy)
+    {
+        m_debugPending = trimmed;
+        return;
+    }
+
+    beginDebug(trimmed, true);
+}
+
+void MainWindow::beginDebug(const QString& command, bool echoNow)
+{
+    m_debugBusy = true;
+    m_debugFailed = false;
+    m_debugSerial = m_haveState ? m_state.CommandSequence : 0;
+    m_debugIdle->stop();
+    m_timer->setInterval(kStepPollMs);
+
+    if (m_cpu != nullptr)
+    {
+        m_cpu->setStepBurst(true);
+    }
+
+    //
+    // Queue the guest step before the command view lays out the previous
+    // transcript. The core thread runs that step while this thread inserts
+    // the text.
+    //
+    m_session.execute(command);
+
+    if (echoNow)
+    {
+        m_debugEcho.clear();
+        m_command->appendEcho(command);
+    }
+    else
+    {
+        m_debugEcho = command;
+    }
+}
+
+void MainWindow::finishDebugCommand(bool failed)
+{
+    m_debugBusy = false;
+    const QString pending = m_debugPending;
+    m_debugPending.clear();
+
+    if (failed == false && pending.isEmpty() == false && m_haveState && m_state.Paused != 0)
+    {
+        beginDebug(pending, false);
+        return;
+    }
+
+    m_timer->setInterval(kIdlePollMs);
+    m_debugIdle->start();
+}
+
+void MainWindow::refreshDebugViews()
+{
+    if (m_debugBusy || m_cpu == nullptr)
+    {
+        return;
+    }
+
+    m_cpu->setStepBurst(false);
 }
 
 void MainWindow::closeEvent(QCloseEvent* event)
@@ -340,30 +427,61 @@ void MainWindow::tick()
 {
     std::vector<CoreSession::OutputRecord> records;
     m_session.drainOutput(2000, &records);
+
+    if (m_debugBusy)
+    {
+        for (const CoreSession::OutputRecord& record : records)
+        {
+            if (record.kind != HacDbgOutputError)
+            {
+                continue;
+            }
+
+            if (record.text.contains(QStringLiteral("timed out waiting for the thread")) ||
+                record.text.contains(QStringLiteral("no paused thread")))
+            {
+                m_debugFailed = true;
+            }
+        }
+    }
+
+    if (m_session.isStarted())
+    {
+        HACDBG_CORE_SYMBOL_PROGRESS progress = {};
+
+        if (m_session.getSymbolProgress(&progress) && progress.Active != 0)
+        {
+            m_connection->setText(QStringLiteral("符号 %1/%2").arg(progress.Completed).arg(progress.Total));
+        }
+
+        HACDBG_CORE_STATE state = {};
+
+        if (m_session.getState(&state))
+        {
+            m_state = state;
+            m_haveState = true;
+
+            if (m_debugBusy && state.CommandSequence != m_debugSerial)
+            {
+                const bool failed = m_debugFailed;
+                m_debugFailed = false;
+                finishDebugCommand(failed);
+            }
+
+            updateState(state);
+            refreshVisiblePage();
+        }
+    }
+
     m_command->appendRecords(records);
+
+    if (m_debugEcho.isEmpty() == false)
+    {
+        m_command->appendEcho(m_debugEcho);
+        m_debugEcho.clear();
+    }
+
     m_command->pollCompletions(&m_session);
-
-    if (m_session.isStarted() == false)
-    {
-        return;
-    }
-
-    HACDBG_CORE_SYMBOL_PROGRESS progress = {};
-
-    if (m_session.getSymbolProgress(&progress) && progress.Active != 0)
-    {
-        m_connection->setText(QStringLiteral("符号 %1/%2").arg(progress.Completed).arg(progress.Total));
-    }
-
-    HACDBG_CORE_STATE state = {};
-
-    if (m_session.getState(&state))
-    {
-        m_state = state;
-        m_haveState = true;
-        updateState(state);
-        refreshVisiblePage();
-    }
 }
 
 void MainWindow::onTabChanged(int index)
@@ -441,6 +559,11 @@ void MainWindow::refreshVisiblePage()
     case PageDisassembly:
         if (m_cpu != nullptr)
         {
+            if (m_debugBusy)
+            {
+                m_cpu->setStepBurst(true);
+            }
+
             m_cpu->onState(m_state);
             m_cpu->poll();
         }

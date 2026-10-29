@@ -48,6 +48,10 @@ private:
     void startCore();
     void onStarted(quint32 status);
     void tick();
+    void executeDebug(const QString& command);
+    void beginDebug(const QString& command, bool echoNow);
+    void finishDebugCommand(bool failed);
+    void refreshDebugViews();
     void openTrace();
     void updateState(const HACDBG_CORE_STATE& state);
     void onTabChanged(int index);
@@ -70,6 +74,7 @@ private:
     QStackedWidget* m_stack = nullptr;
     QWidget* m_holders[6] = {};
     QTimer* m_timer = nullptr;
+    QTimer* m_debugIdle = nullptr;
     QLabel* m_connection = nullptr;
     QLabel* m_paused = nullptr;
     QLabel* m_cr3 = nullptr;
@@ -80,8 +85,13 @@ private:
     bool m_versionWarning = false;
     bool m_haveState = false;
     bool m_breakLatched = false;
+    bool m_debugBusy = false;
+    bool m_debugFailed = false;
     HACDBG_CORE_STATE m_state = {};
     std::uint64_t m_breakRip = 0;
+    std::uint32_t m_debugSerial = 0;
+    QString m_debugPending;
+    QString m_debugEcho;
     QString m_shownUserVersion;
     QString m_shownDriverVersion;
     std::uint64_t m_shownCr3 = 0;

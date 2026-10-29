@@ -309,19 +309,34 @@ void CommandView::focusInput()
 
 void CommandView::appendRecords(const std::vector<CoreSession::OutputRecord>& records)
 {
+    QString info;
+
     for (const CoreSession::OutputRecord& record : records)
     {
         switch (record.kind)
         {
         case HacDbgOutputClear:
+            info.clear();
             clearOutput();
             break;
 
         case HacDbgOutputQuit:
+            if (info.isEmpty() == false)
+            {
+                appendChunk(info, palette().color(QPalette::Text), true);
+                info.clear();
+            }
+
             emit quitRequested();
             break;
 
         case HacDbgOutputWarning:
+            if (info.isEmpty() == false)
+            {
+                appendChunk(info, palette().color(QPalette::Text), true);
+                info.clear();
+            }
+
             appendChunk(QStringLiteral("warn, ") + record.text +
                             (record.text.endsWith('\n') ? QString() : QStringLiteral("\n")),
                         QColor(0xB8, 0x86, 0x0B),
@@ -330,6 +345,12 @@ void CommandView::appendRecords(const std::vector<CoreSession::OutputRecord>& re
 
         case HacDbgOutputError:
         {
+            if (info.isEmpty() == false)
+            {
+                appendChunk(info, palette().color(QPalette::Text), true);
+                info.clear();
+            }
+
             QString text = record.text;
 
             if (text.startsWith(QStringLiteral("err,"), Qt::CaseInsensitive) == false)
@@ -347,16 +368,21 @@ void CommandView::appendRecords(const std::vector<CoreSession::OutputRecord>& re
         }
 
         case HacDbgOutputInfo:
-            appendChunk(record.text.endsWith('\n') ? record.text : record.text + QStringLiteral("\n"),
-                        palette().color(QPalette::Text),
-                        true);
+            info += record.text.endsWith('\n') ? record.text : record.text + QStringLiteral("\n");
             break;
 
         default:
-            appendChunk(record.text, palette().color(QPalette::Text), true);
+            info += record.text;
             break;
         }
     }
+
+    if (info.isEmpty())
+    {
+        return;
+    }
+
+    appendChunk(info, palette().color(QPalette::Text), true);
 }
 
 void CommandView::appendEcho(const QString& command)
@@ -583,36 +609,53 @@ void CommandView::appendChunk(const QString& text, const QColor& color, bool sca
 
     const bool follow = nearEnd();
     const int saved = m_output->verticalScrollBar()->value();
+    const bool perLine = scanLines && (text.contains(QStringLiteral("err,"), Qt::CaseInsensitive) ||
+                                       text.contains(QStringLiteral("[error]"), Qt::CaseInsensitive) ||
+                                       text.contains(QStringLiteral("warn,"), Qt::CaseInsensitive) ||
+                                       text.contains(QStringLiteral("[warning]"), Qt::CaseInsensitive));
+    m_output->setUpdatesEnabled(false);
     QTextCursor cursor(m_output->document());
     cursor.movePosition(QTextCursor::End);
     cursor.beginEditBlock();
-    int start = 0;
 
-    while (start <= text.size())
+    if (perLine == false)
     {
-        const int end = text.indexOf('\n', start);
-        const int stop = end < 0 ? text.size() : end;
-        const QString line = text.mid(start, stop - start);
         QTextCharFormat format;
-        format.setForeground(scanLines ? colorFor(line) : color);
+        format.setForeground(color);
         cursor.setCharFormat(format);
-        cursor.insertText(line);
+        cursor.insertText(text);
+    }
+    else
+    {
+        int start = 0;
 
-        if (end < 0)
+        while (start <= text.size())
         {
-            break;
-        }
+            const int end = text.indexOf('\n', start);
+            const int stop = end < 0 ? text.size() : end;
+            const QString line = text.mid(start, stop - start);
+            QTextCharFormat format;
+            format.setForeground(colorFor(line));
+            cursor.setCharFormat(format);
+            cursor.insertText(line);
 
-        cursor.insertText(QStringLiteral("\n"));
-        start = end + 1;
+            if (end < 0)
+            {
+                break;
+            }
 
-        if (start == text.size())
-        {
-            break;
+            cursor.insertText(QStringLiteral("\n"));
+            start = end + 1;
+
+            if (start == text.size())
+            {
+                break;
+            }
         }
     }
 
     cursor.endEditBlock();
+    m_output->setUpdatesEnabled(true);
 
     if (follow)
     {

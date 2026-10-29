@@ -1172,6 +1172,7 @@ struct unassemble_request_t
 	std::uint64_t start_address = 0;
 	std::uint64_t instruction_count = unassemble_default_instruction_count;
 	std::uint64_t end_address = 0;
+	std::uint32_t nearest_limit = 0;
 	std::uint8_t is_range = 0;
 };
 
@@ -1319,9 +1320,25 @@ static std::uint8_t parse_unassemble_request(const std::vector<std::string>& arg
 	return 1;
 }
 
-static std::unordered_map<std::uint64_t, std::string> make_symbol_index()
+static const std::unordered_map<std::uint64_t, std::string>& make_symbol_index()
 {
-	std::unordered_map<std::uint64_t, std::string> symbols = {};
+	static std::unordered_map<std::uint64_t, std::string> symbols = {};
+	static std::size_t cached_modules = 0;
+	static std::size_t cached_exports = 0;
+	std::size_t exports = 0;
+
+	for (const auto& [module_name, module_info] : sys::kernel::modules_list)
+	{
+		(void)module_name;
+		exports += module_info.exports.size();
+	}
+
+	if (cached_modules == sys::kernel::modules_list.size() && cached_exports == exports)
+	{
+		return symbols;
+	}
+
+	symbols.clear();
 
 	for (const auto& [module_name, module_info] : sys::kernel::modules_list)
 	{
@@ -1332,6 +1349,9 @@ static std::unordered_map<std::uint64_t, std::string> make_symbol_index()
 
 		symbols.emplace(module_info.base_address, module_name);
 	}
+
+	cached_modules = sys::kernel::modules_list.size();
+	cached_exports = exports;
 
 	return symbols;
 }
@@ -1452,9 +1472,13 @@ static std::uint8_t build_disassembly(const unassemble_request_t& request, const
 		}
 	}
 
-	const std::unordered_map<std::uint64_t, std::string> symbols = make_symbol_index();
+	const std::unordered_map<std::uint64_t, std::string>& symbols = make_symbol_index();
 	std::uint64_t offset = 0;
 	std::uint64_t shown = 0;
+	std::uint64_t symbol_cover_base = 0;
+	std::uint64_t symbol_cover_end = 0;
+	std::string symbol_cover_name = {};
+	std::uint32_t nearest_queries = 0;
 
 	while (offset < bytes_read)
 	{
@@ -1484,19 +1508,48 @@ static std::uint8_t build_disassembly(const unassemble_request_t& request, const
 		instruction.address = instruction_address;
 
 		const auto symbol = symbols.find(instruction_address);
+		const std::uint8_t inside_cover = static_cast<std::uint8_t>(
+			symbol_cover_end > symbol_cover_base && instruction_address >= symbol_cover_base &&
+			instruction_address < symbol_cover_end);
 
 		if (symbol != symbols.end())
 		{
 			instruction.symbol = symbol->second;
 		}
-		else
+		else if (inside_cover == 1)
+		{
+			if (instruction_address == symbol_cover_base)
+			{
+				instruction.symbol = symbol_cover_name;
+			}
+		}
+		else if (request.nearest_limit == 0 || nearest_queries < request.nearest_limit)
 		{
 			std::string pdb_name = {};
 			std::uint64_t pdb_displacement = 0;
+			std::uint64_t pdb_size = 0;
 
-			if (symbol_parser::nearest(instruction_address, pdb_name, pdb_displacement) == 1 && pdb_displacement == 0)
+			nearest_queries += 1;
+
+			if (symbol_parser::nearest_span(instruction_address, pdb_name, pdb_displacement, pdb_size) == 1)
 			{
-				instruction.symbol = pdb_name;
+				if (pdb_displacement == 0)
+				{
+					instruction.symbol = pdb_name;
+				}
+
+				if (pdb_size > pdb_displacement && instruction_address >= pdb_displacement)
+				{
+					const std::uint64_t base = instruction_address - pdb_displacement;
+					const std::uint64_t end = base + pdb_size;
+
+					if (end > base)
+					{
+						symbol_cover_base = base;
+						symbol_cover_end = end;
+						symbol_cover_name = std::move(pdb_name);
+					}
+				}
 			}
 		}
 
@@ -2599,17 +2652,34 @@ static std::string format_eflags(const std::uint64_t flags)
 
 static void print_paused_registers(const breakpoint::registers_t& registers)
 {
-	output::print("rax={:016x} rbx={:016x} rcx={:016x}\n", registers.rax, registers.rbx, registers.rcx);
-	output::print("rdx={:016x} rsi={:016x} rdi={:016x}\n", registers.rdx, registers.rsi, registers.rdi);
-	output::print("rip={} rsp={} rbp={:016x}\n", format_windbg_address(registers.rip), format_windbg_address(registers.rsp),
-	           registers.rbp);
-	output::print(" r8={:016x}  r9={:016x} r10={:016x}\n", registers.r8, registers.r9, registers.r10);
-	output::print("r11={:016x} r12={:016x} r13={:016x}\n", registers.r11, registers.r12, registers.r13);
-	output::print("r14={:016x} r15={:016x}\n", registers.r14, registers.r15);
+	const std::string rip = format_windbg_address(registers.rip);
+	const std::string rsp = format_windbg_address(registers.rsp);
 
 	if (registers.rflags_known == 1)
 	{
-		output::print("efl={:08x} {}\n", static_cast<std::uint32_t>(registers.rflags), format_eflags(registers.rflags));
+		output::print("rax={:016x} rbx={:016x} rcx={:016x}\n"
+		              "rdx={:016x} rsi={:016x} rdi={:016x}\n"
+		              "rip={} rsp={} rbp={:016x}\n"
+		              " r8={:016x}  r9={:016x} r10={:016x}\n"
+		              "r11={:016x} r12={:016x} r13={:016x}\n"
+		              "r14={:016x} r15={:016x}\n"
+		              "efl={:08x} {}\n",
+		              registers.rax, registers.rbx, registers.rcx, registers.rdx, registers.rsi, registers.rdi, rip, rsp,
+		              registers.rbp, registers.r8, registers.r9, registers.r10, registers.r11, registers.r12, registers.r13,
+		              registers.r14, registers.r15, static_cast<std::uint32_t>(registers.rflags),
+		              format_eflags(registers.rflags));
+	}
+	else
+	{
+		output::print("rax={:016x} rbx={:016x} rcx={:016x}\n"
+		              "rdx={:016x} rsi={:016x} rdi={:016x}\n"
+		              "rip={} rsp={} rbp={:016x}\n"
+		              " r8={:016x}  r9={:016x} r10={:016x}\n"
+		              "r11={:016x} r12={:016x} r13={:016x}\n"
+		              "r14={:016x} r15={:016x}\n",
+		              registers.rax, registers.rbx, registers.rcx, registers.rdx, registers.rsi, registers.rdi, rip, rsp,
+		              registers.rbp, registers.r8, registers.r9, registers.r10, registers.r11, registers.r12, registers.r13,
+		              registers.r14, registers.r15);
 	}
 
 	output::flush();
@@ -10182,9 +10252,12 @@ std::uint8_t commands::views::disassemble(const std::uint64_t address, const std
                                           std::vector<instruction_t>& instructions_out,
                                           std::uint64_t& next_address_out, std::string& error_out)
 {
+	constexpr std::uint32_t nearest_limit = 4;
+
 	unassemble_request_t request = {};
 	request.start_address = address;
 	request.instruction_count = instruction_count;
+	request.nearest_limit = nearest_limit;
 
 	return build_disassembly(request, cr3, instructions_out, next_address_out, error_out);
 }

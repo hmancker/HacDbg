@@ -50,4 +50,5 @@ private:
     std::vector<std::uint64_t> m_breakpoints;
     std::uint64_t m_rip = 0;
     int m_selected = -1;
+    int m_bytesWidth = 0;
 };

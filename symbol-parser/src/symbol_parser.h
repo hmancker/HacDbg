@@ -61,6 +61,8 @@ namespace symbol_parser
 
 	std::uint8_t resolve(std::string_view module, std::string_view symbol, std::uint64_t& address_out);
 	std::uint8_t nearest(std::uint64_t address, std::string& name_out, std::uint64_t& displacement_out);
+	std::uint8_t nearest_span(std::uint64_t address, std::string& name_out, std::uint64_t& displacement_out,
+	                          std::uint64_t& size_out);
 	std::vector<symbol_match_t> enumerate(std::string_view module, std::string_view mask, std::size_t limit);
 	std::uint8_t query_type(std::string_view module, std::string_view type_name, type_info_t& info_out, std::string& detail);
 }

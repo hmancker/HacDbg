@@ -1632,9 +1632,11 @@ namespace symbol_parser
 		return 0;
 	}
 
-	std::uint8_t nearest(const std::uint64_t address, std::string& name_out, std::uint64_t& displacement_out)
+	std::uint8_t nearest_span(const std::uint64_t address, std::string& name_out, std::uint64_t& displacement_out,
+	                          std::uint64_t& size_out)
 	{
 		const std::lock_guard<std::mutex> lock(session_mutex);
+		size_out = 0;
 
 		if (session_ready == 0)
 		{
@@ -1664,8 +1666,16 @@ namespace symbol_parser
 		const std::string symbol_name = narrow(info->Name);
 		name_out = module_name.empty() == true ? symbol_name : module_name + "!" + symbol_name;
 		displacement_out = displacement;
+		size_out = info->Size;
 
 		return 1;
+	}
+
+	std::uint8_t nearest(const std::uint64_t address, std::string& name_out, std::uint64_t& displacement_out)
+	{
+		std::uint64_t size = 0;
+
+		return nearest_span(address, name_out, displacement_out, size);
 	}
 
 	std::vector<symbol_match_t> enumerate(const std::string_view module, const std::string_view mask, const std::size_t limit)

@@ -105,6 +105,15 @@ void DisassemblyView::setRows(std::vector<Row> rows, std::uint64_t rip, const st
     m_rip = rip;
     m_breakpoints = breakpoints;
     m_selected = -1;
+    const QFontMetrics metrics(font());
+    m_bytesWidth = metrics.horizontalAdvance(QStringLiteral("00"));
+
+    for (const Row& row : m_rows)
+    {
+        m_bytesWidth = qMax(m_bytesWidth, metrics.horizontalAdvance(row.bytes));
+    }
+
+    m_bytesWidth += 12;
 
     for (int index = 0; index < static_cast<int>(m_rows.size()); ++index)
     {
@@ -263,14 +272,7 @@ bool DisassemblyView::eventFilter(QObject* watched, QEvent* event)
     const int first = verticalScrollBar()->value();
     const QFontMetrics metrics(font());
     const int addressWidth = metrics.horizontalAdvance(QStringLiteral("0000000000000000")) + 16;
-    int bytesWidth = metrics.horizontalAdvance(QStringLiteral("00"));
-
-    for (const Row& row : m_rows)
-    {
-        bytesWidth = qMax(bytesWidth, metrics.horizontalAdvance(row.bytes));
-    }
-
-    bytesWidth += 12;
+    const int bytesWidth = m_bytesWidth > 0 ? m_bytesWidth : metrics.horizontalAdvance(QStringLiteral("00")) + 12;
     const int gutter = 36;
     const int symbolWidth = qMin(260, viewport()->width() / 4);
     const int textX = gutter + addressWidth + bytesWidth;

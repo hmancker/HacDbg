@@ -177,7 +177,7 @@ typedef struct _HACDBG_CORE_STATE
     uint32_t Paused;
     uint32_t BreakpointCount;
     uint32_t HypercallAbiVersion;
-    uint32_t Reserved;
+    uint32_t CommandSequence;
     HACDBG_CORE_REGISTERS Registers;
     HACDBG_CORE_BREAKPOINT Breakpoints[HACDBG_CORE_MAX_BREAKPOINTS];
     char UserVersion[HACDBG_CORE_VERSION_STRING_SIZE];

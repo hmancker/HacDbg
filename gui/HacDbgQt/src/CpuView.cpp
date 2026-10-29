@@ -20,7 +20,7 @@ namespace
 {
 constexpr int kMemoryRowBytes = 16;
 constexpr int kMemoryCacheLimit = 32;
-constexpr int kFollowDelayMs = 80;
+constexpr int kStackDelayMs = 300;
 constexpr std::uint32_t kInstructionCount = 64;
 
 std::uint64_t alignRow(std::uint64_t address)
@@ -123,8 +123,8 @@ CpuView::CpuView(QWidget* parent)
 
     m_followTimer = new QTimer(this);
     m_followTimer->setSingleShot(true);
-    m_followTimer->setInterval(kFollowDelayMs);
-    connect(m_followTimer, &QTimer::timeout, this, &CpuView::flushFollow);
+    m_followTimer->setInterval(kStackDelayMs);
+    connect(m_followTimer, &QTimer::timeout, this, &CpuView::flushStack);
 
     connect(m_disassembly, &DisassemblyView::selectionChanged, this, &CpuView::noteSelection);
     connect(m_stack, &StackView::addressActivated, this, [this](std::uint64_t address)
@@ -254,13 +254,47 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
         m_stackStale = true;
     }
 
-    if (m_disassemblyStale || m_stackStale)
+    if (m_stepBurst)
     {
-        scheduleFollow();
+        m_followTimer->stop();
+        return;
+    }
+
+    if (m_disassemblyStale)
+    {
+        queueDisassembly();
+    }
+
+    if (m_stackStale)
+    {
+        scheduleStack();
     }
     else
     {
         m_followTimer->stop();
+    }
+}
+
+void CpuView::setStepBurst(bool burst)
+{
+    if (m_stepBurst == burst)
+    {
+        return;
+    }
+
+    m_stepBurst = burst;
+
+    if (burst)
+    {
+        m_followTimer->stop();
+        return;
+    }
+
+    queueDisassembly();
+
+    if (m_stackStale)
+    {
+        flushStack();
     }
 }
 
@@ -361,7 +395,7 @@ void CpuView::poll()
                 if (m_followRip && m_paused && m_lastRip != 0 && m_disassembly->containsAddress(m_lastRip) == false)
                 {
                     m_disassemblyStale = true;
-                    scheduleFollow();
+                    queueDisassembly();
                 }
                 else
                 {
@@ -434,7 +468,11 @@ void CpuView::poll()
             {
                 m_stackStale = true;
                 m_stackStatus->setText(QStringLiteral("读取中..."));
-                scheduleFollow();
+
+                if (m_stepBurst == false)
+                {
+                    scheduleStack();
+                }
             }
             else
             {
@@ -552,44 +590,44 @@ void CpuView::submitGoto(bool memory)
     setStatus(m_resolveRequest == 0 ? QStringLiteral("无法排队") : QStringLiteral("解析中..."));
 }
 
-void CpuView::scheduleFollow()
+void CpuView::queueDisassembly()
 {
-    //
-    // Disassembly and the stack walk share the worker with the step command.
-    // Queue them only after a burst of steps pauses, so F10/F11 is not stuck
-    // behind symbol lookup and the user-module walk.
-    //
-    m_followTimer->start();
-}
-
-void CpuView::flushFollow()
-{
-    if (m_paused == false || m_session == nullptr || m_session->isStarted() == false)
+    if (m_stepBurst || m_disassemblyStale == false || m_disassemblyRequest != 0 || m_lastRip == 0 || m_session == nullptr ||
+        m_session->isStarted() == false)
     {
-        m_disassemblyStale = false;
-        m_stackStale = false;
         return;
     }
 
-    if (m_disassemblyStale)
+    if (m_disassemblyCr3 == m_pausedCr3 && m_disassembly->containsAddress(m_lastRip))
     {
-        if (m_lastRip != 0 && m_disassemblyCr3 == m_pausedCr3 && m_disassembly->containsAddress(m_lastRip))
-        {
-            m_disassemblyStale = false;
-        }
-        else if (m_lastRip == 0)
-        {
-            m_disassemblyStale = false;
-        }
-        else if (m_disassemblyRequest != 0 && m_followRip)
-        {
-            m_disassemblyStale = true;
-        }
-        else
-        {
-            hideGoto();
-            requestDisassembly(m_lastRip, m_pausedCr3, true);
-        }
+        m_disassemblyStale = false;
+        return;
+    }
+
+    hideGoto();
+    requestDisassembly(m_lastRip, m_pausedCr3, true);
+}
+
+void CpuView::scheduleStack()
+{
+    //
+    // The stack walk shares the worker with the step command. Wait until
+    // repeated steps have been idle so the next F10 or F11 is not stuck
+    // behind the user-module walk.
+    //
+    if (m_stepBurst)
+    {
+        return;
+    }
+
+    m_followTimer->start();
+}
+
+void CpuView::flushStack()
+{
+    if (m_stepBurst || m_paused == false || m_session == nullptr || m_session->isStarted() == false)
+    {
+        return;
     }
 
     if (m_stackStale == false || m_stackRequest != 0)

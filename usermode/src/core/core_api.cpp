@@ -117,6 +117,7 @@ struct HACDBG_CORE
 	std::uint32_t trace_snapshot_write = 1;
 	std::chrono::steady_clock::time_point trace_last_read = {};
 	std::uint8_t trace_last_read_valid = 0;
+	std::uint32_t commands_completed = 0;
 };
 
 namespace
@@ -709,6 +710,7 @@ namespace
 		}
 
 		state.BreakpointCount = static_cast<std::uint32_t>(count);
+		state.CommandSequence = core->commands_completed;
 
 		std::lock_guard<std::mutex> lock(core->state_mutex);
 		core->state = state;
@@ -960,6 +962,13 @@ namespace
 				catch (const std::exception& error)
 				{
 					output::write(output::kind_t::error, error.what());
+				}
+
+				core->commands_completed += 1;
+
+				if (core->commands_completed == 0)
+				{
+					core->commands_completed = 1;
 				}
 
 				update_state(core);

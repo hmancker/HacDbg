@@ -27,6 +27,7 @@ public:
     void onState(const HACDBG_CORE_STATE& state);
     void poll();
     void openAt(std::uint64_t address, std::uint64_t cr3);
+    void setStepBurst(bool burst);
 
 private:
     struct MemoryPage
@@ -41,8 +42,9 @@ private:
     void submitGoto(bool memory);
     void requestDisassembly(std::uint64_t address, std::uint64_t cr3, bool follow = false);
     void requestMemory(std::uint64_t address, std::uint64_t cr3, int highlightBytes);
-    void scheduleFollow();
-    void flushFollow();
+    void queueDisassembly();
+    void scheduleStack();
+    void flushStack();
     void showMemory(const MemoryPage& page);
     void noteSelection();
     bool takeCompleted(std::uint32_t view, std::uint64_t* requestId, HACDBG_CORE_VIEW_STATUS* status);
@@ -78,6 +80,7 @@ private:
     std::uint64_t m_stackRsp = 0;
     std::uint64_t m_stackCr3 = 0;
     bool m_followRip = false;
+    bool m_stepBurst = false;
     bool m_disassemblyStale = false;
     bool m_stackStale = false;
     std::uint64_t m_memoryCursor = 0;
