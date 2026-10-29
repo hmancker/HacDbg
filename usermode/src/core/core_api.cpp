@@ -60,6 +60,7 @@ struct HACDBG_CORE
 	std::deque<std::string> commands;
 	std::thread worker;
 	std::thread view_worker;
+	std::thread monitor_worker;
 	std::atomic<std::uint8_t> running = 0;
 	std::atomic<std::uint8_t> command_active = 0;
 	std::uint8_t initialized = 0;
@@ -1014,6 +1015,71 @@ namespace
 		}
 	}
 
+	std::uint8_t command_is_symbol_reload(const std::string& command)
+	{
+		std::size_t index = 0;
+
+		while (index < command.size() && (command[index] == ' ' || command[index] == '\t'))
+		{
+			index += 1;
+		}
+
+		const std::string_view text(command.data() + index, command.size() - index);
+		constexpr std::string_view prefix = ".reload";
+
+		if (text.size() < prefix.size())
+		{
+			return 0;
+		}
+
+		for (std::size_t cursor = 0; cursor < prefix.size(); cursor++)
+		{
+			char character = text[cursor];
+
+			if (character >= 'A' && character <= 'Z')
+			{
+				character = static_cast<char>(character - 'A' + 'a');
+			}
+
+			if (character != prefix[cursor])
+			{
+				return 0;
+			}
+		}
+
+		if (text.size() == prefix.size())
+		{
+			return 1;
+		}
+
+		const char next = text[prefix.size()];
+
+		return static_cast<std::uint8_t>(next == ' ' || next == '\t');
+	}
+
+	void monitor_loop(HACDBG_CORE* const core)
+	{
+		hypercall::skip_command_guest_wait();
+
+		while (core->running.load(std::memory_order_acquire) != 0)
+		{
+			try
+			{
+				breakpoint::drain_monitor_mailbox();
+				publish_monitors(core);
+			}
+			catch (const std::exception&)
+			{
+			}
+
+			std::unique_lock<std::mutex> lock(core->command_mutex);
+			core->command_ready.wait_for(lock, std::chrono::milliseconds(50), [core]
+			{
+				return core->running.load(std::memory_order_acquire) == 0;
+			});
+		}
+	}
+
 	void worker_loop(HACDBG_CORE* const core)
 	{
 
@@ -1055,11 +1121,20 @@ namespace
 					// thread waits out this section instead of starting another
 					// guest read, including the process walk after a breakpoint.
 					// dbghelp does not take the section, so a step does not wait
-					// for it.
+					// for it. A symbol reload does not hold the section: the
+					// monitor thread keeps flushing the log mailbox while PDBs
+					// download.
 					//
-					const hypercall::GuestSection guest;
+					if (command_is_symbol_reload(command) == 0)
+					{
+						const hypercall::GuestSection guest;
 
-					commands::process(command);
+						commands::process(command);
+					}
+					else
+					{
+						commands::process(command);
+					}
 				}
 				catch (const std::exception& error)
 				{
@@ -1370,6 +1445,7 @@ uint32_t HacDbgCoreStart(HACDBG_CORE* const core)
 		g_preempt_core = core;
 		core->worker = std::thread(worker_loop, core);
 		core->view_worker = std::thread(view_loop, core);
+		core->monitor_worker = std::thread(monitor_loop, core);
 		update_state(core);
 
 		return HacDbgCoreStatusOk;
@@ -1387,6 +1463,11 @@ uint32_t HacDbgCoreStart(HACDBG_CORE* const core)
 		if (core->view_worker.joinable() != false)
 		{
 			core->view_worker.join();
+		}
+
+		if (core->monitor_worker.joinable() != false)
+		{
+			core->monitor_worker.join();
 		}
 
 		g_preempt_core = nullptr;
@@ -1423,6 +1504,11 @@ uint32_t HacDbgCoreStop(HACDBG_CORE* const core)
 	if (core->view_worker.joinable() != false)
 	{
 		core->view_worker.join();
+	}
+
+	if (core->monitor_worker.joinable() != false)
+	{
+		core->monitor_worker.join();
 	}
 
 	g_preempt_core = nullptr;

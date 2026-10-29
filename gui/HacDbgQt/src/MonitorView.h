@@ -31,6 +31,7 @@ private:
     bool nearBottom() const;
     void showSelected();
     void updateStatus();
+    void clearLog();
 
     CoreSession* m_session = nullptr;
     QLabel* m_status = nullptr;

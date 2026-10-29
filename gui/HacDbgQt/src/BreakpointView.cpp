@@ -3,9 +3,15 @@
 #include "Format.h"
 
 #include <QHeaderView>
+#include <QHBoxLayout>
+#include <QKeySequence>
+#include <QPushButton>
+#include <QShortcut>
 #include <QStandardItemModel>
 #include <QTableView>
 #include <QVBoxLayout>
+
+#include <QString>
 
 namespace
 {
@@ -31,6 +37,13 @@ BreakpointView::BreakpointView(QWidget* parent)
 {
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
+    layout->setSpacing(0);
+    auto* bar = new QHBoxLayout();
+    bar->setContentsMargins(8, 4, 8, 4);
+    auto* remove = new QPushButton(QStringLiteral("删除"), this);
+    bar->addWidget(remove);
+    bar->addStretch(1);
+    layout->addLayout(bar);
     m_table = new QTableView(this);
     prepareTable(m_table);
     m_model = new QStandardItemModel(this);
@@ -38,7 +51,11 @@ BreakpointView::BreakpointView(QWidget* parent)
                                         QStringLiteral("CR3"), QStringLiteral("状态"), QStringLiteral("暂停"),
                                         QStringLiteral("次数")});
     m_table->setModel(m_model);
-    layout->addWidget(m_table);
+    layout->addWidget(m_table, 1);
+    connect(remove, &QPushButton::clicked, this, &BreakpointView::deleteSelected);
+    auto* deleteKey = new QShortcut(QKeySequence::Delete, m_table);
+    deleteKey->setContext(Qt::WidgetWithChildrenShortcut);
+    connect(deleteKey, &QShortcut::activated, this, &BreakpointView::deleteSelected);
     connect(m_table, &QTableView::doubleClicked, this, [this](const QModelIndex& index)
     {
         if (index.row() < 0 || index.row() >= static_cast<int>(m_activation.size()))
@@ -47,6 +64,16 @@ BreakpointView::BreakpointView(QWidget* parent)
         }
 
         const Activation& row = m_activation[static_cast<std::size_t>(index.row())];
+
+        if (row.breakpoint)
+        {
+            const QString command = QStringLiteral("%1 0x%2")
+                                        .arg(row.enabled ? QStringLiteral("bd") : QStringLiteral("be"))
+                                        .arg(row.id, 0, 16);
+            emit commandRequested(command);
+            return;
+        }
+
         emit addressActivated(row.address, row.cr3);
     });
 }
@@ -102,20 +129,50 @@ void BreakpointView::setMonitors(const HACDBG_CORE_MONITOR* monitors, std::uint3
     rebuild();
 }
 
+void BreakpointView::deleteSelected()
+{
+    const int row = m_table->currentIndex().row();
+
+    if (row < 0 || row >= static_cast<int>(m_activation.size()))
+    {
+        return;
+    }
+
+    const Activation& item = m_activation[static_cast<std::size_t>(row)];
+
+    if (item.breakpoint)
+    {
+        emit commandRequested(QStringLiteral("bc 0x%1").arg(item.id, 0, 16));
+        return;
+    }
+
+    emit commandRequested(QStringLiteral("rkh 0x%1").arg(item.address, 0, 16));
+}
+
 void BreakpointView::rebuild()
 {
+    const int currentRow = m_table->currentIndex().row();
+    Activation selected = {};
+    bool keepSelection = false;
+
+    if (currentRow >= 0 && currentRow < static_cast<int>(m_activation.size()))
+    {
+        selected = m_activation[static_cast<std::size_t>(currentRow)];
+        keepSelection = true;
+    }
+
     m_model->removeRows(0, m_model->rowCount());
     m_activation.clear();
 
     for (const HACDBG_CORE_BREAKPOINT& row : m_rows)
     {
-        m_activation.push_back({row.Address, row.Cr3});
+        m_activation.push_back({row.Address, row.Cr3, row.Id, true, row.Enabled != 0});
         m_model->appendRow({
             new QStandardItem(QStringLiteral("断点")),
             new QStandardItem(QString::number(row.Id)),
             new QStandardItem(hex16(row.Address)),
             new QStandardItem(row.Cr3 == 0 ? QStringLiteral("—") : hex16(row.Cr3)),
-            new QStandardItem(row.Enabled != 0 ? QStringLiteral("启用") : QStringLiteral("禁用")),
+            new QStandardItem(row.Enabled != 0 ? QStringLiteral("开启") : QStringLiteral("关闭")),
             new QStandardItem(row.PausesThread != 0 ? QStringLiteral("暂停") : QString()),
             new QStandardItem(QStringLiteral("—")),
         });
@@ -123,15 +180,37 @@ void BreakpointView::rebuild()
 
     for (const HACDBG_CORE_MONITOR& row : m_monitors)
     {
-        m_activation.push_back({row.Address, 0});
+        m_activation.push_back({row.Address, 0, 0, false, true});
         m_model->appendRow({
             new QStandardItem(QStringLiteral("监控")),
             new QStandardItem(QStringLiteral("—")),
             new QStandardItem(hex16(row.Address)),
             new QStandardItem(QStringLiteral("—")),
-            new QStandardItem(QStringLiteral("启用")),
+            new QStandardItem(QStringLiteral("开启")),
             new QStandardItem(QString()),
             new QStandardItem(QString::number(row.Hits)),
         });
+    }
+
+    if (keepSelection == false)
+    {
+        return;
+    }
+
+    for (int row = 0; row < static_cast<int>(m_activation.size()); ++row)
+    {
+        const Activation& item = m_activation[static_cast<std::size_t>(row)];
+        const bool same = item.breakpoint == selected.breakpoint &&
+                          (item.breakpoint ? item.id == selected.id : item.address == selected.address);
+
+        if (same == false)
+        {
+            continue;
+        }
+
+        const QModelIndex index = m_model->index(row, 0);
+        m_table->setCurrentIndex(index);
+        m_table->selectionModel()->select(index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        break;
     }
 }

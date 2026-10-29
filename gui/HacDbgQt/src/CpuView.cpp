@@ -140,6 +140,7 @@ CpuView::CpuView(QWidget* parent)
     connect(m_followTimer, &QTimer::timeout, this, &CpuView::flushStack);
 
     connect(m_disassembly, &DisassemblyView::selectionChanged, this, &CpuView::noteSelection);
+    connect(m_disassembly, &DisassemblyView::breakpointToggleRequested, this, &CpuView::toggleSelectedBreakpoint);
     connect(m_stack, &StackView::addressActivated, this, [this](std::uint64_t address)
     {
         hideGoto();
@@ -172,10 +173,12 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
 {
     m_registers->setRegisters(state.Registers, state.Paused != 0);
     std::vector<std::uint64_t> breakpoints;
+    std::vector<HACDBG_CORE_BREAKPOINT> records;
 
     for (std::uint32_t index = 0; index < state.BreakpointCount && index < HACDBG_CORE_MAX_BREAKPOINTS; ++index)
     {
         const HACDBG_CORE_BREAKPOINT& breakpoint = state.Breakpoints[index];
+        records.push_back(breakpoint);
 
         if (breakpoint.Enabled == 0)
         {
@@ -191,6 +194,7 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
     }
 
     m_breakpoints = breakpoints;
+    m_breakpointRecords = std::move(records);
 
     if (state.Paused == 0)
     {
@@ -969,6 +973,51 @@ void CpuView::storeMemoryPage(MemoryPage page)
 void CpuView::showMemory(const MemoryPage& page)
 {
     m_dump->setBytes(page.address, m_memoryCursor, m_memoryCursorBytes, page.bytes);
+}
+
+void CpuView::toggleSelectedBreakpoint()
+{
+    const DisassemblyView::Row* const row = m_disassembly == nullptr ? nullptr : m_disassembly->selectedRow();
+
+    if (row == nullptr || row->address == 0 || m_session == nullptr || m_session->isStarted() == false)
+    {
+        return;
+    }
+
+    const HACDBG_CORE_BREAKPOINT* match = nullptr;
+
+    for (const HACDBG_CORE_BREAKPOINT& breakpoint : m_breakpointRecords)
+    {
+        if (breakpoint.Address != row->address)
+        {
+            continue;
+        }
+
+        if (breakpoint.Cr3 != 0 && m_disassemblyCr3 != 0 && breakpoint.Cr3 != m_disassemblyCr3)
+        {
+            continue;
+        }
+
+        match = &breakpoint;
+        break;
+    }
+
+    QString command;
+
+    if (match != nullptr)
+    {
+        command = QStringLiteral("bc 0x%1").arg(match->Id, 0, 16);
+    }
+    else if (m_disassemblyCr3 == 0)
+    {
+        command = QStringLiteral("bp 0x%1").arg(row->address, 0, 16);
+    }
+    else
+    {
+        command = QStringLiteral("bp 0x%1 0x%2").arg(row->address, 0, 16).arg(m_disassemblyCr3, 0, 16);
+    }
+
+    emit commandRequested(command);
 }
 
 void CpuView::noteSelection()

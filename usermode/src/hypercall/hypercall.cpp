@@ -26,6 +26,7 @@ static std::atomic<std::uint32_t> g_command_cookie = 0;
 static std::atomic<std::uint32_t> g_next_thread_cookie = 1;
 static thread_local std::uint32_t t_thread_cookie = 0;
 static thread_local int t_guest_depth = 0;
+static thread_local std::uint8_t t_skip_command_wait = 0;
 static void (*g_command_yield)() = nullptr;
 
 static std::uint32_t this_thread_cookie()
@@ -42,6 +43,11 @@ static std::uint32_t this_thread_cookie()
 
 static std::uint8_t command_guest_blocks(const std::uint32_t cookie)
 {
+	if (t_skip_command_wait != 0)
+	{
+		return 0;
+	}
+
 	return static_cast<std::uint8_t>(g_command_guest.load(std::memory_order_acquire) != 0 &&
 	                                 g_command_cookie.load(std::memory_order_acquire) != cookie);
 }
@@ -57,6 +63,11 @@ void hypercall::begin_command_guest()
 
 	g_command_cookie.store(this_thread_cookie(), std::memory_order_release);
 	g_command_guest.store(1, std::memory_order_release);
+}
+
+void hypercall::skip_command_guest_wait()
+{
+	t_skip_command_wait = 1;
 }
 
 void hypercall::end_command_guest()

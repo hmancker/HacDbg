@@ -33,6 +33,7 @@ public:
 
 signals:
     void selectionChanged();
+    void breakpointToggleRequested();
 
 protected:
     void resizeEvent(QResizeEvent* event) override;

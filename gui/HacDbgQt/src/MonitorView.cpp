@@ -6,9 +6,11 @@
 
 #include <QAbstractItemView>
 #include <QAbstractListModel>
+#include <QHBoxLayout>
 #include <QHeaderView>
 #include <QLabel>
 #include <QListView>
+#include <QPushButton>
 #include <QScrollBar>
 #include <QSplitter>
 #include <QTableWidget>
@@ -119,6 +121,15 @@ public:
         return m_dropped;
     }
 
+    void clear()
+    {
+        beginResetModel();
+        m_rows.clear();
+        m_dropped = 0;
+        m_nextNumber = 1;
+        endResetModel();
+    }
+
 private:
     struct Row
     {
@@ -126,16 +137,18 @@ private:
         QString line;
     };
 
-    static Row makeRow(const HACDBG_CORE_MONITOR_HIT& hit)
+    Row makeRow(const HACDBG_CORE_MONITOR_HIT& hit)
     {
         Row row;
         row.hit = hit;
-        row.line = monitorLine(hit);
+        row.line = QStringLiteral("%1  %2").arg(m_nextNumber).arg(monitorLine(hit));
+        m_nextNumber += 1;
         return row;
     }
 
     std::vector<Row> m_rows;
     std::uint64_t m_dropped = 0;
+    std::uint64_t m_nextNumber = 1;
 };
 
 namespace
@@ -180,8 +193,15 @@ MonitorView::MonitorView(QWidget* parent)
     auto* layout = new QVBoxLayout(this);
     layout->setContentsMargins(0, 0, 0, 0);
     layout->setSpacing(0);
+    auto* bar = new QHBoxLayout();
+    bar->setContentsMargins(8, 4, 8, 4);
+    auto* clear = new QPushButton(QStringLiteral("清空"), this);
+    bar->addWidget(clear);
+    bar->addStretch(1);
+    layout->addLayout(bar);
     m_status = new QLabel(this);
     m_status->setContentsMargins(8, 4, 8, 4);
+    connect(clear, &QPushButton::clicked, this, &MonitorView::clearLog);
     m_log = new QListView(this);
     m_model = new MonitorLogModel(this);
     m_log->setModel(m_model);
@@ -304,6 +324,33 @@ void MonitorView::updateStatus()
     m_status->setText(QStringLiteral("监控日志来自日志邮箱，不必执行 fl。选中一行后，右侧显示这一次的寄存器和栈。列表保留最近 %1 条，较早的 %2 条已丢掉。")
                           .arg(kMaximumRows)
                           .arg(dropped));
+}
+
+void MonitorView::clearLog()
+{
+    m_model->clear();
+    showSelected();
+    updateStatus();
+
+    if (m_session == nullptr || m_session->isStarted() == false)
+    {
+        return;
+    }
+
+    if (m_copy.size() != kCopyCapacity)
+    {
+        m_copy.resize(kCopyCapacity);
+    }
+
+    for (int pass = 0; pass < 4; ++pass)
+    {
+        std::uint32_t count = 0;
+
+        if (m_session->copyMonitorHits(m_copy.data(), kCopyCapacity, &count) == false || count == 0)
+        {
+            break;
+        }
+    }
 }
 
 void MonitorView::poll()

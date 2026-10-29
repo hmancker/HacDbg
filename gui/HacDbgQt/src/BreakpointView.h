@@ -1,5 +1,6 @@
 #pragma once
 
+#include <QString>
 #include <QWidget>
 
 #include <hacdbg_core_api.h>
@@ -22,15 +23,20 @@ public:
 
 signals:
     void addressActivated(quint64 address, quint64 cr3);
+    void commandRequested(const QString& command);
 
 private:
     struct Activation
     {
         std::uint64_t address = 0;
         std::uint64_t cr3 = 0;
+        std::uint64_t id = 0;
+        bool breakpoint = false;
+        bool enabled = false;
     };
 
     void rebuild();
+    void deleteSelected();
 
     QTableView* m_table = nullptr;
     QStandardItemModel* m_model = nullptr;

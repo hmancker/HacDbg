@@ -503,12 +503,14 @@ void MainWindow::ensurePage(int index)
         m_cpu = new CpuView(holder(index));
         m_cpu->setSession(&m_session);
         holder(index)->layout()->addWidget(m_cpu);
+        connect(m_cpu, &CpuView::commandRequested, this, &MainWindow::executeCommand);
     }
     else if (index == PageBreakpoints && m_breakpoints == nullptr)
     {
         m_breakpoints = new BreakpointView(holder(index));
         holder(index)->layout()->addWidget(m_breakpoints);
         connect(m_breakpoints, &BreakpointView::addressActivated, this, &MainWindow::openDisassembly);
+        connect(m_breakpoints, &BreakpointView::commandRequested, this, &MainWindow::executeCommand);
     }
     else if (index == PageMonitors && m_monitors == nullptr)
     {

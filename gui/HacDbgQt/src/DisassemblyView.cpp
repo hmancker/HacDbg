@@ -404,6 +404,12 @@ void DisassemblyView::keyPressEvent(QKeyEvent* event)
         return;
     }
 
+    if (event->key() == Qt::Key_F2 && event->isAutoRepeat() == false)
+    {
+        emit breakpointToggleRequested();
+        return;
+    }
+
     if (event->key() == Qt::Key_Up || event->key() == Qt::Key_Down)
     {
         const int delta = event->key() == Qt::Key_Up ? -1 : 1;

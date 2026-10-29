@@ -85,6 +85,8 @@ namespace breakpoint
 	void note_monitor_logs(const trap_frame_log_t* logs, std::uint64_t count);
 	std::vector<monitor_site_t> monitor_sites();
 	std::vector<monitor_hit_t> take_monitor_hits();
+	// Copies new mailbox records into the monitor list. Does not take a pause.
+	void drain_monitor_mailbox();
 
 	std::uint8_t capture_pause();
 	std::uint8_t poll_new_pause();

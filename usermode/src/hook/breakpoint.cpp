@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <deque>
+#include <mutex>
 #include <string_view>
 #include <vector>
 
@@ -3744,9 +3745,12 @@ std::vector<breakpoint::info_t> breakpoint::list()
 
 std::vector<breakpoint::monitor_site_t> monitor_site_list = {};
 std::deque<breakpoint::monitor_hit_t> monitor_hit_list = {};
+std::recursive_mutex g_log_mutex = {};
 
 void breakpoint::clean_up()
 {
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
+
 	monitor_site_list.clear();
 	monitor_hit_list.clear();
 
@@ -3822,6 +3826,7 @@ void note_one_monitor_log(const trap_frame_log_t& log)
 void remember_flushed_logs(const trap_frame_log_t* const logs, const std::uint64_t count)
 {
 	constexpr std::uint64_t pending_log_limit = 2840;
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 
 	if (logs == nullptr)
 	{
@@ -3860,6 +3865,8 @@ void discard_stale_pause_logs(const breakpoint_t* const breakpoint)
 	constexpr std::uint64_t log_count = 2840;
 	std::vector<trap_frame_log_t> logs(log_count);
 	const std::uint64_t logs_flushed = hypercall::flush_logs(logs);
+
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 
 	if (logs_flushed != static_cast<std::uint64_t>(-1))
 	{
@@ -3920,12 +3927,18 @@ void breakpoint::observe_pause_logs(const trap_frame_log_t* const logs, const st
 
 std::uint8_t reconsider_pending_logs()
 {
-	if (pause_state.valid == 1 || pending_logs.empty() == true)
-	{
-		return pause_state.valid;
-	}
+	std::vector<trap_frame_log_t> logs = {};
 
-	const std::vector<trap_frame_log_t> logs(pending_logs.begin(), pending_logs.end());
+	{
+		const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
+
+		if (pause_state.valid == 1 || pending_logs.empty() == true)
+		{
+			return pause_state.valid;
+		}
+
+		logs.assign(pending_logs.begin(), pending_logs.end());
+	}
 
 	observe_logs_impl(logs.data(), logs.size());
 
@@ -3990,6 +4003,8 @@ std::uint8_t breakpoint::poll_new_pause()
 std::uint8_t breakpoint::add_monitor(const std::uint64_t address, const std::uint64_t log_rip,
                                          const std::uint64_t span)
 {
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
+
 	if (address == 0 || log_rip == 0)
 	{
 		return 0;
@@ -4022,6 +4037,7 @@ std::uint8_t breakpoint::add_monitor(const std::uint64_t address, const std::uin
 
 void breakpoint::remove_monitor(const std::uint64_t address)
 {
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 	std::vector<monitor_site_t> kept = {};
 
 	for (const monitor_site_t& site : monitor_site_list)
@@ -4037,6 +4053,8 @@ void breakpoint::remove_monitor(const std::uint64_t address)
 
 void breakpoint::note_monitor_logs(const trap_frame_log_t* const logs, const std::uint64_t count)
 {
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
+
 	if (logs == nullptr)
 	{
 		return;
@@ -4050,16 +4068,38 @@ void breakpoint::note_monitor_logs(const trap_frame_log_t* const logs, const std
 
 std::vector<breakpoint::monitor_site_t> breakpoint::monitor_sites()
 {
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
+
 	return monitor_site_list;
 }
 
 std::vector<breakpoint::monitor_hit_t> breakpoint::take_monitor_hits()
 {
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 	std::vector<monitor_hit_t> hits(monitor_hit_list.begin(), monitor_hit_list.end());
 
 	monitor_hit_list.clear();
 
 	return hits;
+}
+
+void breakpoint::drain_monitor_mailbox()
+{
+	if (hypercall::log_notify_idle() != 0)
+	{
+		return;
+	}
+
+	constexpr std::uint64_t log_count = 2840;
+	std::vector<trap_frame_log_t> logs(log_count);
+	const std::uint64_t logs_flushed = hypercall::flush_logs(logs);
+
+	if (logs_flushed == static_cast<std::uint64_t>(-1) || logs_flushed == 0)
+	{
+		return;
+	}
+
+	remember_flushed_logs(logs.data(), logs_flushed);
 }
 
 std::uint8_t breakpoint::has_paused_thread()
@@ -4076,6 +4116,7 @@ std::uint64_t breakpoint::paused_breakpoint_id()
 
 std::vector<trap_frame_log_t> breakpoint::take_pending_logs()
 {
+	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 	std::vector<trap_frame_log_t> logs(pending_logs.begin(), pending_logs.end());
 
 	pending_logs.clear();

@@ -29,6 +29,9 @@ public:
     void openAt(std::uint64_t address, std::uint64_t cr3);
     void setStepBurst(bool burst);
 
+signals:
+    void commandRequested(const QString& command);
+
 private:
     struct MemoryPage
     {
@@ -58,6 +61,7 @@ private:
     void storeMemoryPage(MemoryPage page);
     void showMemory(const MemoryPage& page);
     void noteSelection();
+    void toggleSelectedBreakpoint();
     bool takeCompleted(std::uint32_t view, std::uint64_t* requestId, HACDBG_CORE_VIEW_STATUS* status);
     void setDisassemblyStatus(const QString& text);
     void setMemoryStatus(const QString& text);
@@ -118,4 +122,5 @@ private:
     bool m_suppressSelection = false;
     std::vector<MemoryPage> m_memoryCache;
     std::vector<std::uint64_t> m_breakpoints;
+    std::vector<HACDBG_CORE_BREAKPOINT> m_breakpointRecords;
 };

@@ -28,6 +28,8 @@ namespace hypercall
 	void set_command_yield(void (*yield)());
 	void begin_command_guest();
 	void end_command_guest();
+	// This thread may start a guest hypercall while a command section is open.
+	void skip_command_guest_wait();
 
 	std::uint64_t read_guest_physical_memory(void* guest_destination_buffer,
 	                                         std::uint64_t guest_source_physical_address, std::uint64_t size);
