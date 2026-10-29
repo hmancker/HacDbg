@@ -28,6 +28,19 @@ std::uint64_t alignRow(std::uint64_t address)
     return address & ~static_cast<std::uint64_t>(kMemoryRowBytes - 1);
 }
 
+bool isCallOrRet(const QString& text)
+{
+    const int space = text.indexOf(QLatin1Char(' '));
+    const QString mnemonic = (space < 0 ? text : text.left(space)).trimmed().toLower();
+
+    return mnemonic == QLatin1String("call") || mnemonic == QLatin1String("ret") || mnemonic == QLatin1String("retf");
+}
+
+std::uint64_t alignStack(std::uint64_t rsp)
+{
+    return rsp & ~static_cast<std::uint64_t>(7);
+}
+
 QWidget* makeGotoBar(QWidget* parent, QLineEdit** address, QLineEdit** cr3)
 {
     auto* bar = new QWidget(parent);
@@ -213,6 +226,8 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
     const bool rspChanged = entered || m_lastRsp != rsp;
     const bool cr3Changed = entered || m_pausedCr3 != cr3;
     const bool commandChanged = entered || m_commandSequence != state.CommandSequence;
+    const DisassemblyView::Row* const previous = ripChanged ? m_disassembly->rowForAddress(m_lastRip) : nullptr;
+    const bool callOrRet = previous != nullptr && isCallOrRet(previous->text);
     m_paused = true;
     m_pausedCr3 = cr3;
     m_lastRip = rip;
@@ -251,13 +266,15 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
     }
 
     //
-    // mov [rsp+8] writes a stack slot without moving RSP. The qword window
-    // has to be read again. The frame walk stays tied to RSP and CR3.
+    // A step shares this worker with the stack walk. push, sub rsp, and
+    // and rdx all stall when that walk is in dbghelp or reading pdata.
+    // Bytes move with RSP. Frames are walked only for a new address space
+    // or for call and ret.
     //
-    const bool stackContextSame = m_stack->hasFrames() && m_stackRsp == rsp && m_stackCr3 == cr3;
-    const bool stackCommandSame = stackContextSame && m_stackCommand == state.CommandSequence;
+    const bool framesForCr3 = m_stack->hasFrames() && m_stackCr3 == cr3;
+    const bool bytesCurrent = framesForCr3 && m_stackRsp == rsp && m_stackCommand == state.CommandSequence;
 
-    if (stackCommandSame)
+    if (bytesCurrent)
     {
         m_stackStale = false;
         m_stackBytesStale = false;
@@ -265,23 +282,24 @@ void CpuView::onState(const HACDBG_CORE_STATE& state)
     else if (m_stackRequest != 0 &&
              (m_stackRequestCommand != state.CommandSequence || m_stackRequestRsp != rsp || m_stackRequestCr3 != cr3))
     {
-        m_stackStale = true;
-    }
-    else if (m_stackRequest == 0 && stackContextSame && (commandChanged || ripChanged))
-    {
-        if (m_stackWindowBase == 0)
-        {
-            m_stackStale = true;
-            m_stackBytesStale = false;
-        }
-        else
+        if (framesForCr3 && callOrRet == false)
         {
             m_stackBytesStale = true;
             m_stackStale = false;
             m_followTimer->stop();
         }
+        else
+        {
+            m_stackStale = true;
+        }
     }
-    else if (m_stackRequest == 0 && (entered || rspChanged || cr3Changed || stackContextSame == false))
+    else if (m_stackRequest == 0 && framesForCr3 && callOrRet == false && (commandChanged || ripChanged || rspChanged))
+    {
+        m_stackBytesStale = true;
+        m_stackStale = false;
+        m_followTimer->stop();
+    }
+    else if (m_stackRequest == 0 && (framesForCr3 == false || callOrRet))
     {
         m_stackStale = true;
         m_stackBytesStale = false;
@@ -504,12 +522,25 @@ void CpuView::poll()
                                    m_stackRequestCommand != m_commandSequence || m_stackRequestRsp != m_lastRsp ||
                                    m_stackRequestCr3 != m_pausedCr3))
             {
-                m_stackStale = true;
-                m_stackStatus->setText(QStringLiteral("读取中..."));
-
-                if (m_stepBurst == false)
+                if (m_stack->hasFrames() && m_stackCr3 == m_pausedCr3)
                 {
-                    scheduleStack();
+                    m_stackStale = false;
+                    m_stackBytesStale = true;
+
+                    if (m_stepBurst == false)
+                    {
+                        pumpMemoryReads();
+                    }
+                }
+                else
+                {
+                    m_stackStale = true;
+                    m_stackStatus->setText(QStringLiteral("读取中..."));
+
+                    if (m_stepBurst == false)
+                    {
+                        scheduleStack();
+                    }
                 }
             }
             else
@@ -781,8 +812,10 @@ void CpuView::pumpMemoryReads()
         return;
     }
 
-    if (m_stackBytesStale == false || m_stackStale || m_stackWindowBase == 0 || m_paused == false ||
-        m_stack->hasFrames() == false || m_stackRsp != m_lastRsp || m_stackCr3 != m_pausedCr3)
+    const std::uint64_t stackBase = alignStack(m_lastRsp);
+
+    if (m_stackBytesStale == false || m_stackStale || stackBase == 0 || m_paused == false || m_stack->hasFrames() == false ||
+        m_stackCr3 != m_pausedCr3)
     {
         return;
     }
@@ -792,7 +825,7 @@ void CpuView::pumpMemoryReads()
     m_memoryRequestCommand = m_commandSequence;
     m_memoryRequestRsp = m_lastRsp;
     m_memoryRequestCr3 = m_pausedCr3;
-    m_memoryRequest = m_session->requestMemory(m_stackWindowBase, m_pausedCr3, HACDBG_CORE_MAX_MEMORY_BYTES);
+    m_memoryRequest = m_session->requestMemory(stackBase, m_pausedCr3, HACDBG_CORE_MAX_MEMORY_BYTES);
 
     if (m_memoryRequest == 0)
     {
@@ -850,15 +883,15 @@ void CpuView::applyStackByteRead(const HACDBG_CORE_VIEW_STATUS& status)
 
     if (status.Failed != 0 || current == false)
     {
-        if (current == false && m_paused && m_stackRsp == m_lastRsp && m_stackCr3 == m_pausedCr3)
+        if (current == false && m_paused && m_stack->hasFrames() && m_stackCr3 == m_pausedCr3)
         {
             m_stackBytesStale = true;
         }
-        else if (current == false)
+        else if (current == false && m_paused)
         {
             m_stackStale = true;
         }
-        else
+        else if (status.Failed != 0)
         {
             m_stackStatus->setText(fromField(status.Message, HACDBG_CORE_MESSAGE_SIZE));
         }
@@ -878,8 +911,25 @@ void CpuView::applyStackByteRead(const HACDBG_CORE_VIEW_STATUS& status)
 
     if (memory.Address == m_stackWindowBase && m_stack->replaceBytes(memory.Address, m_lastRsp, memory.Data, length))
     {
+        m_stackRsp = m_lastRsp;
         m_stackCommand = m_memoryRequestCommand;
         m_stackBytesStale = false;
+        return;
+    }
+
+    HACDBG_CORE_STACK_FRAME frames[HACDBG_CORE_MAX_STACK_FRAMES] = {};
+    std::uint32_t count = 0;
+
+    if (m_session->copyStack(frames, HACDBG_CORE_MAX_STACK_FRAMES, &count) && count > 0 &&
+        m_stack->hasFrames())
+    {
+        m_stack->setSnapshot(frames, count, memory.Address, m_lastRsp, memory.Data, length);
+        m_stackRsp = m_lastRsp;
+        m_stackCr3 = m_pausedCr3;
+        m_stackCommand = m_memoryRequestCommand;
+        m_stackWindowBase = length >= 8 ? memory.Address : 0;
+        m_stackBytesStale = false;
+        m_stackStale = false;
         return;
     }
 

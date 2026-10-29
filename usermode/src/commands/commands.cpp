@@ -1525,6 +1525,14 @@ static std::uint8_t build_disassembly(const unassemble_request_t& request, const
 		}
 		else if (request.nearest_limit == 0 || nearest_queries < request.nearest_limit)
 		{
+			if (preempt_view() != 0)
+			{
+				instructions_out.clear();
+				error_out.clear();
+
+				return 0;
+			}
+
 			std::string pdb_name = {};
 			std::uint64_t pdb_displacement = 0;
 			std::uint64_t pdb_size = 0;
@@ -4243,6 +4251,11 @@ static std::uint64_t eprocess_for_cr3(const std::uint64_t cr3)
 
 	for (std::uint64_t count = 0; count < 4096 && eprocess != 0; count++)
 	{
+		if (preempt_view() != 0)
+		{
+			return 0;
+		}
+
 		std::uint64_t directory = 0;
 		hypercall::read_guest_virtual_memory(&directory, eprocess + nt->eprocess_directory_table_base, sys::current_cr3, sizeof(directory));
 		const std::uint64_t user_directory = guest_user_directory(eprocess, *nt, directory);
@@ -8197,6 +8210,13 @@ static std::uint8_t load_function_table(stack_module_t& module, const std::uint6
 
 	while (done < exception_size)
 	{
+		if (preempt_view() != 0)
+		{
+			module.functions.clear();
+
+			return 0;
+		}
+
 		const std::uint64_t chunk = exception_size - done > 0x1000 ? 0x1000 : exception_size - done;
 
 		if (read_paused_block(module.base + exception_rva + done, raw + done, chunk, extra_cr3) == 0)
@@ -8258,6 +8278,11 @@ static std::uint8_t emulate_epilog(stack_regs_t& regs, const std::uint64_t extra
 
 	for (std::uint32_t step = 0; step < 16; step++)
 	{
+		if (preempt_view() != 0)
+		{
+			return 0;
+		}
+
 		std::uint8_t bytes[15] = {};
 
 		if (read_paused_block(rip, bytes, sizeof(bytes), extra_cr3) == 0)
@@ -8547,6 +8572,11 @@ static std::uint8_t unwind_with_pdata(std::vector<stack_module_t>& modules, stac
 		return 1;
 	}
 
+	if (preempt_view() != 0)
+	{
+		return 0;
+	}
+
 	const stack_regs_t saved = regs;
 
 	if (module_bounds(modules, regs.rip, base, image_size) == 0 || regs.rip < base)
@@ -8633,6 +8663,13 @@ static std::uint8_t unwind_with_pdata(std::vector<stack_module_t>& modules, stac
 	// only when that slot is the instruction after a call. An unreadable
 	// predecessor stays, because the unwind codes already named the slot.
 	//
+	if (preempt_view() != 0)
+	{
+		regs = saved;
+
+		return 0;
+	}
+
 	if (instruction_before_is_call(ret, extra_cr3) == 0)
 	{
 		regs = saved;
@@ -8652,7 +8689,7 @@ static std::uint8_t instruction_before_is_call(const std::uint64_t address, cons
 {
 	constexpr std::uint64_t kBack = 15;
 
-	if (canonical_code_address(address) == 0 || address < 2)
+	if (preempt_view() != 0 || canonical_code_address(address) == 0 || address < 2)
 	{
 		return 0;
 	}
@@ -8721,6 +8758,11 @@ static std::uint8_t leaf_unwind(stack_regs_t& regs, const std::uint64_t extra_cr
 	//
 	for (std::uint32_t slot = 0; slot < kSlots; slot++)
 	{
+		if (preempt_view() != 0)
+		{
+			return 0;
+		}
+
 		const std::uint64_t address = regs.rsp + static_cast<std::uint64_t>(slot) * 8;
 		std::uint64_t ret = 0;
 
@@ -8807,6 +8849,11 @@ static std::string stack_call_site(const std::uint64_t address)
 		return "00000000`00000000";
 	}
 
+	if (preempt_view() != 0)
+	{
+		return format_windbg_address(address);
+	}
+
 	if (symbol_parser::nearest(address, name, displacement) == 1 && name.empty() == false)
 	{
 		if (displacement == 0)
@@ -8877,6 +8924,13 @@ static std::uint8_t build_stack_frames(const breakpoint::registers_t& registers,
 
 		if (unwind_with_pdata(modules, regs, extra_cr3, child_sp, ret) == 0 && leaf_unwind(regs, extra_cr3, child_sp, ret) == 0)
 		{
+			if (preempt_view() != 0)
+			{
+				frames_out.clear();
+
+				return 0;
+			}
+
 			frame.child_sp = previous_rsp;
 			frames_out.push_back(frame);
 
@@ -10279,6 +10333,14 @@ std::uint8_t commands::views::stack(const std::uint32_t frame_count, std::vector
 		commands::views::stack_frame_t entry = {};
 
 		entry.symbol = stack_call_site(frame.rip);
+
+		if (preempt_view() != 0)
+		{
+			frames_out.clear();
+
+			return 0;
+		}
+
 		entry.child_sp = frame.child_sp;
 		entry.return_address = frame.ret;
 		entry.instruction_pointer = frame.rip;
@@ -10903,6 +10965,11 @@ std::uint8_t commands::interrupt_requested()
 void commands::set_view_preempt(std::uint8_t (*preempt)())
 {
 	g_view_preempt = preempt;
+}
+
+void commands::latch_view_preempt()
+{
+	g_view_preempted = 1;
 }
 
 void commands::clear_view_preempted()

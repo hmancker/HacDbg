@@ -211,6 +211,24 @@ bool DisassemblyView::containsAddress(std::uint64_t address) const
     return false;
 }
 
+const DisassemblyView::Row* DisassemblyView::rowForAddress(std::uint64_t address) const
+{
+    if (address == 0)
+    {
+        return nullptr;
+    }
+
+    for (const Row& row : m_rows)
+    {
+        if (row.address == address)
+        {
+            return &row;
+        }
+    }
+
+    return nullptr;
+}
+
 const DisassemblyView::Row* DisassemblyView::selectedRow() const
 {
     if (m_selected < 0 || m_selected >= static_cast<int>(m_rows.size()))

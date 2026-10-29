@@ -8,6 +8,27 @@
 
 namespace hypercall
 {
+	//
+	// Serializes guest hypercalls. The command thread holds one section for a
+	// whole command. A view thread takes another only around each hypercall.
+	// While a command section is open, the view thread does not start another
+	// hypercall, so a step waits for the call already in flight and not for
+	// the rest of a process walk or dbghelp.
+	//
+	class GuestSection
+	{
+	public:
+		GuestSection();
+		~GuestSection();
+
+		GuestSection(const GuestSection&) = delete;
+		GuestSection& operator=(const GuestSection&) = delete;
+	};
+
+	void set_command_yield(void (*yield)());
+	void begin_command_guest();
+	void end_command_guest();
+
 	std::uint64_t read_guest_physical_memory(void* guest_destination_buffer,
 	                                         std::uint64_t guest_source_physical_address, std::uint64_t size);
 	std::uint64_t write_guest_physical_memory(const void* guest_source_buffer,

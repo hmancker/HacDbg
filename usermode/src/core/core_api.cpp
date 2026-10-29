@@ -59,7 +59,9 @@ struct HACDBG_CORE
 	std::condition_variable command_ready;
 	std::deque<std::string> commands;
 	std::thread worker;
+	std::thread view_worker;
 	std::atomic<std::uint8_t> running = 0;
+	std::atomic<std::uint8_t> command_active = 0;
 	std::uint8_t initialized = 0;
 	HACDBG_OUTPUT_CALLBACK output_callback = nullptr;
 	void* output_context = nullptr;
@@ -275,6 +277,12 @@ namespace
 		if (g_preempt_core == nullptr)
 		{
 			return 0;
+		}
+
+		if (g_preempt_core->running.load(std::memory_order_acquire) == 0 ||
+		    g_preempt_core->command_active.load(std::memory_order_acquire) != 0)
+		{
+			return 1;
 		}
 
 		std::lock_guard<std::mutex> lock(g_preempt_core->command_mutex);
@@ -654,7 +662,7 @@ namespace
 			std::lock_guard<std::mutex> lock(core->command_mutex);
 		}
 
-		core->command_ready.notify_one();
+		core->command_ready.notify_all();
 
 		return id;
 	}
@@ -936,9 +944,78 @@ namespace
 		core->trace_status.EventsEnabled = 0;
 	}
 
+	void view_loop(HACDBG_CORE* const core)
+	{
+		while (core->running.load(std::memory_order_acquire) != 0)
+		{
+			{
+				std::unique_lock<std::mutex> lock(core->command_mutex);
+				core->command_ready.wait_for(lock, std::chrono::milliseconds(100), [core]
+				{
+					return core->running.load(std::memory_order_acquire) == 0 ||
+					       (core->command_active.load(std::memory_order_acquire) == 0 && core->commands.empty() &&
+					        has_pending_view(core));
+				});
+			}
+
+			if (core->running.load(std::memory_order_acquire) == 0)
+			{
+				break;
+			}
+
+			if (view_command_pending() != 0)
+			{
+				continue;
+			}
+
+			core_view_request_t view_request = {};
+
+			if (take_view_request(core, view_request) == false)
+			{
+				continue;
+			}
+
+			if (view_command_pending() != 0)
+			{
+				requeue_preempted_view(core, view_request);
+				continue;
+			}
+
+			commands::clear_view_preempted();
+
+			try
+			{
+				execute_view_request(core, view_request);
+			}
+			catch (const std::exception& error)
+			{
+				if (commands::view_was_preempted() == 0)
+				{
+					publish_view_error(core, view_request, error.what());
+				}
+				else
+				{
+					requeue_preempted_view(core, view_request);
+				}
+			}
+			catch (...)
+			{
+				if (commands::view_was_preempted() == 0)
+				{
+					publish_view_error(core, view_request, "view request failed");
+				}
+				else
+				{
+					requeue_preempted_view(core, view_request);
+				}
+			}
+
+			commands::clear_view_preempted();
+		}
+	}
+
 	void worker_loop(HACDBG_CORE* const core)
 	{
-		commands::set_view_preempt(view_command_pending);
 
 		while (true)
 		{
@@ -950,8 +1027,7 @@ namespace
 				core->command_ready.wait_for(lock, wait_interval, [core]
 				{
 					return core->running.load() == 0 || core->commands.empty() == false ||
-					       has_pending_view(core) || has_pending_completion(core) ||
-					       has_pending_trace(core);
+					       has_pending_completion(core) || has_pending_trace(core);
 				});
 
 				if (core->running.load() == 0)
@@ -963,15 +1039,26 @@ namespace
 				{
 					command = std::move(core->commands.front());
 					core->commands.pop_front();
+					core->command_active.store(1, std::memory_order_release);
 				}
 			}
 
 			if (command.empty() == false)
 			{
 				commands::clear_cancel();
+				hypercall::begin_command_guest();
 
 				try
 				{
+					//
+					// Hold the guest section for the whole command. The view
+					// thread waits out this section instead of starting another
+					// guest read, including the process walk after a breakpoint.
+					// dbghelp does not take the section, so a step does not wait
+					// for it.
+					//
+					const hypercall::GuestSection guest;
+
 					commands::process(command);
 				}
 				catch (const std::exception& error)
@@ -979,6 +1066,10 @@ namespace
 					output::write(output::kind_t::error, error.what());
 				}
 
+				hypercall::end_command_guest();
+
+				core->command_active.store(0, std::memory_order_release);
+				core->command_ready.notify_all();
 				core->commands_completed += 1;
 
 				if (core->commands_completed == 0)
@@ -1081,55 +1172,6 @@ namespace
 
 			if (perform_trace_read(core) != false)
 			{
-				continue;
-			}
-
-			core_view_request_t view_request = {};
-
-			if (take_view_request(core, view_request) == true)
-			{
-				commands::clear_view_preempted();
-				g_preempt_core = core;
-
-				try
-				{
-					execute_view_request(core, view_request);
-				}
-				catch (const std::exception& error)
-				{
-					g_preempt_core = nullptr;
-
-					if (commands::view_was_preempted() == 0)
-					{
-						publish_view_error(core, view_request, error.what());
-					}
-					else
-					{
-						requeue_preempted_view(core, view_request);
-					}
-
-					commands::clear_view_preempted();
-					continue;
-				}
-				catch (...)
-				{
-					g_preempt_core = nullptr;
-
-					if (commands::view_was_preempted() == 0)
-					{
-						publish_view_error(core, view_request, "view request failed");
-					}
-					else
-					{
-						requeue_preempted_view(core, view_request);
-					}
-
-					commands::clear_view_preempted();
-					continue;
-				}
-
-				g_preempt_core = nullptr;
-				commands::clear_view_preempted();
 				continue;
 			}
 		}
@@ -1323,7 +1365,11 @@ uint32_t HacDbgCoreStart(HACDBG_CORE* const core)
 			copy_version(core->state.DriverVersion, version);
 		}
 
+		commands::set_view_preempt(view_command_pending);
+		hypercall::set_command_yield(commands::latch_view_preempt);
+		g_preempt_core = core;
 		core->worker = std::thread(worker_loop, core);
+		core->view_worker = std::thread(view_loop, core);
 		update_state(core);
 
 		return HacDbgCoreStatusOk;
@@ -1337,6 +1383,13 @@ uint32_t HacDbgCoreStart(HACDBG_CORE* const core)
 		{
 			core->worker.join();
 		}
+
+		if (core->view_worker.joinable() != false)
+		{
+			core->view_worker.join();
+		}
+
+		g_preempt_core = nullptr;
 
 		if (core->initialized != 0)
 		{
@@ -1366,6 +1419,13 @@ uint32_t HacDbgCoreStop(HACDBG_CORE* const core)
 	{
 		core->worker.join();
 	}
+
+	if (core->view_worker.joinable() != false)
+	{
+		core->view_worker.join();
+	}
+
+	g_preempt_core = nullptr;
 
 	if (core->initialized != 0)
 	{
@@ -1422,7 +1482,7 @@ uint32_t HacDbgCoreExecute(HACDBG_CORE* const core, const char* const utf8_comma
 			core->commands.emplace_back(utf8_command);
 		}
 
-		core->command_ready.notify_one();
+		core->command_ready.notify_all();
 
 		return HacDbgCoreStatusOk;
 	}
@@ -1828,7 +1888,7 @@ uint32_t HacDbgCoreTraceControl(HACDBG_CORE* const core, const uint32_t flags, c
 		std::lock_guard<std::mutex> lock(core->command_mutex);
 	}
 
-	core->command_ready.notify_one();
+	core->command_ready.notify_all();
 
 	return HacDbgCoreStatusOk;
 }
@@ -1865,7 +1925,7 @@ uint32_t HacDbgCoreRequestTraceRead(HACDBG_CORE* const core)
 		std::lock_guard<std::mutex> lock(core->command_mutex);
 	}
 
-	core->command_ready.notify_one();
+	core->command_ready.notify_all();
 
 	return HacDbgCoreStatusOk;
 }
@@ -1990,7 +2050,7 @@ uint64_t HacDbgCoreRequestCompletions(HACDBG_CORE* const core, const char* const
 			std::lock_guard<std::mutex> lock(core->command_mutex);
 		}
 
-		core->command_ready.notify_one();
+		core->command_ready.notify_all();
 
 		return id;
 	}

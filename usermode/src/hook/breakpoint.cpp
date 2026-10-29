@@ -4064,6 +4064,8 @@ std::vector<breakpoint::monitor_hit_t> breakpoint::take_monitor_hits()
 
 std::uint8_t breakpoint::has_paused_thread()
 {
+	const hypercall::GuestSection guest;
+
 	return pause_state.valid;
 }
 
@@ -4083,6 +4085,8 @@ std::vector<trap_frame_log_t> breakpoint::take_pending_logs()
 
 std::uint8_t breakpoint::paused_registers(registers_t& registers_out)
 {
+	const hypercall::GuestSection guest;
+
 	if (pause_state.valid == 0)
 	{
 		return 0;
@@ -4149,6 +4153,8 @@ std::uint8_t breakpoint::set_paused_register(const std::string_view name, const 
 
 std::uint8_t breakpoint::read_paused_virtual(void* const buffer, const std::uint64_t address, const std::uint64_t size)
 {
+	const hypercall::GuestSection guest;
+
 	if (buffer == nullptr || pause_state.registers.cr3 == 0)
 	{
 		return 0;
@@ -4159,6 +4165,8 @@ std::uint8_t breakpoint::read_paused_virtual(void* const buffer, const std::uint
 
 std::uint8_t breakpoint::write_paused_virtual(const void* const buffer, const std::uint64_t address, const std::uint64_t size)
 {
+	const hypercall::GuestSection guest;
+
 	if (buffer == nullptr || pause_state.registers.cr3 == 0)
 	{
 		return 0;

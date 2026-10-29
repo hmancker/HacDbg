@@ -21,6 +21,7 @@ namespace commands
 	// back so that command runs before the view is tried again.
 	//
 	void set_view_preempt(std::uint8_t (*preempt)());
+	void latch_view_preempt();
 	void clear_view_preempted();
 	std::uint8_t view_was_preempted();
 

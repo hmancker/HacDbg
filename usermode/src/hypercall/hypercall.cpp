@@ -6,7 +6,10 @@
 #include "../system/system.h"
 
 #include <atomic>
+#include <condition_variable>
+#include <cstdint>
 #include <mutex>
+#include <thread>
 
 extern "C" std::uint64_t launch_raw_hypercall(hypercall_info_t rcx, std::uint64_t rdx, std::uint64_t r8,
                                               std::uint64_t r9);
@@ -15,6 +18,117 @@ static_assert(sizeof(HACDBG_HYPERCALL_REQUEST) == 0x40, "IOCTL ABI changed");
 static_assert(sizeof(HACDBG_VERSION_INFO) == 0x30, "version ABI changed");
 
 static std::mutex g_flush_mutex;
+static std::recursive_mutex g_guest_mutex;
+static std::mutex g_command_wait_mutex;
+static std::condition_variable g_command_cv;
+static std::atomic<std::uint8_t> g_command_guest = 0;
+static std::atomic<std::uint32_t> g_command_cookie = 0;
+static std::atomic<std::uint32_t> g_next_thread_cookie = 1;
+static thread_local std::uint32_t t_thread_cookie = 0;
+static thread_local int t_guest_depth = 0;
+static void (*g_command_yield)() = nullptr;
+
+static std::uint32_t this_thread_cookie()
+{
+	if (t_thread_cookie == 0)
+	{
+		const std::uint32_t cookie = g_next_thread_cookie.fetch_add(1, std::memory_order_relaxed);
+
+		t_thread_cookie = cookie == 0 ? g_next_thread_cookie.fetch_add(1, std::memory_order_relaxed) : cookie;
+	}
+
+	return t_thread_cookie;
+}
+
+static std::uint8_t command_guest_blocks(const std::uint32_t cookie)
+{
+	return static_cast<std::uint8_t>(g_command_guest.load(std::memory_order_acquire) != 0 &&
+	                                 g_command_cookie.load(std::memory_order_acquire) != cookie);
+}
+
+void hypercall::set_command_yield(void (*const yield)())
+{
+	g_command_yield = yield;
+}
+
+void hypercall::begin_command_guest()
+{
+	const std::lock_guard<std::mutex> wait(g_command_wait_mutex);
+
+	g_command_cookie.store(this_thread_cookie(), std::memory_order_release);
+	g_command_guest.store(1, std::memory_order_release);
+}
+
+void hypercall::end_command_guest()
+{
+	{
+		const std::lock_guard<std::mutex> wait(g_command_wait_mutex);
+
+		g_command_guest.store(0, std::memory_order_release);
+		g_command_cookie.store(0, std::memory_order_release);
+	}
+
+	g_command_cv.notify_all();
+}
+
+hypercall::GuestSection::GuestSection()
+{
+	if (t_guest_depth == 0)
+	{
+		const std::uint32_t mine = this_thread_cookie();
+
+		for (;;)
+		{
+			{
+				std::unique_lock<std::mutex> wait(g_command_wait_mutex);
+
+				if (command_guest_blocks(mine) != 0)
+				{
+					if (g_command_yield != nullptr)
+					{
+						g_command_yield();
+					}
+
+					g_command_cv.wait(wait, [mine]
+					{
+						return command_guest_blocks(mine) == 0;
+					});
+				}
+			}
+
+			g_guest_mutex.lock();
+
+			std::uint8_t blocked = 0;
+
+			{
+				const std::lock_guard<std::mutex> wait(g_command_wait_mutex);
+
+				blocked = command_guest_blocks(mine);
+			}
+
+			if (blocked != 0)
+			{
+				g_guest_mutex.unlock();
+
+				continue;
+			}
+
+			break;
+		}
+	}
+	else
+	{
+		g_guest_mutex.lock();
+	}
+
+	t_guest_depth += 1;
+}
+
+hypercall::GuestSection::~GuestSection()
+{
+	t_guest_depth -= 1;
+	g_guest_mutex.unlock();
+}
 
 static HACDBG_LOG_MAILBOX* g_log_mailbox = nullptr;
 static std::uint64_t g_log_mailbox_key = 0;
@@ -196,6 +310,7 @@ static std::uint8_t offset_wraps(const std::uint64_t address, const std::uint64_
 static std::uint64_t launch_cpuid_hypercall(const hypercall_type_t call_type, const std::uint64_t call_reserved_data,
                                             const std::uint64_t rdx, const std::uint64_t r8, const std::uint64_t r9)
 {
+	const hypercall::GuestSection guest;
 	hypercall_info_t hypercall_info = {};
 
 	hypercall_info.primary_key = hypercall_primary_key;
