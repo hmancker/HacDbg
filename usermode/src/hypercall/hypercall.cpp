@@ -169,27 +169,22 @@ static std::uint8_t driver_has_log_mailbox()
 		return 0;
 	}
 
-	if (major > HACDBG_VERSION_MAJOR)
+	// The mailbox was added in 1.1.5. Later minor versions still have it.
+	if (major != 1)
+	{
+		return static_cast<std::uint8_t>(major > 1);
+	}
+
+	if (minor > 1)
 	{
 		return 1;
 	}
 
-	if (major < HACDBG_VERSION_MAJOR)
+	if (minor < 1)
 	{
 		return 0;
 	}
 
-	if (minor > HACDBG_VERSION_MINOR)
-	{
-		return 1;
-	}
-
-	if (minor < HACDBG_VERSION_MINOR)
-	{
-		return 0;
-	}
-
-	// The mailbox was added in 1.1.5. A later patch still has it.
 	return static_cast<std::uint8_t>(patch >= 5);
 }
 
@@ -329,7 +324,7 @@ std::uint8_t hypercall::query_driver_version(std::uint32_t& major, std::uint32_t
                                              std::string& version)
 {
 	HACDBG_VERSION_INFO info = {};
-	const std::uint64_t written = launch_cpuid_hypercall(hypercall_type_t::query_hypervisor_version, 0,
+	const std::uint64_t written = launch_cpuid_hypercall(hypercall_type_t::flush_logs, flush_logs_query_version,
 	                                                     reinterpret_cast<std::uint64_t>(&info), sizeof(info), 0);
 
 	if (written != sizeof(info) || info.VersionString[0] == '\0')
@@ -348,10 +343,11 @@ std::uint8_t hypercall::query_driver_version(std::uint32_t& major, std::uint32_t
 std::uint64_t hypercall::add_slat_code_hook(const std::uint64_t target_guest_physical_address,
                                             const std::uint64_t shadow_page_guest_physical_address)
 {
-	constexpr auto call_type = hypercall_type_t::add_slat_code_hook;
+	constexpr auto call_type = hypercall_type_t::slat;
 
 	const std::uint64_t result =
-		launch_cpuid_hypercall(call_type, 0, target_guest_physical_address, shadow_page_guest_physical_address, 0);
+		launch_cpuid_hypercall(call_type, slat_add_hook, target_guest_physical_address,
+		                       shadow_page_guest_physical_address, 0);
 
 	if (result == 1)
 	{
@@ -363,9 +359,9 @@ std::uint64_t hypercall::add_slat_code_hook(const std::uint64_t target_guest_phy
 
 std::uint64_t hypercall::remove_slat_code_hook(const std::uint64_t target_guest_physical_address)
 {
-	constexpr auto call_type = hypercall_type_t::remove_slat_code_hook;
+	constexpr auto call_type = hypercall_type_t::slat;
 
-	const std::uint64_t result = launch_cpuid_hypercall(call_type, 0, target_guest_physical_address, 0, 0);
+	const std::uint64_t result = launch_cpuid_hypercall(call_type, slat_remove_hook, target_guest_physical_address, 0, 0);
 
 	if (result == 1)
 	{
@@ -377,9 +373,9 @@ std::uint64_t hypercall::remove_slat_code_hook(const std::uint64_t target_guest_
 
 std::uint64_t hypercall::hide_guest_physical_page(const std::uint64_t target_guest_physical_address)
 {
-	constexpr auto call_type = hypercall_type_t::hide_guest_physical_page;
+	constexpr auto call_type = hypercall_type_t::slat;
 
-	const std::uint64_t result = launch_cpuid_hypercall(call_type, 0, target_guest_physical_address, 0, 0);
+	const std::uint64_t result = launch_cpuid_hypercall(call_type, slat_hide_page, target_guest_physical_address, 0, 0);
 
 	if (result == 1)
 	{
@@ -533,9 +529,9 @@ std::uint8_t hypercall::log_notify_idle()
 
 std::uint64_t hypercall::get_heap_free_page_count()
 {
-	constexpr auto call_type = hypercall_type_t::get_heap_free_page_count;
+	constexpr auto call_type = hypercall_type_t::slat;
 
-	return launch_cpuid_hypercall(call_type, 0, 0, 0, 0);
+	return launch_cpuid_hypercall(call_type, slat_free_page_count, 0, 0, 0);
 }
 
 static std::uint8_t wait_for_processor(const WORD group, const DWORD number)
@@ -567,7 +563,7 @@ static std::uint64_t flush_slat_on_every_processor()
 
 	if (GetThreadGroupAffinity(thread, &previous) == FALSE)
 	{
-		return launch_cpuid_hypercall(hypercall_type_t::flush_slat_cache, 0, 0, 0, 0);
+		return launch_cpuid_hypercall(hypercall_type_t::slat, slat_flush, 0, 0, 0);
 	}
 
 	for (WORD group = 0; group < group_count; ++group)
@@ -587,7 +583,7 @@ static std::uint64_t flush_slat_on_every_processor()
 				continue;
 			}
 
-			launch_cpuid_hypercall(hypercall_type_t::flush_slat_cache, 0, 0, 0, 0);
+			launch_cpuid_hypercall(hypercall_type_t::slat, slat_flush, 0, 0, 0);
 			visited += 1;
 		}
 	}
@@ -596,7 +592,7 @@ static std::uint64_t flush_slat_on_every_processor()
 
 	if (visited == 0)
 	{
-		return launch_cpuid_hypercall(hypercall_type_t::flush_slat_cache, 0, 0, 0, 0);
+		return launch_cpuid_hypercall(hypercall_type_t::slat, slat_flush, 0, 0, 0);
 	}
 
 	return 1;
@@ -609,14 +605,14 @@ std::uint64_t hypercall::flush_slat_cache()
 
 std::uint64_t hypercall::breakpoint_resume()
 {
-	constexpr auto call_type = hypercall_type_t::breakpoint_resume;
+	constexpr auto call_type = hypercall_type_t::breakpoint;
 
 	return launch_cpuid_hypercall(call_type, breakpoint_resume_publish, 0, 0, 0);
 }
 
 std::uint64_t hypercall::breakpoint_abandon()
 {
-	constexpr auto call_type = hypercall_type_t::breakpoint_resume;
+	constexpr auto call_type = hypercall_type_t::breakpoint;
 
 	return launch_cpuid_hypercall(call_type, breakpoint_resume_abandon, 0, 0, 0);
 }
@@ -624,15 +620,15 @@ std::uint64_t hypercall::breakpoint_abandon()
 std::uint64_t hypercall::trace_control(const std::uint64_t control_flags, const std::uint32_t sample_rate,
                                        const std::uint32_t event_mask)
 {
-	constexpr auto call_type = hypercall_type_t::trace_control;
+	constexpr auto call_type = hypercall_type_t::trace;
 
-	return launch_cpuid_hypercall(call_type, 0, control_flags, sample_rate, event_mask);
+	return launch_cpuid_hypercall(call_type, trace_control_op, control_flags, sample_rate, event_mask);
 }
 
 std::uint64_t hypercall::trace_read(HACDBG_TRACE_SNAPSHOT& snapshot_out, const std::uint32_t cpu_filter)
 {
-	constexpr auto call_type = hypercall_type_t::trace_read;
+	constexpr auto call_type = hypercall_type_t::trace;
 
-	return launch_cpuid_hypercall(call_type, 0, reinterpret_cast<std::uint64_t>(&snapshot_out),
+	return launch_cpuid_hypercall(call_type, trace_read_op, reinterpret_cast<std::uint64_t>(&snapshot_out),
 	                              sizeof(snapshot_out), cpu_filter);
 }

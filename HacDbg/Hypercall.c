@@ -607,29 +607,43 @@ HypercallExecute(
         break;
     }
 
-    case add_slat_code_hook:
-        result = HacDbgSlatAddHook(HacDbgGuestPhysicalAddress(registers->Rdx),
-                                   HacDbgGuestPhysicalAddress(registers->R8)) != FALSE;
-        if (result != 0)
+    case slat:
+        if (Information->call_reserved_data == slat_add_hook)
         {
-            HacDbgSlatFlush();
+            result = HacDbgSlatAddHook(HacDbgGuestPhysicalAddress(registers->Rdx),
+                                       HacDbgGuestPhysicalAddress(registers->R8)) != FALSE;
+            if (result != 0)
+            {
+                HacDbgSlatFlush();
+            }
         }
-        break;
+        else if (Information->call_reserved_data == slat_remove_hook)
+        {
+            result = HacDbgSlatRemoveHook(HacDbgGuestPhysicalAddress(registers->Rdx)) != FALSE;
+            if (result != 0)
+            {
+                HacDbgSlatFlush();
+            }
+        }
+        else if (Information->call_reserved_data == slat_hide_page)
+        {
+            result = HacDbgSlatHidePage(HacDbgGuestPhysicalAddress(registers->Rdx)) != FALSE;
+            if (result != 0)
+            {
+                HacDbgSlatFlush();
+            }
+        }
+        else if (Information->call_reserved_data == slat_flush)
+        {
+            HacDbgSlatRefreshHooks();
+            HacDbgSlatFlush();
+            result = 1;
+        }
+        else if (Information->call_reserved_data == slat_free_page_count)
+        {
+            result = HacDbgSlatFreePages();
+        }
 
-    case remove_slat_code_hook:
-        result = HacDbgSlatRemoveHook(HacDbgGuestPhysicalAddress(registers->Rdx)) != FALSE;
-        if (result != 0)
-        {
-            HacDbgSlatFlush();
-        }
-        break;
-
-    case hide_guest_physical_page:
-        result = HacDbgSlatHidePage(HacDbgGuestPhysicalAddress(registers->Rdx)) != FALSE;
-        if (result != 0)
-        {
-            HacDbgSlatFlush();
-        }
         break;
 
     case log_current_state:
@@ -670,40 +684,27 @@ HypercallExecute(
         {
             result = LogsFlush(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx), registers->R8);
         }
-
-        break;
-
-    case get_heap_free_page_count:
-        result = HacDbgSlatFreePages();
-        break;
-
-    case flush_slat_cache:
-        HacDbgSlatRefreshHooks();
-        HacDbgSlatFlush();
-        result = 1;
-        break;
-
-    case query_hypervisor_version:
-    {
-        HACDBG_VERSION_INFO info;
-
-        if (registers->R8 < sizeof(info) || registers->Rdx == 0)
+        else if (Information->call_reserved_data == flush_logs_query_version)
         {
+            HACDBG_VERSION_INFO info;
+
+            if (registers->R8 >= sizeof(info) && registers->Rdx != 0)
+            {
+                HypercallFillVersion(&info);
+                result = GuestVirtualWrite(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx),
+                                           &info, sizeof(info));
+            }
+        }
+
+        break;
+
+    case breakpoint:
+        if (Information->call_reserved_data == breakpoint_pause_poll)
+        {
+            result = GuestContext->InGuest == FALSE ? 0 : HypercallBreakpointPausePoll(GuestContext);
             break;
         }
 
-        HypercallFillVersion(&info);
-        result = GuestVirtualWrite(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx),
-                                   &info, sizeof(info));
-        break;
-    }
-
-    case breakpoint_pause_poll:
-        result = GuestContext->InGuest == FALSE ? 0 : HypercallBreakpointPausePoll(GuestContext);
-        break;
-
-    case breakpoint_resume:
-    {
         HacDbgSpinLockAcquire(&g_BreakpointLock);
 
         if (Information->call_reserved_data == breakpoint_resume_abandon)
@@ -720,7 +721,8 @@ HypercallExecute(
             g_BreakpointLatchPa = 0;
             result = 1;
         }
-        else if (g_BreakpointPauseActive != FALSE)
+        else if (Information->call_reserved_data == breakpoint_resume_publish &&
+                 g_BreakpointPauseActive != FALSE)
         {
             HypercallPublishLatch();
             result = 1;
@@ -728,15 +730,18 @@ HypercallExecute(
 
         HacDbgSpinLockRelease(&g_BreakpointLock);
         break;
-    }
 
-    case trace_control:
-        result = TraceControl(registers->Rdx, registers->R8, registers->R9);
-        break;
+    case trace:
+        if (Information->call_reserved_data == trace_control_op)
+        {
+            result = TraceControl(registers->Rdx, registers->R8, registers->R9);
+        }
+        else if (Information->call_reserved_data == trace_read_op)
+        {
+            result = TraceRead(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx),
+                               registers->R8, registers->R9);
+        }
 
-    case trace_read:
-        result = TraceRead(CurrentCr3, HacDbgGuestVirtualAddress(registers->Rdx),
-                           registers->R8, registers->R9);
         break;
 
     default:

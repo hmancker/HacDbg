@@ -16,22 +16,15 @@ enum class hypercall_type_t : std::uint64_t
 typedef enum _hypercall_type_t
 #endif
 {
-    guest_physical_memory_operation,
-    guest_virtual_memory_operation,
-    translate_guest_virtual_address,
-    read_guest_cr3,
-    add_slat_code_hook,
-    remove_slat_code_hook,
-    hide_guest_physical_page,
-    log_current_state,
-    flush_logs,
-    get_heap_free_page_count,
-    flush_slat_cache,
-    breakpoint_pause_poll,
-    breakpoint_resume,
-    query_hypervisor_version,
-    trace_control,
-    trace_read
+    guest_physical_memory_operation = 0,
+    guest_virtual_memory_operation = 1,
+    translate_guest_virtual_address = 2,
+    read_guest_cr3 = 3,
+    slat = 4,
+    log_current_state = 5,
+    flush_logs = 6,
+    breakpoint = 7,
+    trace = 8
 #ifdef __cplusplus
 };
 #else
@@ -39,13 +32,30 @@ typedef enum _hypercall_type_t
 #endif
 
 #ifdef __cplusplus
-static_assert(static_cast<std::uint64_t>(hypercall_type_t::trace_control) == 14,
-              "hypercall trace_control number changed");
-static_assert(static_cast<std::uint64_t>(hypercall_type_t::trace_read) == 15,
-              "hypercall trace_read number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::guest_physical_memory_operation) == 0,
+              "hypercall number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::guest_virtual_memory_operation) == 1,
+              "hypercall number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::translate_guest_virtual_address) == 2,
+              "hypercall number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::read_guest_cr3) == 3,
+              "hypercall number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::slat) == 4, "hypercall number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::log_current_state) == 5,
+              "hypercall number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::flush_logs) == 6, "hypercall number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::breakpoint) == 7, "hypercall number changed");
+static_assert(static_cast<std::uint64_t>(hypercall_type_t::trace) == 8, "hypercall number changed");
 #else
-_Static_assert(trace_control == 14, "hypercall trace_control number changed");
-_Static_assert(trace_read == 15, "hypercall trace_read number changed");
+_Static_assert(guest_physical_memory_operation == 0, "hypercall number changed");
+_Static_assert(guest_virtual_memory_operation == 1, "hypercall number changed");
+_Static_assert(translate_guest_virtual_address == 2, "hypercall number changed");
+_Static_assert(read_guest_cr3 == 3, "hypercall number changed");
+_Static_assert(slat == 4, "hypercall number changed");
+_Static_assert(log_current_state == 5, "hypercall number changed");
+_Static_assert(flush_logs == 6, "hypercall number changed");
+_Static_assert(breakpoint == 7, "hypercall number changed");
+_Static_assert(trace == 8, "hypercall number changed");
 #endif
 
 // log_current_state with this bit set is a breakpoint hit. The stub pushes
@@ -69,16 +79,30 @@ constexpr std::uint64_t hypercall_secondary_key = 0x7F;
 // parked guest and the resume write see the same qword.
 constexpr std::uint64_t pause_latch_signature = 0x484354414C434148ull;
 
-// breakpoint_resume call_reserved_data. 0 publishes the latch as 1.
-// 1 drops the pause because the owner thread is gone and will not confirm.
-constexpr std::uint64_t breakpoint_resume_publish = 0;
-constexpr std::uint64_t breakpoint_resume_abandon = 1;
+// slat call_reserved_data. 0 installs a code hook. 1 removes one. 2 hides a
+// page. 3 refreshes hook copies and the SLAT TLB. 4 returns free SLAT pages.
+constexpr std::uint64_t slat_add_hook = 0;
+constexpr std::uint64_t slat_remove_hook = 1;
+constexpr std::uint64_t slat_hide_page = 2;
+constexpr std::uint64_t slat_flush = 3;
+constexpr std::uint64_t slat_free_page_count = 4;
 
-// flush_logs call_reserved_data. 0 copies the kernel log ring. The call-type
-// field is 4 bits and 0..15 are already assigned, so the mailbox shares this
-// call. 1 registers the caller's HACDBG_LOG_MAILBOX. 2 drops that registration.
+// breakpoint call_reserved_data. 0 is the guest pause poll. 1 publishes the
+// latch as 1. 2 drops the pause because the owner thread is gone.
+constexpr std::uint64_t breakpoint_pause_poll = 0;
+constexpr std::uint64_t breakpoint_resume_publish = 1;
+constexpr std::uint64_t breakpoint_resume_abandon = 2;
+
+// flush_logs call_reserved_data. 0 copies the kernel log ring. 1 registers
+// the caller's HACDBG_LOG_MAILBOX. 2 drops that registration. 3 writes
+// HACDBG_VERSION_INFO into the caller buffer.
 constexpr std::uint64_t flush_logs_register_mailbox = 1;
 constexpr std::uint64_t flush_logs_unregister_mailbox = 2;
+constexpr std::uint64_t flush_logs_query_version = 3;
+
+// trace call_reserved_data. 0 changes capture state. 1 copies a snapshot.
+constexpr std::uint64_t trace_control_op = 0;
+constexpr std::uint64_t trace_read_op = 1;
 
 // Bytes copied inside one CPUID vmexit. The copy runs in Hyper-V's vmexit
 // handler, so a longer exit can stall the guest long enough to bugcheck.
@@ -87,10 +111,19 @@ constexpr std::uint64_t hypercall_memory_chunk_size = 0x10000;
 #define hypercall_primary_key 0x4E47
 #define hypercall_secondary_key 0x7F
 #define pause_latch_signature 0x484354414C434148ull
-#define breakpoint_resume_publish 0
-#define breakpoint_resume_abandon 1
+#define slat_add_hook 0
+#define slat_remove_hook 1
+#define slat_hide_page 2
+#define slat_flush 3
+#define slat_free_page_count 4
+#define breakpoint_pause_poll 0
+#define breakpoint_resume_publish 1
+#define breakpoint_resume_abandon 2
 #define flush_logs_register_mailbox 1
 #define flush_logs_unregister_mailbox 2
+#define flush_logs_query_version 3
+#define trace_control_op 0
+#define trace_read_op 1
 #define hypercall_memory_chunk_size 0x10000
 #endif
 

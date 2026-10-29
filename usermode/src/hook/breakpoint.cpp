@@ -1493,7 +1493,8 @@ namespace
 
 		call_info.primary_key = hypercall_primary_key;
 		call_info.secondary_key = hypercall_secondary_key;
-		call_info.call_type = hypercall_type_t::breakpoint_pause_poll;
+		call_info.call_type = hypercall_type_t::breakpoint;
+		call_info.call_reserved_data = breakpoint_pause_poll;
 
 		std::vector<std::uint8_t> entry1_bytes = {
 			0x9C, 0x53, 0x55, 0x56, 0x57, 0x41, 0x51, 0x41, 0x52, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x50, 0x51,
@@ -1991,7 +1992,8 @@ namespace
 
 		call_info.primary_key = hypercall_primary_key;
 		call_info.secondary_key = hypercall_secondary_key;
-		call_info.call_type = hypercall_type_t::breakpoint_pause_poll;
+		call_info.call_type = hypercall_type_t::breakpoint;
+		call_info.call_reserved_data = breakpoint_pause_poll;
 
 		std::vector<std::uint8_t> entry1_bytes = {
 			0x9C, 0x53, 0x55, 0x56, 0x57, 0x41, 0x51, 0x41, 0x52, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x50, 0x51,
@@ -2897,7 +2899,8 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 		call_info.primary_key = hypercall_primary_key;
 		call_info.secondary_key = hypercall_secondary_key;
-		call_info.call_type = hypercall_type_t::breakpoint_pause_poll;
+		call_info.call_type = hypercall_type_t::breakpoint;
+		call_info.call_reserved_data = breakpoint_pause_poll;
 
 		std::vector<std::uint8_t> entry1_bytes = {
 			0x9C, 0x53, 0x55, 0x56, 0x57, 0x41, 0x51, 0x41, 0x52, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x50, 0x51,

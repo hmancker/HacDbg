@@ -292,7 +292,7 @@ TraceIsOwnHypercall(
     information.value = Rcx;
     return information.primary_key == hypercall_primary_key &&
            information.secondary_key == hypercall_secondary_key &&
-           (information.call_type == trace_control || information.call_type == trace_read);
+           information.call_type == trace;
 }
 
 static VOID

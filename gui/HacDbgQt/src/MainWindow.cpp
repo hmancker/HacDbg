@@ -31,7 +31,7 @@
 
 namespace
 {
-constexpr std::uint32_t kExpectedHypercallAbi = 1;
+constexpr std::uint32_t kExpectedHypercallAbi = 2;
 
 enum DebugIcon
 {

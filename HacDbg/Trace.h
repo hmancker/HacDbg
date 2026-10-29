@@ -72,8 +72,8 @@ TraceCpuState(
  * @brief Records one VM exit in the current processor's counters and ring.
  *
  * @details This runs in the exit path and performs no allocation, blocking, or
- * logging. The trace_control and trace_read hypercalls are ignored so reading
- * trace does not create additional trace events.
+ * logging. The trace hypercall is ignored so reading trace does not create
+ * additional trace events.
  */
 VOID
 TraceRecordExit(
