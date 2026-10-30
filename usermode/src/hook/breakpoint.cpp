@@ -2338,6 +2338,8 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 	constexpr std::uint64_t kernel_pause_slack = 96;
 	constexpr std::uint64_t kernel_pause_need = kernel_pause_fixed + kernel_pause_slack;
 
+	static_assert(kernel_pause_need == kernel_pause_fixed + kernel_pause_slack);
+
 	std::uint64_t kernel_directory()
 	{
 		const nt_offsets_t* const nt = nt_offsets_current();
@@ -2374,6 +2376,10 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 	std::uint64_t kernel_pause_physical = 0;
 	std::uint64_t kernel_pause_virtual = 0;
 	std::uint64_t kernel_pause_used = 0;
+	std::uint8_t* kernel_cave_page = nullptr;
+	std::uint64_t kernel_cave_physical = 0;
+	std::uint64_t kernel_cave_virtual = 0;
+	std::uint64_t kernel_cave_used = 0;
 
 	std::uint8_t ensure_supervisor_entry(const std::uint64_t table_physical, const std::uint64_t index,
 	                                     std::uint64_t& next_physical, const std::uint8_t create)
@@ -2531,6 +2537,103 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 		return 0;
 	}
 
+	//
+	// Image padding is not long enough for every prologue. This page is filled
+	// with INT3 and mapped into the kernel directory, then the breakpoint path
+	// shadows it the same way it shadows an ntoskrnl pad.
+	//
+	std::uint8_t ensure_kernel_cave_page(const std::uint64_t kernel_cr3)
+	{
+		if (kernel_cave_page != nullptr)
+		{
+			return 1;
+		}
+
+		const auto module = sys::kernel::modules_list.find("ntoskrnl.exe");
+
+		if (module == sys::kernel::modules_list.end() || module->second.base_address == 0 || module->second.size == 0)
+		{
+			return 0;
+		}
+
+		auto* const page = static_cast<std::uint8_t*>(sys::user::allocate_locked_memory(page_size, PAGE_EXECUTE_READWRITE));
+
+		if (page == nullptr)
+		{
+			return 0;
+		}
+
+		std::memset(page, 0xCC, page_size);
+
+		const std::uint64_t physical = hypercall::translate_guest_virtual_address(
+			reinterpret_cast<std::uint64_t>(page), sys::directory_for_local_memory());
+
+		if (physical == 0)
+		{
+			sys::user::free_memory(page);
+
+			return 0;
+		}
+
+		const std::uint64_t start = (module->second.base_address + module->second.size + page_size - 1) & ~0xFFFull;
+		constexpr std::uint64_t scan = 64ull * 1024ull * 1024ull;
+		const std::uint64_t session = sys::current_cr3 & page_table_entry_mask;
+		const std::uint64_t primary = kernel_cr3 & page_table_entry_mask;
+
+		for (std::uint64_t offset = 0; offset < scan; offset += page_size)
+		{
+			const std::uint64_t candidate = start + offset;
+
+			if (user_page_is_present(kernel_cr3, candidate) == 1)
+			{
+				continue;
+			}
+
+			if (map_supervisor_page(kernel_cr3, candidate, physical) == 0)
+			{
+				continue;
+			}
+
+			if (session != 0 && session != primary)
+			{
+				map_supervisor_page(session, candidate, physical);
+			}
+
+			kernel_cave_page = page;
+			kernel_cave_physical = physical & page_table_entry_mask;
+			kernel_cave_virtual = candidate;
+			kernel_cave_used = 0;
+			LOG_INFO("kernel breakpoint cave page 0x{:x}", candidate);
+
+			return 1;
+		}
+
+		sys::user::free_memory(page);
+
+		return 0;
+	}
+
+	std::uint64_t allocate_kernel_cave(const std::uint64_t kernel_cr3, const std::uint64_t need)
+	{
+		if (need == 0 || need > page_size || ensure_kernel_cave_page(kernel_cr3) == 0)
+		{
+			return 0;
+		}
+
+		const std::uint64_t aligned = (kernel_cave_used + 15) & ~0xFull;
+
+		if (aligned + need > page_size)
+		{
+			return 0;
+		}
+
+		const std::uint64_t cave = kernel_cave_virtual + aligned;
+
+		kernel_cave_used = aligned + need;
+
+		return cave;
+	}
+
 	std::uint8_t place_kernel_pause_park(const std::uint64_t kernel_cr3, const std::uint64_t reentry, pause_park_site_t& site)
 	{
 		if (ensure_kernel_pause_page(kernel_cr3) == 0)
@@ -2603,10 +2706,16 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 	}
 
 	std::uint64_t padding_run(const std::uint8_t* const page, const std::uint64_t page_address, const std::uint64_t readable,
-	                          const std::uint64_t site, const std::uint64_t kernel_cr3)
+	                          const std::uint64_t site, const std::uint64_t kernel_cr3, const std::uint64_t need,
+	                          const std::uint8_t require_rel32)
 	{
 		std::uint64_t run = 0;
 		std::uint64_t run_start = 0;
+
+		if (need == 0 || need > page_size)
+		{
+			return 0;
+		}
 
 		for (std::uint64_t index = 0; index < readable; index++)
 		{
@@ -2628,19 +2737,27 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 			run++;
 
-			if ((run_start & 0xFFFull) + kernel_pause_need > page_size)
+			if ((run_start & 0xFFFull) + need > page_size)
 			{
 				run = 0;
 
 				continue;
 			}
 
-			if (run < kernel_pause_need)
+			if (run < need)
 			{
 				continue;
 			}
 
-			if (cave_conflicts(run_start, kernel_pause_need, site) == 1)
+			if (require_rel32 == 1 &&
+				(rel32_reaches(site, run_start) == 0 || rel32_reaches(run_start, site) == 0))
+			{
+				run = 0;
+
+				continue;
+			}
+
+			if (cave_conflicts(run_start, need, site) == 1)
 			{
 				run = 0;
 
@@ -2662,7 +2779,8 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 		return 0;
 	}
 
-	std::uint64_t find_kernel_cave(const std::uint64_t site, const std::uint64_t kernel_cr3)
+	std::uint64_t find_kernel_cave(const std::uint64_t site, const std::uint64_t kernel_cr3, const std::uint64_t need,
+	                               const std::uint8_t require_rel32)
 	{
 		const auto module = sys::kernel::modules_list.find("ntoskrnl.exe");
 
@@ -2734,7 +2852,8 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 						continue;
 					}
 
-					const std::uint64_t found = padding_run(page, page_address, readable, site, kernel_cr3);
+					const std::uint64_t found = padding_run(page, page_address, readable, site, kernel_cr3, need,
+					                                        require_rel32);
 
 					if (found != 0)
 					{
@@ -2745,6 +2864,60 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 		}
 
 		return 0;
+	}
+
+	std::uint8_t kernel_site_fits(const std::pair<std::vector<std::uint8_t>, std::uint64_t>& aligned,
+	                              const std::uint64_t jump_size, const std::uint64_t bytes_available,
+	                              const std::uint64_t bytes_until_next, const std::uint64_t bytes_left_in_page,
+	                              const std::uint64_t page_physical, const std::uint64_t page_offset,
+	                              const std::uint8_t report)
+	{
+		if (aligned.first.empty() == true || aligned.second < jump_size)
+		{
+			if (report == 1)
+			{
+				LOG_ERR("failed to decode breakpoint site");
+			}
+
+			return 0;
+		}
+
+		if (aligned.second > bytes_available)
+		{
+			if (report == 1)
+			{
+				LOG_ERR(bytes_until_next <= bytes_left_in_page ? "breakpoint would overwrite the next function"
+				                                               : "breakpoint crosses a page");
+			}
+
+			return 0;
+		}
+
+		if (aligned.first.size() + absolute_jump_size > kernel_pause_slack)
+		{
+			if (report == 1)
+			{
+				LOG_ERR("breakpoint site is too large for the kernel pause stub");
+			}
+
+			return 0;
+		}
+
+		for (const breakpoint_t& breakpoint : breakpoints)
+		{
+			if (breakpoint.page_physical == page_physical &&
+				ranges_overlap(page_offset, aligned.second, breakpoint.page_offset, breakpoint.span) == 1)
+			{
+				if (report == 1)
+				{
+					LOG_ERR("breakpoint overlaps an existing breakpoint");
+				}
+
+				return 0;
+			}
+		}
+
+		return 1;
 	}
 
 	std::uint8_t install_kernel_pause(const std::uint64_t address, const std::uint64_t cr3, std::uint64_t& id_out,
@@ -2761,18 +2934,6 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 			return 0;
 		}
 
-		const std::uint64_t cave = find_kernel_cave(address, kernel_cr3);
-
-		if (cave == 0)
-		{
-			LOG_ERR("no code cave for the kernel breakpoint");
-
-			return 0;
-		}
-
-		const std::uint8_t cave_in_range = rel32_reaches(address, cave);
-		const std::uint64_t jump_size = cave_in_range == 1 ? relative_jump_size : absolute_jump_size;
-		const std::uint64_t return_jump_size = cave_in_range == 1 ? relative_jump_size : absolute_jump_size;
 		const std::uint64_t physical_address = hypercall::translate_guest_virtual_address(address, kernel_cr3);
 
 		if (physical_address == 0)
@@ -2803,39 +2964,92 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 			return 0;
 		}
 
-		const auto aligned_bytes = hook_disasm::get_routine_aligned_bytes(instruction_buffer.data(), jump_size, address);
+		//
+		// kernel_pause_need reserves 96 bytes for the worst prologue. Some
+		// kernels have no INT3 run that long. The placed stub is the fixed
+		// bytes plus the instructions this site actually steals.
+		//
+		const auto rel_aligned = hook_disasm::get_routine_aligned_bytes(instruction_buffer.data(), relative_jump_size, address);
+		const auto abs_aligned = hook_disasm::get_routine_aligned_bytes(instruction_buffer.data(), absolute_jump_size, address);
+		const std::uint8_t rel_fits = kernel_site_fits(rel_aligned, relative_jump_size, bytes_available, bytes_until_next,
+		                                               bytes_left_in_page, page_physical, page_offset, 0);
+		const std::uint8_t abs_fits = kernel_site_fits(abs_aligned, absolute_jump_size, bytes_available, bytes_until_next,
+		                                               bytes_left_in_page, page_physical, page_offset, 0);
+		const std::uint64_t rel_need =
+			rel_fits == 1 ? kernel_pause_fixed + rel_aligned.first.size() + relative_jump_size : 0;
+		const std::uint64_t abs_need =
+			abs_fits == 1 ? kernel_pause_fixed + abs_aligned.first.size() + absolute_jump_size : 0;
+		std::uint64_t cave = 0;
+		std::uint64_t cave_span = 0;
 
-		if (aligned_bytes.first.empty() == true || aligned_bytes.second < jump_size)
+		if (rel_need != 0)
 		{
-			LOG_ERR("failed to decode breakpoint site");
-
-			return 0;
+			cave = find_kernel_cave(address, kernel_cr3, rel_need, 1);
+			cave_span = cave == 0 ? 0 : rel_need;
 		}
 
-		if (aligned_bytes.second > bytes_available)
+		if (cave == 0 && abs_need != 0)
 		{
-			LOG_ERR(bytes_until_next <= bytes_left_in_page ? "breakpoint would overwrite the next function"
-			                                               : "breakpoint crosses a page");
-
-			return 0;
+			cave = find_kernel_cave(address, kernel_cr3, abs_need, 0);
+			cave_span = cave == 0 ? 0 : abs_need;
 		}
 
-		if (aligned_bytes.first.size() + absolute_jump_size > kernel_pause_slack)
+		if (cave == 0 && (rel_need != 0 || abs_need != 0))
 		{
-			LOG_ERR("breakpoint site is too large for the kernel pause stub");
+			const std::uint64_t reserved = abs_need != 0 ? abs_need : rel_need;
+			const std::uint64_t mapped = allocate_kernel_cave(kernel_cr3, reserved);
 
-			return 0;
-		}
-
-		for (const breakpoint_t& breakpoint : breakpoints)
-		{
-			if (breakpoint.page_physical == page_physical &&
-				ranges_overlap(page_offset, aligned_bytes.second, breakpoint.page_offset, breakpoint.span) == 1)
+			if (mapped != 0)
 			{
-				LOG_ERR("breakpoint overlaps an existing breakpoint");
+				const std::uint8_t in_range = static_cast<std::uint8_t>(
+					rel32_reaches(address, mapped) == 1 && rel32_reaches(mapped, address) == 1);
 
-				return 0;
+				if (in_range == 1 && rel_need != 0)
+				{
+					cave = mapped;
+					cave_span = rel_need;
+				}
+				else if (abs_need != 0)
+				{
+					cave = mapped;
+					cave_span = abs_need;
+				}
 			}
+		}
+
+		if (cave == 0)
+		{
+			if (rel_fits == 0 && abs_fits == 0)
+			{
+				if (abs_aligned.first.empty() == false)
+				{
+					kernel_site_fits(abs_aligned, absolute_jump_size, bytes_available, bytes_until_next,
+					                 bytes_left_in_page, page_physical, page_offset, 1);
+				}
+				else
+				{
+					kernel_site_fits(rel_aligned, relative_jump_size, bytes_available, bytes_until_next,
+					                 bytes_left_in_page, page_physical, page_offset, 1);
+				}
+			}
+			else
+			{
+				LOG_ERR("no code cave for the kernel breakpoint");
+			}
+
+			return 0;
+		}
+
+		const std::uint8_t cave_in_range = static_cast<std::uint8_t>(
+			rel_need != 0 && rel32_reaches(address, cave) == 1 && rel32_reaches(cave, address) == 1);
+		const std::uint64_t jump_size = cave_in_range == 1 ? relative_jump_size : absolute_jump_size;
+		const std::uint64_t return_jump_size = cave_in_range == 1 ? relative_jump_size : absolute_jump_size;
+		const auto aligned_bytes = cave_in_range == 1 ? rel_aligned : abs_aligned;
+
+		if (kernel_site_fits(aligned_bytes, jump_size, bytes_available, bytes_until_next, bytes_left_in_page,
+		                     page_physical, page_offset, 1) == 0)
+		{
+			return 0;
 		}
 
 		const std::uint64_t resume_size = aligned_bytes.first.size() + return_jump_size;
@@ -2880,7 +3094,7 @@ std::uint64_t breakpoint::cr3_for_process(const std::uint64_t process_id)
 
 		cursor += 25;
 
-		if (cursor - cave > kernel_pause_need || (cave & 0xFFFull) + (cursor - cave) > page_size)
+		if (cursor - cave > cave_span || (cave & 0xFFFull) + (cursor - cave) > page_size)
 		{
 			LOG_ERR("no code cave for the kernel breakpoint");
 
