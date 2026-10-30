@@ -8695,6 +8695,28 @@ static std::uint8_t unwind_with_pdata(std::vector<stack_module_t>& modules, stac
 	return 1;
 }
 
+static std::uint64_t image_floor(const std::uint64_t address)
+{
+	std::uint64_t floor = 0;
+
+	for (const auto& [name, module] : sys::kernel::modules_list)
+	{
+		(void)name;
+
+		if (module.base_address == 0 || address < module.base_address ||
+		    address - module.base_address >= module.size)
+		{
+			continue;
+		}
+
+		floor = module.base_address;
+
+		break;
+	}
+
+	return floor;
+}
+
 static std::uint8_t instruction_before_is_call(const std::uint64_t address, const std::uint64_t extra_cr3)
 {
 	constexpr std::uint64_t kBack = 15;
@@ -8704,14 +8726,41 @@ static std::uint8_t instruction_before_is_call(const std::uint64_t address, cons
 		return 0;
 	}
 
+	//
+	// A kernel pointer that is not inside a loaded image is not a call site.
+	// The slot base itself, such as 0xfffff80500000000, has no page 15 bytes
+	// earlier: that byte is the previous PML4 entry, and the entry is empty.
+	// The first byte of a real image stays inside the image and is not read.
+	//
+	std::uint64_t room = address;
+
+	if (address > 0x00007FFFFFFFFFFFull)
+	{
+		const std::uint64_t floor = image_floor(address);
+
+		if (floor == 0)
+		{
+			return 0;
+		}
+
+		room = address - floor;
+	}
+
+	const std::uint64_t window = room < kBack ? room : kBack;
+
+	if (window < 2)
+	{
+		return 2;
+	}
+
 	std::uint8_t bytes[kBack] = {};
 	std::uint64_t available = 0;
 
-	if (address >= kBack && read_paused_block(address - kBack, bytes, kBack, extra_cr3) == 1)
+	if (read_paused_block(address - window, bytes + (kBack - window), window, extra_cr3) == 1)
 	{
-		available = kBack;
+		available = window;
 	}
-	else if (address >= 5 && read_paused_block(address - 5, bytes + (kBack - 5), 5, extra_cr3) == 1)
+	else if (window > 5 && read_paused_block(address - 5, bytes + (kBack - 5), 5, extra_cr3) == 1)
 	{
 		available = 5;
 	}
