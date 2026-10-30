@@ -246,6 +246,95 @@ GuestPhysicalPteState(
     _In_ GUEST_PHYSICAL_ADDRESS PagePhysical
     );
 
+INT
+/**
+ * @brief Compares a leaf PTE value with the page it must still name.
+ *
+ * @param Entry Leaf PTE value already read by the caller.
+ * @param PagePhysical 4 KiB-aligned guest physical page.
+ *
+ * @return 1 when Entry is present and names PagePhysical. -1 otherwise.
+ */
+PhysicalMemoryPteNamesPage(
+    _In_ UINT64 Entry,
+    _In_ UINT64 PagePhysical
+    );
+
+typedef struct _GUEST_PAGE_ALIAS GUEST_PAGE_ALIAS;
+
+NTSTATUS
+/**
+ * @brief Reserves a host window whose pages can later alias guest RAM.
+ *
+ * @details Call this before any logical processor enters the guest. The
+ * window is not a guest mapping. Preparing it maps a scratch page so the
+ * host page tables exist, then drops that mapping.
+ *
+ * @param PageCount Number of 4 KiB pages. Must be 1 to 8192.
+ * @param Alias Receives the alias. NULL on failure.
+ *
+ * @return STATUS_SUCCESS, or an NTSTATUS error.
+ */
+PhysicalMemoryPrepareGuestAlias(
+    _In_ ULONG PageCount,
+    _Out_ GUEST_PAGE_ALIAS** Alias
+    );
+
+PVOID
+/**
+ * @brief Returns the host virtual base of a prepared alias.
+ *
+ * @param Alias Alias from PhysicalMemoryPrepareGuestAlias.
+ *
+ * @return Host virtual address, or NULL.
+ */
+PhysicalMemoryGuestAliasBase(
+    _In_ const GUEST_PAGE_ALIAS* Alias
+    );
+
+VOID
+/**
+ * @brief Clears one alias page before any processor has used the window.
+ *
+ * @param Alias Prepared alias.
+ * @param PageIndex Zero-based page in the window.
+ */
+PhysicalMemoryClearGuestAliasPage(
+    _Inout_ GUEST_PAGE_ALIAS* Alias,
+    _In_ ULONG PageIndex
+    );
+
+BOOLEAN
+/**
+ * @brief Points one unused alias page at a guest frame.
+ *
+ * @details The caller must do this before any other processor reads or
+ * writes the alias. Later changes to the same host PTE are not coherent
+ * with a TLB entry another processor already cached. Call this only while
+ * the alias is still unpublished.
+ *
+ * @param Alias Prepared alias.
+ * @param PageIndex Zero-based page in the window.
+ * @param PagePhysical 4 KiB-aligned guest physical page in RAM.
+ *
+ * @return TRUE when the host PTE names that frame.
+ */
+PhysicalMemoryAssignGuestAliasPage(
+    _Inout_ GUEST_PAGE_ALIAS* Alias,
+    _In_ ULONG PageIndex,
+    _In_ UINT64 PagePhysical
+    );
+
+VOID
+/**
+ * @brief Drops a prepared alias. The guest must already have left every processor.
+ *
+ * @param Alias Alias to destroy. NULL is ignored.
+ */
+PhysicalMemoryDestroyGuestAlias(
+    _In_opt_ GUEST_PAGE_ALIAS* Alias
+    );
+
 SIZE_T
 /**
  * @brief Reads through guest page tables.

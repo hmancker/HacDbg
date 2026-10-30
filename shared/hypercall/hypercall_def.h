@@ -128,7 +128,10 @@ constexpr std::uint64_t hypercall_memory_chunk_size = 0x10000;
 #endif
 
 // Records that follow the 32-byte header. trap_frame_log_t is 0xb8 bytes.
-#define HACDBG_LOG_MAILBOX_CAPACITY 2048
+// 131072 records is about 24 MiB. A reader that falls behind by less than one
+// lap still copies every record. One record is left unpublished to the reader
+// so the slot being written is not consumed.
+#define HACDBG_LOG_MAILBOX_CAPACITY 131072
 #define HACDBG_LOG_MAILBOX_HEADER_BYTES 32
 #define HACDBG_LOG_MAILBOX_RECORD_BYTES 0xb8
 
@@ -139,8 +142,10 @@ constexpr std::uint64_t hypercall_memory_chunk_size = 0x10000;
 // hypervisor writes producer, then producer_copy, with the same count of
 // records ever published. A reader that observes equal fields has a complete
 // count. key is chosen by the debugger and checked before every write so a
-// reused CR3 is ignored. capacity is HACDBG_LOG_MAILBOX_CAPACITY; a smaller
-// page is rejected.
+// reused CR3 is ignored. capacity is HACDBG_LOG_MAILBOX_CAPACITY; any other
+// value is rejected. The debugger and the driver must be built from the same
+// header. An older driver rejects this capacity and the debugger falls back
+// to the kernel log ring.
 //
 typedef struct _HACDBG_LOG_MAILBOX
 {

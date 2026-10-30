@@ -178,16 +178,21 @@ static std::uint64_t sample_log_mailbox(std::uint8_t& stable, const std::uint8_t
 		return 0;
 	}
 
+	//
+	// producer_copy is stored after the record bytes and producer. An aligned
+	// 64-bit read is the count of complete records. Waiting for producer to
+	// match it fails while the next record is being published.
+	//
 	for (std::uint32_t attempt = 0; attempt < 8; ++attempt)
 	{
-		const std::uint64_t copy = *reinterpret_cast<const volatile std::uint64_t*>(&g_log_mailbox->producer_copy);
-		const std::uint64_t producer = *reinterpret_cast<const volatile std::uint64_t*>(&g_log_mailbox->producer);
+		const std::uint64_t first = *reinterpret_cast<const volatile std::uint64_t*>(&g_log_mailbox->producer_copy);
+		const std::uint64_t second = *reinterpret_cast<const volatile std::uint64_t*>(&g_log_mailbox->producer_copy);
 
-		if (copy == producer && mailbox_key_acceptable(mailbox_key(), allow_cleared) == 1)
+		if (first == second && mailbox_key_acceptable(mailbox_key(), allow_cleared) == 1)
 		{
 			stable = 1;
 
-			return producer;
+			return first;
 		}
 	}
 
@@ -238,9 +243,13 @@ static std::uint64_t copy_log_mailbox(std::vector<trap_frame_log_t>& logs, std::
 		cursor = 0;
 	}
 
-	if (producer - cursor > HACDBG_LOG_MAILBOX_CAPACITY)
+	//
+	// The slot at producer % capacity is the one being published. Reading it
+	// can tear. Records older than one lap are already overwritten.
+	//
+	if (producer - cursor >= HACDBG_LOG_MAILBOX_CAPACITY)
 	{
-		cursor = producer - HACDBG_LOG_MAILBOX_CAPACITY;
+		cursor = producer - (HACDBG_LOG_MAILBOX_CAPACITY - 1);
 	}
 
 	count = producer - cursor;
@@ -523,6 +532,31 @@ std::uint64_t hypercall::flush_logs(std::vector<trap_frame_log_t>& logs)
 		if (give_up == 0)
 		{
 			return copied;
+		}
+
+		//
+		// The driver cleared the key after a failed publish used to unregister
+		// the mailbox for good. Register the same locked buffer again so a
+		// new hook does not have to reload the driver. A different non-zero
+		// key belongs to another debugger and is left alone.
+		//
+		if (mailbox_key() == 0 && g_log_mailbox != nullptr)
+		{
+			g_log_mailbox->key = g_log_mailbox_key;
+			g_log_mailbox->capacity = HACDBG_LOG_MAILBOX_CAPACITY;
+			g_log_mailbox->producer = 0;
+			g_log_mailbox->producer_copy = 0;
+			g_log_notify_seen.store(0, std::memory_order_relaxed);
+
+			const std::uint64_t registered = launch_cpuid_hypercall(
+				hypercall_type_t::flush_logs, flush_logs_register_mailbox,
+				reinterpret_cast<std::uint64_t>(g_log_mailbox), 0, 0);
+
+			if (registered == 1)
+			{
+				g_log_notify_armed.store(1, std::memory_order_release);
+				return copied;
+			}
 		}
 
 		g_log_notify_armed.store(0, std::memory_order_release);

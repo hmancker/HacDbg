@@ -56,7 +56,8 @@ public:
     bool copyDisassembly(HACDBG_CORE_INSTRUCTION* instructions, std::uint32_t capacity, std::uint32_t* count) const;
     bool copyResolvedAddress(HACDBG_CORE_RESOLVED_ADDRESS* address) const;
     bool copyMonitors(HACDBG_CORE_MONITOR* monitors, std::uint32_t capacity, std::uint32_t* count) const;
-    bool copyMonitorHits(HACDBG_CORE_MONITOR_HIT* hits, std::uint32_t capacity, std::uint32_t* count) const;
+    bool copyMonitorHits(HACDBG_CORE_MONITOR_HIT* hits, std::uint32_t capacity, std::uint32_t* count,
+                         std::uint64_t* newestSequence) const;
 
     bool traceControl(std::uint32_t flags, std::uint32_t sampleRate, std::uint32_t eventMask);
     bool requestTraceRead();
@@ -113,7 +114,7 @@ private:
     std::uint32_t (*m_copyDisassembly)(HACDBG_CORE* core, HACDBG_CORE_INSTRUCTION* instructions, std::uint32_t capacity, std::uint32_t* count) = nullptr;
     std::uint32_t (*m_copyResolvedAddress)(HACDBG_CORE* core, HACDBG_CORE_RESOLVED_ADDRESS* address) = nullptr;
     std::uint32_t (*m_copyMonitors)(HACDBG_CORE* core, HACDBG_CORE_MONITOR* monitors, std::uint32_t capacity, std::uint32_t* count) = nullptr;
-    std::uint32_t (*m_copyMonitorHits)(HACDBG_CORE* core, HACDBG_CORE_MONITOR_HIT* hits, std::uint32_t capacity, std::uint32_t* count) = nullptr;
+    std::uint32_t (*m_copyMonitorHits)(HACDBG_CORE* core, HACDBG_CORE_MONITOR_HIT* hits, std::uint32_t capacity, std::uint32_t* count, std::uint64_t* newestSequence) = nullptr;
     std::uint32_t (*m_traceControl)(HACDBG_CORE* core, std::uint32_t flags, std::uint32_t sampleRate, std::uint32_t eventMask) = nullptr;
     std::uint32_t (*m_requestTraceRead)(HACDBG_CORE* core) = nullptr;
     std::uint32_t (*m_getTraceStatus)(HACDBG_CORE* core, HACDBG_CORE_TRACE_STATUS* status) = nullptr;

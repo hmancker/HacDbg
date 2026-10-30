@@ -666,7 +666,10 @@ HypercallExecute(
             HypercallLogState(GuestContext, HACDBG_LOG_POPPED_ONE, logRip, 0);
         }
 
-        HACDBG_LOG("HacDbg: monitor rip=0x%I64x cr3=0x%I64x.\n", logRip, GuestContext->Cr3);
+        //
+        // The monitor record is the mailbox slot. A debug print here runs on
+        // the VM-exit path and stalls the processor at a high hit rate.
+        //
 
         break;
     }

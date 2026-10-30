@@ -18,7 +18,6 @@
 #include <cctype>
 #include <cstdint>
 #include <cstring>
-#include <deque>
 #include <mutex>
 #include <string_view>
 #include <vector>
@@ -3744,15 +3743,48 @@ std::vector<breakpoint::info_t> breakpoint::list()
 }
 
 std::vector<breakpoint::monitor_site_t> monitor_site_list = {};
-std::deque<breakpoint::monitor_hit_t> monitor_hit_list = {};
 std::recursive_mutex g_log_mutex = {};
+
+constexpr std::size_t pending_log_limit = 2840;
+std::vector<trap_frame_log_t> pending_logs(pending_log_limit);
+std::size_t pending_head = 0;
+std::size_t pending_count = 0;
+
+constexpr std::size_t monitor_site_limit = 64;
+constexpr std::size_t monitor_hit_limit = 8192;
+std::vector<breakpoint::monitor_hit_t> monitor_hit_ring(monitor_hit_limit);
+std::size_t monitor_hit_head = 0;
+std::size_t monitor_hit_count = 0;
+std::uint64_t monitor_hit_sequence = 0;
+
+void pending_push(const trap_frame_log_t& log)
+{
+	if (pending_count == pending_logs.size())
+	{
+		pending_logs[pending_head] = log;
+		pending_head = (pending_head + 1) % pending_logs.size();
+		return;
+	}
+
+	pending_logs[(pending_head + pending_count) % pending_logs.size()] = log;
+	pending_count += 1;
+}
+
+const trap_frame_log_t& pending_at(const std::size_t index)
+{
+	return pending_logs[(pending_head + index) % pending_logs.size()];
+}
 
 void breakpoint::clean_up()
 {
 	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 
 	monitor_site_list.clear();
-	monitor_hit_list.clear();
+	monitor_hit_head = 0;
+	monitor_hit_count = 0;
+	monitor_hit_sequence = 0;
+	pending_head = 0;
+	pending_count = 0;
 
 	if (pause_state.valid == 1)
 	{
@@ -3767,11 +3799,6 @@ void breakpoint::clean_up()
 		}
 	}
 }
-
-std::deque<trap_frame_log_t> pending_logs = {};
-
-constexpr std::size_t monitor_site_limit = 64;
-constexpr std::size_t monitor_hit_limit = 2048;
 
 std::uint8_t monitor_log_matches(const breakpoint::monitor_site_t& site, const std::uint64_t rip)
 {
@@ -3808,16 +3835,24 @@ void note_one_monitor_log(const trap_frame_log_t& log)
 		}
 
 		site.hits++;
-
-		if (monitor_hit_list.size() == monitor_hit_limit)
-		{
-			monitor_hit_list.pop_front();
-		}
+		monitor_hit_sequence += 1;
 
 		breakpoint::monitor_hit_t hit = {};
 		hit.address = site.address;
+		hit.sequence = monitor_hit_sequence;
 		hit.log = log;
-		monitor_hit_list.push_back(hit);
+
+		if (monitor_hit_count == monitor_hit_ring.size())
+		{
+			monitor_hit_ring[monitor_hit_head] = hit;
+			monitor_hit_head = (monitor_hit_head + 1) % monitor_hit_ring.size();
+		}
+		else
+		{
+			const std::size_t index = (monitor_hit_head + monitor_hit_count) % monitor_hit_ring.size();
+			monitor_hit_ring[index] = hit;
+			monitor_hit_count += 1;
+		}
 
 		return;
 	}
@@ -3825,7 +3860,6 @@ void note_one_monitor_log(const trap_frame_log_t& log)
 
 void remember_flushed_logs(const trap_frame_log_t* const logs, const std::uint64_t count)
 {
-	constexpr std::uint64_t pending_log_limit = 2840;
 	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 
 	if (logs == nullptr)
@@ -3840,12 +3874,7 @@ void remember_flushed_logs(const trap_frame_log_t* const logs, const std::uint64
 			continue;
 		}
 
-		if (pending_logs.size() == pending_log_limit)
-		{
-			pending_logs.pop_front();
-		}
-
-		pending_logs.push_back(logs[index]);
+		pending_push(logs[index]);
 		note_one_monitor_log(logs[index]);
 	}
 }
@@ -3878,8 +3907,10 @@ void discard_stale_pause_logs(const breakpoint_t* const breakpoint)
 
 	std::vector<trap_frame_log_t> kept = {};
 
-	for (const trap_frame_log_t& log : pending_logs)
+	for (std::size_t index = 0; index < pending_count; index++)
 	{
+		const trap_frame_log_t& log = pending_at(index);
+
 		if (breakpoint != nullptr && log.rip == breakpoint->address && same_cr3(breakpoint->cr3, log.cr3) == 1)
 		{
 			continue;
@@ -3888,7 +3919,13 @@ void discard_stale_pause_logs(const breakpoint_t* const breakpoint)
 		kept.push_back(log);
 	}
 
-	pending_logs.assign(kept.begin(), kept.end());
+	pending_head = 0;
+	pending_count = 0;
+
+	for (const trap_frame_log_t& log : kept)
+	{
+		pending_push(log);
+	}
 }
 
 std::uint8_t flush_into_pause_state(const std::uint8_t report_error, const std::uint8_t observe)
@@ -3932,12 +3969,17 @@ std::uint8_t reconsider_pending_logs()
 	{
 		const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 
-		if (pause_state.valid == 1 || pending_logs.empty() == true)
+		if (pause_state.valid == 1 || pending_count == 0)
 		{
 			return pause_state.valid;
 		}
 
-		logs.assign(pending_logs.begin(), pending_logs.end());
+		logs.resize(pending_count);
+
+		for (std::size_t index = 0; index < pending_count; index++)
+		{
+			logs[index] = pending_at(index);
+		}
 	}
 
 	observe_logs_impl(logs.data(), logs.size());
@@ -4073,33 +4115,61 @@ std::vector<breakpoint::monitor_site_t> breakpoint::monitor_sites()
 	return monitor_site_list;
 }
 
-std::vector<breakpoint::monitor_hit_t> breakpoint::take_monitor_hits()
+std::size_t breakpoint::copy_monitor_hits(monitor_hit_t* const destination, const std::size_t capacity,
+                                           std::uint64_t* const newest)
 {
 	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
-	std::vector<monitor_hit_t> hits(monitor_hit_list.begin(), monitor_hit_list.end());
+	const std::size_t count = capacity < monitor_hit_count ? capacity : monitor_hit_count;
 
-	monitor_hit_list.clear();
+	if (newest != nullptr)
+	{
+		*newest = monitor_hit_sequence;
+	}
 
-	return hits;
+	if (destination == nullptr || count == 0)
+	{
+		return 0;
+	}
+
+	for (std::size_t index = 0; index < count; index++)
+	{
+		destination[index] = monitor_hit_ring[(monitor_hit_head + index) % monitor_hit_ring.size()];
+	}
+
+	monitor_hit_head = (monitor_hit_head + count) % monitor_hit_ring.size();
+	monitor_hit_count -= count;
+	return count;
 }
 
-void breakpoint::drain_monitor_mailbox()
+std::uint8_t breakpoint::drain_monitor_mailbox()
 {
-	if (hypercall::log_notify_idle() != 0)
+	constexpr std::uint64_t log_count = 8192;
+	constexpr int max_passes = 32;
+	static std::vector<trap_frame_log_t> logs(log_count);
+
+	for (int pass = 0; pass < max_passes; ++pass)
 	{
-		return;
+		if (hypercall::log_notify_idle() != 0)
+		{
+			return 0;
+		}
+
+		const std::uint64_t logs_flushed = hypercall::flush_logs(logs);
+
+		if (logs_flushed == static_cast<std::uint64_t>(-1) || logs_flushed == 0)
+		{
+			return 0;
+		}
+
+		remember_flushed_logs(logs.data(), logs_flushed);
+
+		if (logs_flushed < log_count)
+		{
+			return 0;
+		}
 	}
 
-	constexpr std::uint64_t log_count = 2840;
-	std::vector<trap_frame_log_t> logs(log_count);
-	const std::uint64_t logs_flushed = hypercall::flush_logs(logs);
-
-	if (logs_flushed == static_cast<std::uint64_t>(-1) || logs_flushed == 0)
-	{
-		return;
-	}
-
-	remember_flushed_logs(logs.data(), logs_flushed);
+	return 1;
 }
 
 std::uint8_t breakpoint::has_paused_thread()
@@ -4117,10 +4187,15 @@ std::uint64_t breakpoint::paused_breakpoint_id()
 std::vector<trap_frame_log_t> breakpoint::take_pending_logs()
 {
 	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
-	std::vector<trap_frame_log_t> logs(pending_logs.begin(), pending_logs.end());
+	std::vector<trap_frame_log_t> logs(pending_count);
 
-	pending_logs.clear();
+	for (std::size_t index = 0; index < pending_count; index++)
+	{
+		logs[index] = pending_at(index);
+	}
 
+	pending_head = 0;
+	pending_count = 0;
 	return logs;
 }
 

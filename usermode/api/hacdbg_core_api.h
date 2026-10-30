@@ -17,7 +17,7 @@ extern "C"
 {
 #endif
 
-#define HACDBG_CORE_API_VERSION 6u
+#define HACDBG_CORE_API_VERSION 7u
 #define HACDBG_CORE_MAX_MONITORS 64u
 #define HACDBG_CORE_MONITOR_STACK 5u
 #define HACDBG_CORE_MAX_BREAKPOINTS 64u
@@ -532,6 +532,7 @@ typedef struct _HACDBG_CORE_MONITOR_HIT
     uint64_t R15;
     uint64_t Cr3;
     uint64_t Stack[HACDBG_CORE_MONITOR_STACK];
+    uint64_t Sequence;
 } HACDBG_CORE_MONITOR_HIT;
 
 /**
@@ -543,11 +544,14 @@ uint32_t HacDbgCoreCopyMonitors(HACDBG_CORE* Core, HACDBG_CORE_MONITOR* Items, u
 /**
  * @brief Copies and removes the oldest monitor hits waiting for the GUI.
  *
- * @details The core worker already reads the log mailbox. Hits stay here until
- * this copy, up to 2048. Older hits are dropped when that queue is full.
+ * @details The monitor thread reads the log mailbox. Hits stay here until this
+ * copy. The queue keeps the newest 8192 hits and reuses those slots. Sequence
+ * is the capture count for that hit, starting at 1. NewestSequence receives
+ * the highest sequence assigned so far, including hits the queue has already
+ * overwritten, or 0 when none have been captured.
  */
 uint32_t HacDbgCoreCopyMonitorHits(HACDBG_CORE* Core, HACDBG_CORE_MONITOR_HIT* Items, uint32_t Capacity,
-                                   uint32_t* CountOut);
+                                   uint32_t* CountOut, uint64_t* NewestSequence);
 
 #ifdef __cplusplus
 }
@@ -556,6 +560,6 @@ static_assert(sizeof(HACDBG_CORE_TRACE_STATUS) == 80, "core trace status ABI cha
 static_assert(sizeof(HACDBG_CORE_COMPLETION) == 512, "core completion ABI changed");
 static_assert(sizeof(HACDBG_CORE_COMPLETION_STATUS) == 32, "core completion status ABI changed");
 static_assert(sizeof(HACDBG_CORE_MONITOR) == 16, "core monitor ABI changed");
-static_assert(sizeof(HACDBG_CORE_MONITOR_HIT) == 192, "core monitor hit ABI changed");
+static_assert(sizeof(HACDBG_CORE_MONITOR_HIT) == 200, "core monitor hit ABI changed");
 static_assert(HACDBG_CORE_MONITOR_STACK == 5, "core monitor stack ABI changed");
 #endif

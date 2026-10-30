@@ -786,6 +786,268 @@ PhysicalMemoryFlushPage(
     return TRUE;
 }
 
+typedef struct _GUEST_PAGE_ALIAS
+{
+    PVOID Window;
+    ULONG PageCount;
+    volatile UINT64** HostPte;
+} GUEST_PAGE_ALIAS;
+
+#define PHYSICAL_ALIAS_MAX_PAGES 8192
+
+// 在客户进入之前准备别名窗口。此时可以用 MmCopyMemory 找宿主 PTE。
+NTSTATUS
+PhysicalMemoryPrepareGuestAlias(
+    _In_ ULONG PageCount,
+    _Out_ GUEST_PAGE_ALIAS** Alias
+    )
+{
+    GUEST_PAGE_ALIAS* alias;
+    PMDL mdl = NULL;
+    PVOID scratch = NULL;
+    PPFN_NUMBER pfns;
+    PHYSICAL_ADDRESS scratchPhysical;
+    PVOID mapped;
+    ULONG index;
+    SIZE_T bytes;
+
+    *Alias = NULL;
+
+    if (PageCount == 0 || PageCount > PHYSICAL_ALIAS_MAX_PAGES)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    bytes = (SIZE_T)PageCount * PAGE_SIZE;
+    alias = (GUEST_PAGE_ALIAS*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(*alias), HACDBG_PHYSICAL_TAG);
+
+    if (alias == NULL)
+    {
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(alias, sizeof(*alias));
+    alias->Window = MmAllocateMappingAddress(bytes, HACDBG_PHYSICAL_TAG);
+    alias->HostPte = (volatile UINT64**)ExAllocatePool2(POOL_FLAG_NON_PAGED,
+                                                         sizeof(volatile UINT64*) * PageCount,
+                                                         HACDBG_PHYSICAL_TAG);
+
+    if (alias->Window == NULL || alias->HostPte == NULL)
+    {
+        PhysicalMemoryDestroyGuestAlias(alias);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(alias->HostPte, sizeof(volatile UINT64*) * PageCount);
+    alias->PageCount = PageCount;
+    mdl = IoAllocateMdl(NULL, (ULONG)bytes, FALSE, FALSE, NULL);
+    scratch = ExAllocatePool2(POOL_FLAG_NON_PAGED, PAGE_SIZE, HACDBG_PHYSICAL_TAG);
+
+    if (mdl == NULL || scratch == NULL)
+    {
+        if (mdl != NULL)
+        {
+            IoFreeMdl(mdl);
+        }
+
+        if (scratch != NULL)
+        {
+            ExFreePoolWithTag(scratch, HACDBG_PHYSICAL_TAG);
+        }
+
+        PhysicalMemoryDestroyGuestAlias(alias);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    scratchPhysical = MmGetPhysicalAddress(scratch);
+
+    if (scratchPhysical.QuadPart == 0)
+    {
+        IoFreeMdl(mdl);
+        ExFreePoolWithTag(scratch, HACDBG_PHYSICAL_TAG);
+        PhysicalMemoryDestroyGuestAlias(alias);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    pfns = MmGetMdlPfnArray(mdl);
+
+    for (index = 0; index < PageCount; index++)
+    {
+        pfns[index] = (PFN_NUMBER)((UINT64)scratchPhysical.QuadPart >> PAGE_SHIFT);
+    }
+
+    mdl->Next = NULL;
+    mdl->MdlFlags = MDL_PAGES_LOCKED;
+    mdl->StartVa = alias->Window;
+    mdl->ByteOffset = 0;
+    mdl->ByteCount = (ULONG)bytes;
+    mdl->Process = NULL;
+    mapped = MmMapLockedPagesWithReservedMapping(alias->Window, HACDBG_PHYSICAL_TAG, mdl, MmCached);
+
+    if (mapped == NULL)
+    {
+        IoFreeMdl(mdl);
+        ExFreePoolWithTag(scratch, HACDBG_PHYSICAL_TAG);
+        PhysicalMemoryDestroyGuestAlias(alias);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    for (index = 0; index < PageCount; index++)
+    {
+        PVOID pageVa = (PUCHAR)alias->Window + ((SIZE_T)index * PAGE_SIZE);
+
+        alias->HostPte[index] = PhysicalMemoryFindPte(pageVa);
+
+        if (alias->HostPte[index] == NULL)
+        {
+            MmUnmapReservedMapping(alias->Window, HACDBG_PHYSICAL_TAG, mdl);
+            IoFreeMdl(mdl);
+            ExFreePoolWithTag(scratch, HACDBG_PHYSICAL_TAG);
+            PhysicalMemoryDestroyGuestAlias(alias);
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+
+    MmUnmapReservedMapping(alias->Window, HACDBG_PHYSICAL_TAG, mdl);
+    IoFreeMdl(mdl);
+    ExFreePoolWithTag(scratch, HACDBG_PHYSICAL_TAG);
+
+    if ((*alias->HostPte[0] & PHYSICAL_PTE_PRESENT) != 0)
+    {
+        PhysicalMemoryDestroyGuestAlias(alias);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    *Alias = alias;
+    return STATUS_SUCCESS;
+}
+
+PVOID
+PhysicalMemoryGuestAliasBase(
+    _In_ const GUEST_PAGE_ALIAS* Alias
+    )
+{
+    if (Alias == NULL)
+    {
+        return NULL;
+    }
+
+    return Alias->Window;
+}
+
+VOID
+PhysicalMemoryClearGuestAliasPage(
+    _Inout_ GUEST_PAGE_ALIAS* Alias,
+    _In_ ULONG PageIndex
+    )
+{
+    PVOID pageVa;
+
+    if (Alias == NULL || Alias->HostPte == NULL || PageIndex >= Alias->PageCount ||
+        Alias->HostPte[PageIndex] == NULL || Alias->Window == NULL)
+    {
+        return;
+    }
+
+    pageVa = (PUCHAR)Alias->Window + ((SIZE_T)PageIndex * PAGE_SIZE);
+    *Alias->HostPte[PageIndex] = 0;
+    __invlpg(pageVa);
+}
+
+BOOLEAN
+PhysicalMemoryAssignGuestAliasPage(
+    _Inout_ GUEST_PAGE_ALIAS* Alias,
+    _In_ ULONG PageIndex,
+    _In_ UINT64 PagePhysical
+    )
+{
+    PVOID pageVa;
+    UINT64 available = 0;
+
+    if (Alias == NULL || Alias->HostPte == NULL || PageIndex >= Alias->PageCount ||
+        Alias->HostPte[PageIndex] == NULL || (PagePhysical & (PAGE_SIZE - 1)) != 0 ||
+        PhysicalMemoryFindRange(PagePhysical, &available) == FALSE)
+    {
+        return FALSE;
+    }
+
+    pageVa = (PUCHAR)Alias->Window + ((SIZE_T)PageIndex * PAGE_SIZE);
+
+    //
+    // INVARIANT: HostPte[PageIndex] is the host leaf PTE of this alias page.
+    // No other processor has executed from or written through this VA yet.
+    // A local invalidation is enough. PagePhysical is a locked guest frame.
+    //
+    *Alias->HostPte[PageIndex] = (PagePhysical & PHYSICAL_PTE_FRAME) | PHYSICAL_PTE_PRESENT |
+                                 PHYSICAL_PTE_WRITE | PHYSICAL_PTE_ACCESSED | PHYSICAL_PTE_DIRTY |
+                                 PHYSICAL_PTE_NX;
+    __invlpg(pageVa);
+    return TRUE;
+}
+
+VOID
+PhysicalMemoryDestroyGuestAlias(
+    _In_opt_ GUEST_PAGE_ALIAS* Alias
+    )
+{
+    ULONG index;
+
+    if (Alias == NULL)
+    {
+        return;
+    }
+
+    if (Alias->HostPte != NULL && Alias->Window != NULL)
+    {
+        for (index = 0; index < Alias->PageCount; index++)
+        {
+            if (Alias->HostPte[index] == NULL)
+            {
+                continue;
+            }
+
+            *Alias->HostPte[index] = 0;
+            __invlpg((PUCHAR)Alias->Window + ((SIZE_T)index * PAGE_SIZE));
+        }
+    }
+
+    if (Alias->Window != NULL)
+    {
+        MmFreeMappingAddress(Alias->Window, HACDBG_PHYSICAL_TAG);
+    }
+
+    if (Alias->HostPte != NULL)
+    {
+        ExFreePoolWithTag(Alias->HostPte, HACDBG_PHYSICAL_TAG);
+    }
+
+    ExFreePoolWithTag(Alias, HACDBG_PHYSICAL_TAG);
+}
+
+INT
+PhysicalMemoryPteNamesPage(
+    _In_ UINT64 Entry,
+    _In_ UINT64 PagePhysical
+    )
+{
+    if ((PagePhysical & (PAGE_SIZE - 1)) != 0)
+    {
+        return -1;
+    }
+
+    if ((Entry & PHYSICAL_PTE_PRESENT) == 0 || (Entry & PHYSICAL_PTE_LARGE) != 0)
+    {
+        return -1;
+    }
+
+    if ((Entry & PHYSICAL_PTE_FRAME) != PagePhysical)
+    {
+        return -1;
+    }
+
+    return 1;
+}
+
 // 解除临时映射。
 VOID
 PhysicalMemoryUnmapTemporary(

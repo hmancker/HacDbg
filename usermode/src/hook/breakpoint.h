@@ -77,6 +77,7 @@ namespace breakpoint
 	struct monitor_hit_t
 	{
 		std::uint64_t address = 0;
+		std::uint64_t sequence = 0;
 		trap_frame_log_t log = {};
 	};
 
@@ -84,9 +85,13 @@ namespace breakpoint
 	void remove_monitor(std::uint64_t address);
 	void note_monitor_logs(const trap_frame_log_t* logs, std::uint64_t count);
 	std::vector<monitor_site_t> monitor_sites();
-	std::vector<monitor_hit_t> take_monitor_hits();
+	// Copies the oldest hits into Destination and drops them from the ring.
+	// Newest is the capture count, including hits the ring has already overwritten.
+	std::size_t copy_monitor_hits(monitor_hit_t* destination, std::size_t capacity, std::uint64_t* newest);
 	// Copies new mailbox records into the monitor list. Does not take a pause.
-	void drain_monitor_mailbox();
+	// Returns 1 when the mailbox still had a full chunk, so the caller should
+	// drain again without waiting out an idle interval.
+	std::uint8_t drain_monitor_mailbox();
 
 	std::uint8_t capture_pause();
 	std::uint8_t poll_new_pause();

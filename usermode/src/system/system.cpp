@@ -1348,16 +1348,12 @@ void* sys::user::allocate_locked_memory(const std::uint64_t size, const std::uin
 		return nullptr;
 	}
 
-	if (VirtualLock(allocation_base, size) != 0)
-	{
-		return allocation_base;
-	}
-
-	// VirtualLock is capped by the working-set minimum. A failed user-park
-	// map can fill that cap with page-table pages and then every later lock fails.
+	// VirtualLock is capped by the working-set minimum. The log mailbox is
+	// about 24 MiB. Raise the minimum before the first lock so those pages
+	// are not the ones a later trim unmaps.
 	constexpr std::uint32_t increase_working_set_privilege = 33;
-	constexpr SIZE_T want_minimum = 64ull * 1024ull * 1024ull;
-	constexpr SIZE_T want_maximum = 128ull * 1024ull * 1024ull;
+	constexpr SIZE_T want_minimum = 256ull * 1024ull * 1024ull;
+	constexpr SIZE_T want_maximum = 512ull * 1024ull * 1024ull;
 	std::uint8_t previous_privilege = 0;
 	SIZE_T minimum = 0;
 	SIZE_T maximum = 0;
@@ -1414,8 +1410,8 @@ std::uint8_t sys::user::lock_resident_pages(void* const address, const std::uint
 	}
 
 	constexpr std::uint32_t increase_working_set_privilege = 33;
-	constexpr SIZE_T want_minimum = 64ull * 1024ull * 1024ull;
-	constexpr SIZE_T want_maximum = 128ull * 1024ull * 1024ull;
+	constexpr SIZE_T want_minimum = 256ull * 1024ull * 1024ull;
+	constexpr SIZE_T want_maximum = 512ull * 1024ull * 1024ull;
 	std::uint8_t previous_privilege = 0;
 	SIZE_T minimum = 0;
 	SIZE_T maximum = 0;

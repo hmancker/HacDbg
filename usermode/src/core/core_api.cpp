@@ -72,7 +72,10 @@ struct HACDBG_CORE
 
 	std::mutex monitor_mutex;
 	std::vector<HACDBG_CORE_MONITOR> monitors = {};
-	std::deque<HACDBG_CORE_MONITOR_HIT> monitor_hits = {};
+	std::vector<HACDBG_CORE_MONITOR_HIT> monitor_hit_slots = {};
+	std::size_t monitor_hit_head = 0;
+	std::size_t monitor_hit_count = 0;
+	std::uint64_t monitor_newest_sequence = 0;
 
 	std::mutex view_mutex;
 	std::array<core_view_request_t, static_cast<std::size_t>(HacDbgViewCount)> view_requests = {};
@@ -128,7 +131,7 @@ namespace
 {
 	constexpr std::size_t max_queued_commands = 64;
 	constexpr std::chrono::milliseconds breakpoint_poll_interval(100);
-	constexpr std::size_t monitor_hit_queue_limit = 2048;
+	constexpr std::size_t monitor_hit_queue_limit = 8192;
 
 	static_assert(HACDBG_CORE_MONITOR_STACK == trap_frame_log_stack_data_count, "monitor stack width changed");
 
@@ -154,6 +157,7 @@ namespace
 		item.R14 = hit.log.r14;
 		item.R15 = hit.log.r15;
 		item.Cr3 = hit.log.cr3;
+		item.Sequence = hit.sequence;
 
 		for (std::size_t index = 0; index < HACDBG_CORE_MONITOR_STACK; index++)
 		{
@@ -161,10 +165,38 @@ namespace
 		}
 	}
 
-	void publish_monitors(HACDBG_CORE* const core)
+	void push_monitor_hit(HACDBG_CORE* const core, const HACDBG_CORE_MONITOR_HIT& item)
+	{
+		std::vector<HACDBG_CORE_MONITOR_HIT>& slots = core->monitor_hit_slots;
+		const std::size_t capacity = slots.size();
+
+		if (capacity == 0)
+		{
+			return;
+		}
+
+		if (core->monitor_hit_count == capacity)
+		{
+			slots[core->monitor_hit_head] = item;
+			core->monitor_hit_head = (core->monitor_hit_head + 1) % capacity;
+		}
+		else
+		{
+			const std::size_t index = (core->monitor_hit_head + core->monitor_hit_count) % capacity;
+			slots[index] = item;
+			core->monitor_hit_count += 1;
+		}
+
+		if (item.Sequence > core->monitor_newest_sequence)
+		{
+			core->monitor_newest_sequence = item.Sequence;
+		}
+	}
+
+	void publish_monitor_sites(HACDBG_CORE* const core)
 	{
 		const std::vector<breakpoint::monitor_site_t> sites = breakpoint::monitor_sites();
-		std::vector<breakpoint::monitor_hit_t> hits = breakpoint::take_monitor_hits();
+
 		std::lock_guard<std::mutex> lock(core->monitor_mutex);
 
 		core->monitors.clear();
@@ -181,18 +213,47 @@ namespace
 			item.Hits = site.hits;
 			core->monitors.push_back(item);
 		}
+	}
 
-		for (const breakpoint::monitor_hit_t& hit : hits)
+	//
+	// Hits leave the ring only on the monitor thread. The command thread used
+	// to drain the same ring and could push an older batch after a newer one.
+	// The GUI then counted the sequence hole and those late rows.
+	//
+	void publish_monitor_hits(HACDBG_CORE* const core)
+	{
+		breakpoint::monitor_hit_t batch[128] = {};
+
+		for (;;)
 		{
-			if (core->monitor_hits.size() == monitor_hit_queue_limit)
+			std::uint64_t newest = 0;
+			const std::size_t count = breakpoint::copy_monitor_hits(batch, 128, &newest);
+
+			std::lock_guard<std::mutex> lock(core->monitor_mutex);
+
+			if (newest > core->monitor_newest_sequence)
 			{
-				core->monitor_hits.pop_front();
+				core->monitor_newest_sequence = newest;
 			}
 
-			HACDBG_CORE_MONITOR_HIT item = {};
-			fill_monitor_hit(item, hit);
-			core->monitor_hits.push_back(item);
+			for (std::size_t index = 0; index < count; index++)
+			{
+				HACDBG_CORE_MONITOR_HIT item = {};
+				fill_monitor_hit(item, batch[index]);
+				push_monitor_hit(core, item);
+			}
+
+			if (count < 128)
+			{
+				break;
+			}
 		}
+	}
+
+	void publish_monitors(HACDBG_CORE* const core)
+	{
+		publish_monitor_sites(core);
+		publish_monitor_hits(core);
 	}
 	constexpr std::chrono::milliseconds trace_poll_interval(33);
 	constexpr std::chrono::milliseconds trace_minimum_read_interval(20);
@@ -1063,13 +1124,20 @@ namespace
 
 		while (core->running.load(std::memory_order_acquire) != 0)
 		{
+			std::uint8_t again = 0;
+
 			try
 			{
-				breakpoint::drain_monitor_mailbox();
+				again = breakpoint::drain_monitor_mailbox();
 				publish_monitors(core);
 			}
 			catch (const std::exception&)
 			{
+			}
+
+			if (again != 0)
+			{
+				continue;
 			}
 
 			std::unique_lock<std::mutex> lock(core->command_mutex);
@@ -1153,7 +1221,7 @@ namespace
 				}
 
 				update_state(core);
-				publish_monitors(core);
+				publish_monitor_sites(core);
 
 				if (commands::is_quit_command(command) != 0)
 				{
@@ -1243,7 +1311,7 @@ namespace
 				update_state(core);
 			}
 
-			publish_monitors(core);
+			publish_monitor_sites(core);
 
 			if (perform_trace_read(core) != false)
 			{
@@ -1324,6 +1392,7 @@ HACDBG_CORE* HacDbgCoreCreate(const HACDBG_OUTPUT_CALLBACK output_callback, void
 	try
 	{
 		HACDBG_CORE* const core = new HACDBG_CORE();
+		core->monitor_hit_slots.resize(monitor_hit_queue_limit);
 		core->output_callback = output_callback;
 		core->output_context = context;
 		copy_version(core->state.UserVersion, HACDBG_VERSION_STRING);
@@ -1622,7 +1691,7 @@ uint32_t HacDbgCoreCopyMonitors(HACDBG_CORE* const core, HACDBG_CORE_MONITOR* co
 }
 
 uint32_t HacDbgCoreCopyMonitorHits(HACDBG_CORE* const core, HACDBG_CORE_MONITOR_HIT* const items, const uint32_t capacity,
-                                   uint32_t* const count_out)
+                                   uint32_t* const count_out, uint64_t* const newest_sequence)
 {
 	if (core == nullptr || count_out == nullptr || (items == nullptr && capacity != 0))
 	{
@@ -1630,16 +1699,28 @@ uint32_t HacDbgCoreCopyMonitorHits(HACDBG_CORE* const core, HACDBG_CORE_MONITOR_
 	}
 
 	std::lock_guard<std::mutex> lock(core->monitor_mutex);
+	const std::size_t available = core->monitor_hit_count;
 	const uint32_t count = static_cast<uint32_t>(
-		(std::min)(core->monitor_hits.size(), static_cast<std::size_t>(capacity)));
+		(std::min)(available, static_cast<std::size_t>(capacity)));
+	const std::size_t slots = core->monitor_hit_slots.size();
 
 	for (uint32_t index = 0; index < count; index++)
 	{
-		items[index] = core->monitor_hits[index];
+		items[index] = core->monitor_hit_slots[(core->monitor_hit_head + index) % slots];
 	}
 
-	core->monitor_hits.erase(core->monitor_hits.begin(), core->monitor_hits.begin() + count);
+	if (count != 0 && slots != 0)
+	{
+		core->monitor_hit_head = (core->monitor_hit_head + count) % slots;
+		core->monitor_hit_count -= count;
+	}
+
 	*count_out = count;
+
+	if (newest_sequence != nullptr)
+	{
+		*newest_sequence = core->monitor_newest_sequence;
+	}
 
 	return HacDbgCoreStatusOk;
 }

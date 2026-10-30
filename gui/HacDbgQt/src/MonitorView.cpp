@@ -4,6 +4,8 @@
 #include "Format.h"
 #include "RegisterView.h"
 
+#include <algorithm>
+
 #include <QAbstractItemView>
 #include <QAbstractListModel>
 #include <QHBoxLayout>
@@ -19,7 +21,7 @@
 namespace
 {
 constexpr int kMaximumRows = 20000;
-constexpr std::uint32_t kCopyCapacity = 2048;
+constexpr std::uint32_t kCopyCapacity = 8192;
 
 QString monitorLine(const HACDBG_CORE_MONITOR_HIT& hit)
 {
@@ -70,8 +72,10 @@ public:
 
         if (count > kMaximumRows)
         {
-            m_dropped += static_cast<std::uint64_t>(count - kMaximumRows);
-            hits += count - kMaximumRows;
+            const int skip = count - kMaximumRows;
+            m_dropped += static_cast<std::uint64_t>(skip);
+            m_nextNumber += static_cast<std::uint64_t>(skip);
+            hits += skip;
             count = kMaximumRows;
         }
 
@@ -127,7 +131,92 @@ public:
         m_rows.clear();
         m_dropped = 0;
         m_nextNumber = 1;
+        m_expected = 0;
         endResetModel();
+    }
+
+    void setExpected(std::uint64_t sequence)
+    {
+        m_expected = sequence;
+    }
+
+    void account(const HACDBG_CORE_MONITOR_HIT* hits, int count)
+    {
+        if (hits == nullptr || count <= 0)
+        {
+            return;
+        }
+
+        //
+        // One read can contain a later sequence before an earlier one. Counting
+        // that hole and then also keeping the late rows makes the last line
+        // number larger than the number of hits. Same sequence twice is one hit.
+        //
+        std::vector<HACDBG_CORE_MONITOR_HIT> fresh;
+        fresh.reserve(static_cast<std::size_t>(count));
+
+        for (int index = 0; index < count; ++index)
+        {
+            const std::uint64_t sequence = hits[index].Sequence;
+
+            if (sequence == 0 || (m_expected != 0 && sequence <= m_expected))
+            {
+                continue;
+            }
+
+            fresh.push_back(hits[index]);
+        }
+
+        if (fresh.empty())
+        {
+            return;
+        }
+
+        std::sort(fresh.begin(), fresh.end(), [](const HACDBG_CORE_MONITOR_HIT& left, const HACDBG_CORE_MONITOR_HIT& right)
+        {
+            return left.Sequence < right.Sequence;
+        });
+        fresh.erase(std::unique(fresh.begin(), fresh.end(), [](const HACDBG_CORE_MONITOR_HIT& left, const HACDBG_CORE_MONITOR_HIT& right)
+        {
+            return left.Sequence == right.Sequence;
+        }),
+                    fresh.end());
+
+        std::uint64_t accounted = m_expected;
+        std::size_t run = 0;
+
+        while (run < fresh.size())
+        {
+            const std::uint64_t sequence = fresh[run].Sequence;
+
+            if (accounted == 0)
+            {
+                if (sequence > m_nextNumber)
+                {
+                    m_dropped += sequence - m_nextNumber;
+                    m_nextNumber = sequence;
+                }
+            }
+            else if (sequence > accounted + 1)
+            {
+                const std::uint64_t gap = sequence - (accounted + 1);
+                m_dropped += gap;
+                m_nextNumber += gap;
+            }
+
+            std::size_t end = run + 1;
+
+            while (end < fresh.size() && fresh[end].Sequence == fresh[end - 1].Sequence + 1)
+            {
+                end += 1;
+            }
+
+            append(fresh.data() + run, static_cast<int>(end - run));
+            accounted = fresh[end - 1].Sequence;
+            run = end;
+        }
+
+        m_expected = accounted;
     }
 
 private:
@@ -149,6 +238,7 @@ private:
     std::vector<Row> m_rows;
     std::uint64_t m_dropped = 0;
     std::uint64_t m_nextNumber = 1;
+    std::uint64_t m_expected = 0;
 };
 
 namespace
@@ -342,15 +432,19 @@ void MonitorView::clearLog()
         m_copy.resize(kCopyCapacity);
     }
 
-    for (int pass = 0; pass < 4; ++pass)
+    std::uint64_t newest = 0;
+
+    for (int batch = 0; batch < 4; ++batch)
     {
         std::uint32_t count = 0;
 
-        if (m_session->copyMonitorHits(m_copy.data(), kCopyCapacity, &count) == false || count == 0)
+        if (m_session->copyMonitorHits(m_copy.data(), kCopyCapacity, &count, &newest) == false || count == 0)
         {
             break;
         }
     }
+
+    m_model->setExpected(newest);
 }
 
 void MonitorView::poll()
@@ -365,15 +459,32 @@ void MonitorView::poll()
         m_copy.resize(kCopyCapacity);
     }
 
-    std::uint32_t count = 0;
+    bool any = false;
+    const bool follow = nearBottom() || m_log->selectionModel()->currentIndex().isValid() == false;
 
-    if (m_session->copyMonitorHits(m_copy.data(), kCopyCapacity, &count) == false || count == 0)
+    //
+    // One poll takes a few fixed batches. Draining until the queue stays
+    // empty never returns while a million hits a second are still arriving,
+    // and the batch vector keeps every copy until the process runs out of memory.
+    //
+    for (int batch = 0; batch < 4; ++batch)
+    {
+        std::uint32_t count = 0;
+        std::uint64_t newest = 0;
+
+        if (m_session->copyMonitorHits(m_copy.data(), kCopyCapacity, &count, &newest) == false || count == 0)
+        {
+            break;
+        }
+
+        any = true;
+        m_model->account(m_copy.data(), static_cast<int>(count));
+    }
+
+    if (any == false)
     {
         return;
     }
-
-    const bool follow = nearBottom() || m_log->selectionModel()->currentIndex().isValid() == false;
-    m_model->append(m_copy.data(), static_cast<int>(count));
 
     if (follow && m_model->rowCount() > 0)
     {

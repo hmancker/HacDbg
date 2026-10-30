@@ -491,10 +491,11 @@ bool CoreSession::copyMonitors(HACDBG_CORE_MONITOR* monitors, std::uint32_t capa
            m_copyMonitors(m_core, monitors, capacity, count) == HacDbgCoreStatusOk;
 }
 
-bool CoreSession::copyMonitorHits(HACDBG_CORE_MONITOR_HIT* hits, std::uint32_t capacity, std::uint32_t* count) const
+bool CoreSession::copyMonitorHits(HACDBG_CORE_MONITOR_HIT* hits, std::uint32_t capacity, std::uint32_t* count,
+                                 std::uint64_t* newestSequence) const
 {
     return m_started && m_copyMonitorHits != nullptr && count != nullptr &&
-           m_copyMonitorHits(m_core, hits, capacity, count) == HacDbgCoreStatusOk;
+           m_copyMonitorHits(m_core, hits, capacity, count, newestSequence) == HacDbgCoreStatusOk;
 }
 
 bool CoreSession::traceControl(std::uint32_t flags, std::uint32_t sampleRate, std::uint32_t eventMask)
