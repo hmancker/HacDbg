@@ -4696,14 +4696,43 @@ std::uint8_t breakpoint::continue_paused_thread(const std::uint64_t logical_rip,
 
 	const ULONGLONG started = GetTickCount64();
 
+	//
+	// The monitor thread drains the mailbox into the pending list. A call
+	// that returns after that drain never shows up as a fresh notify here.
+	//
 	while (GetTickCount64() - started < wait_ms)
 	{
-		if (hypercall::log_notify_idle() == 0 && flush_into_pause_state(0, 1) == 1 && pause_state.valid == 1)
+		if (hypercall::log_notify_idle() == 0)
+		{
+			flush_into_pause_state(0, 1);
+		}
+
+		if (pause_state.valid == 0)
+		{
+			reconsider_pending_logs();
+		}
+
+		if (pause_state.valid == 1)
 		{
 			return 1;
 		}
 
 		Sleep(10);
+	}
+
+	if (hypercall::log_notify_idle() == 0)
+	{
+		flush_into_pause_state(0, 1);
+	}
+
+	if (pause_state.valid == 0)
+	{
+		reconsider_pending_logs();
+	}
+
+	if (pause_state.valid == 1)
+	{
+		return 1;
 	}
 
 	pause_state.expected_rip = 0;
