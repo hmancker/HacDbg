@@ -5,6 +5,7 @@
 #include "RegisterView.h"
 
 #include <algorithm>
+#include <utility>
 
 #include <QAbstractItemView>
 #include <QAbstractListModel>
@@ -23,10 +24,17 @@ namespace
 constexpr int kMaximumRows = 20000;
 constexpr std::uint32_t kCopyCapacity = 8192;
 
-QString monitorLine(const HACDBG_CORE_MONITOR_HIT& hit)
+QString monitorLine(const HACDBG_CORE_MONITOR_HIT& hit, const QString& function)
 {
-    return QStringLiteral("HacDbg: monitor rip=0x%1 cr3=0x%2.")
-        .arg(QString::number(hit.Rip, 16), QString::number(hit.Cr3, 16));
+    const QString rip = QString::number(hit.Rip, 16);
+    const QString cr3 = QString::number(hit.Cr3, 16);
+
+    if (function.isEmpty())
+    {
+        return QStringLiteral("HacDbg: monitor rip=0x%1 cr3=0x%2.").arg(rip, cr3);
+    }
+
+    return QStringLiteral("HacDbg: monitor %1 rip=0x%2 cr3=0x%3.").arg(function, rip, cr3);
 }
 }
 
@@ -36,6 +44,25 @@ public:
     explicit MonitorLogModel(QObject* parent)
         : QAbstractListModel(parent)
     {
+    }
+
+    void setSiteSymbol(const std::uint64_t address, const QString& symbol)
+    {
+        if (address == 0 || symbol.isEmpty())
+        {
+            return;
+        }
+
+        for (std::pair<std::uint64_t, QString>& item : m_symbols)
+        {
+            if (item.first == address)
+            {
+                item.second = symbol;
+                return;
+            }
+        }
+
+        m_symbols.emplace_back(address, symbol);
     }
 
     int rowCount(const QModelIndex& parent = QModelIndex()) const override
@@ -226,15 +253,30 @@ private:
         QString line;
     };
 
+    QString cachedSymbol(const std::uint64_t address) const
+    {
+        for (const std::pair<std::uint64_t, QString>& item : m_symbols)
+        {
+            if (item.first == address)
+            {
+                return item.second;
+            }
+        }
+
+        return {};
+    }
+
     Row makeRow(const HACDBG_CORE_MONITOR_HIT& hit)
     {
+        const std::uint64_t address = hit.Address != 0 ? hit.Address : hit.Rip;
         Row row;
         row.hit = hit;
-        row.line = QStringLiteral("%1  %2").arg(m_nextNumber).arg(monitorLine(hit));
+        row.line = QStringLiteral("%1  %2").arg(m_nextNumber).arg(monitorLine(hit, cachedSymbol(address)));
         m_nextNumber += 1;
         return row;
     }
 
+    std::vector<std::pair<std::uint64_t, QString>> m_symbols;
     std::vector<Row> m_rows;
     std::uint64_t m_dropped = 0;
     std::uint64_t m_nextNumber = 1;
@@ -461,6 +503,16 @@ void MonitorView::poll()
 
     bool any = false;
     const bool follow = nearBottom() || m_log->selectionModel()->currentIndex().isValid() == false;
+    std::vector<HACDBG_CORE_MONITOR> sites(HACDBG_CORE_MAX_MONITORS);
+    std::uint32_t siteCount = 0;
+
+    if (m_session->copyMonitors(sites.data(), HACDBG_CORE_MAX_MONITORS, &siteCount))
+    {
+        for (std::uint32_t index = 0; index < siteCount; ++index)
+        {
+            m_model->setSiteSymbol(sites[index].Address, QString::fromUtf8(sites[index].Symbol));
+        }
+    }
 
     //
     // One poll takes a few fixed batches. Draining until the queue stays

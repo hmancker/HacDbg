@@ -20,6 +20,7 @@ namespace commands
 	// return means a command is already queued. The view stops and is put
 	// back so that command runs before the view is tried again.
 	//
+	void mark_command_thread();
 	void set_view_preempt(std::uint8_t (*preempt)());
 	void latch_view_preempt();
 	void clear_view_preempted();

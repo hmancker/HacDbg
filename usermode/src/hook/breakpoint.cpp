@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <mutex>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -4043,7 +4044,7 @@ std::uint8_t breakpoint::poll_new_pause()
 }
 
 std::uint8_t breakpoint::add_monitor(const std::uint64_t address, const std::uint64_t log_rip,
-                                         const std::uint64_t span)
+                                         const std::uint64_t span, const std::string_view symbol)
 {
 	const std::lock_guard<std::recursive_mutex> log(g_log_mutex);
 
@@ -4059,6 +4060,11 @@ std::uint8_t breakpoint::add_monitor(const std::uint64_t address, const std::uin
 			site.log_rip = log_rip;
 			site.span = span;
 
+			if (symbol.empty() == false)
+			{
+				site.symbol.assign(symbol);
+			}
+
 			return 1;
 		}
 	}
@@ -4072,7 +4078,8 @@ std::uint8_t breakpoint::add_monitor(const std::uint64_t address, const std::uin
 	site.address = address;
 	site.log_rip = log_rip;
 	site.span = span;
-	monitor_site_list.push_back(site);
+	site.symbol.assign(symbol);
+	monitor_site_list.push_back(std::move(site));
 
 	return 1;
 }

@@ -9,12 +9,20 @@
 #include <vector>
 #include <array>
 #include <memory_resource>
+#include <unordered_map>
 
 #include "hook_disassembly.h"
 
 namespace
 {
+	struct kernel_hook_patch_t
+	{
+		std::uint64_t offset = 0;
+		std::vector<std::uint8_t> original = {};
+	};
+
 	std::unordered_map<std::uint64_t, hook::kernel_hook_info_t> kernel_hook_list = {};
+	std::unordered_map<std::uint64_t, kernel_hook_patch_t> kernel_hook_patches = {};
 
 	std::uint64_t kernel_detour_section_base = 0;
 	std::uint64_t kernel_detour_section_size = 0;
@@ -23,6 +31,7 @@ namespace
 	std::uint8_t* kernel_detour_holder_shadow_page_mapped = nullptr;
 
 	constexpr std::size_t inline_hook_bytes_size = 14;
+	constexpr std::uint64_t inline_jump_rel32_size = 5;
 	constexpr std::uint64_t detour_cave_minimum = 0x80;
 
 	std::uint8_t padding_byte(const std::uint8_t value)
@@ -71,6 +80,79 @@ namespace
 				size_out = cave_size;
 			}
 		}
+	}
+
+	void* shadow_for_page(const std::uint64_t page_pfn, std::uint8_t& overflow_out)
+	{
+		overflow_out = 0;
+		void* shadow = nullptr;
+
+		for (const auto& [address, info] : kernel_hook_list)
+		{
+			if (info.original_page_pfn() != page_pfn && info.overflow_page_pfn() != page_pfn)
+			{
+				continue;
+			}
+
+			if (info.overflow_page_pfn() != 0)
+			{
+				overflow_out = 1;
+			}
+
+			shadow = info.mapped_shadow_page();
+
+			if (info.original_page_pfn() == page_pfn)
+			{
+				return shadow;
+			}
+
+			(void)address;
+		}
+
+		return shadow;
+	}
+
+	std::uint8_t patch_overlaps(const std::uint64_t page_pfn, const std::uint64_t offset, const std::uint64_t length)
+	{
+		const std::uint64_t end = offset + length;
+
+		for (const auto& [address, info] : kernel_hook_list)
+		{
+			if (info.original_page_pfn() != page_pfn)
+			{
+				continue;
+			}
+
+			const auto found = kernel_hook_patches.find(address);
+
+			if (found == kernel_hook_patches.end())
+			{
+				continue;
+			}
+
+			const std::uint64_t other = found->second.offset;
+			const std::uint64_t other_end = other + found->second.original.size();
+
+			if (offset < other_end && other < end)
+			{
+				return 1;
+			}
+		}
+
+		return 0;
+	}
+
+	std::uint8_t shadow_still_used(void* const shadow, const std::uint64_t except)
+	{
+		for (const auto& [address, info] : kernel_hook_list)
+		{
+			if (address != except && info.mapped_shadow_page() == shadow)
+			{
+				return 1;
+			}
+		}
+
+		return 0;
 	}
 
 	void publish_shadow_bytes(void* const address, const std::uint64_t size)
@@ -240,9 +322,20 @@ std::uint8_t hook::contains_hooked_page(const std::uint64_t physical_address)
 
 void hook::clean_up()
 {
+	std::vector<std::uint64_t> addresses = {};
+
+	addresses.reserve(kernel_hook_list.size());
+
 	for (const auto& [virtual_address, info] : kernel_hook_list)
 	{
-		remove_kernel_hook(virtual_address, 0);
+		addresses.push_back(virtual_address);
+
+		(void)info;
+	}
+
+	for (const std::uint64_t virtual_address : addresses)
+	{
+		remove_kernel_hook(virtual_address, 1);
 	}
 
 	kernel_hook_list.clear();
@@ -261,51 +354,46 @@ void hook::set_kernel_detour_holder_base(const std::uint64_t address, const std:
 
 static std::pair<std::vector<std::uint8_t>, std::uint64_t> load_original_bytes_into_shadow_page(
 	std::uint8_t* shadow_page_virtual, const std::uint64_t routine_to_hook_virtual, const std::uint8_t is_overflow_hook,
-	const std::uint64_t extra_asm_byte_count)
+	const std::uint64_t minimum_size)
 {
 	const std::uint64_t page_offset = routine_to_hook_virtual & 0xFFF;
 
 	hypercall::read_guest_virtual_memory(shadow_page_virtual, routine_to_hook_virtual - page_offset, sys::current_cr3,
 	                                     is_overflow_hook == 1 ? (page_size * 2) : page_size);
 
-	return hook_disasm::get_routine_aligned_bytes(shadow_page_virtual + page_offset,
-	                                              inline_hook_bytes_size + extra_asm_byte_count,
+	return hook_disasm::get_routine_aligned_bytes(shadow_page_virtual + page_offset, minimum_size,
 	                                              routine_to_hook_virtual);
 }
 
+static std::vector<std::uint8_t> absolute_jump(std::uint64_t target);
+static std::vector<std::uint8_t> relative_jump(std::uint64_t site, std::uint64_t target);
+
 static std::uint8_t set_up_inline_hook(std::uint8_t* shadow_page_virtual, const std::uint64_t routine_to_hook_virtual,
                                        const std::uint64_t routine_to_hook_physical, const std::uint64_t detour_address,
-                                       const std::pair<std::vector<std::uint8_t>, std::uint64_t>& original_bytes,
-                                       const std::span<const std::uint8_t> extra_assembled_bytes,
-                                       const std::span<const std::uint8_t> post_original_assembled_bytes,
-                                       const std::uint8_t is_overflow_hook,
+                                       const std::uint64_t patch_length, const std::uint8_t is_overflow_hook,
                                        std::uint64_t& overflow_shadow_page_physical_address,
                                        std::uint64_t& overflow_page_physical_address)
 {
-	std::array<std::uint8_t, inline_hook_bytes_size> jmp_to_detour_bytes = {
-		0x68, 0x21, 0x43, 0x65, 0x87, // push   0xffffffff87654321
-		0xC7, 0x44, 0x24, 0x04, 0x78, 0x56, 0x34, 0x12, // mov    DWORD PTR [rsp+0x4],0x12345678
-		0xC3 // ret
-	};
+	std::vector<std::uint8_t> inline_hook_bytes = {};
 
-	const parted_address_t parted_subroutine_to_jmp_to = {.value = detour_address};
-
-	*reinterpret_cast<std::uint32_t*>(&jmp_to_detour_bytes[1]) = parted_subroutine_to_jmp_to.u.low_part;
-	*reinterpret_cast<std::uint32_t*>(&jmp_to_detour_bytes[9]) = parted_subroutine_to_jmp_to.u.high_part;
-
-	std::vector<std::uint8_t> inline_hook_bytes(extra_assembled_bytes.begin(), extra_assembled_bytes.end());
-
-	inline_hook_bytes.insert(inline_hook_bytes.end(), jmp_to_detour_bytes.begin(), jmp_to_detour_bytes.end());
-
-	if (static_cast<int>(post_original_assembled_bytes.empty()) == 0)
+	//
+	// The monitor stub and any post bytes run in the detour. The function
+	// entry keeps only the jump, so a short neighbor on the same page can
+	// still be hooked.
+	//
+	if (patch_length == inline_jump_rel32_size)
 	{
-		inline_hook_bytes.insert(inline_hook_bytes.end(), post_original_assembled_bytes.begin(),
-		                         post_original_assembled_bytes.end());
+		inline_hook_bytes = relative_jump(routine_to_hook_virtual, detour_address);
+	}
 
-		const std::uint64_t nop_bytes_needed = original_bytes.second - inline_hook_bytes.size();
+	if (inline_hook_bytes.empty() == true)
+	{
+		inline_hook_bytes = absolute_jump(detour_address);
+	}
 
-		inline_hook_bytes.insert(inline_hook_bytes.end(), nop_bytes_needed, 0x90);
-		// nop padding until next actual instruction
+	if (inline_hook_bytes.size() != patch_length)
+	{
+		return 0;
 	}
 
 	const std::uint64_t page_offset = routine_to_hook_physical & 0xFFF;
@@ -362,21 +450,16 @@ static std::uint8_t set_up_hook_handler(const std::uint64_t routine_to_hook_virt
 
 	parted_address_t parted_subroutine_to_jmp_to{};
 
-	if (static_cast<int>(post_original_assembled_bytes.empty()) == 0)
-	{
-		parted_subroutine_to_jmp_to.value = routine_to_hook_virtual + extra_assembled_bytes.size() +
-			inline_hook_bytes_size;
-	}
-	else
-	{
-		parted_subroutine_to_jmp_to.value = routine_to_hook_virtual + original_bytes.second;
-	}
+	parted_subroutine_to_jmp_to.value = routine_to_hook_virtual + original_bytes.second;
 
 	*reinterpret_cast<std::uint32_t*>(&return_to_original_bytes[1]) = parted_subroutine_to_jmp_to.u.low_part;
 	*reinterpret_cast<std::uint32_t*>(&return_to_original_bytes[9]) = parted_subroutine_to_jmp_to.u.high_part;
 
-	std::vector<std::uint8_t> hook_handler_bytes = original_bytes.first;
+	std::vector<std::uint8_t> hook_handler_bytes(extra_assembled_bytes.begin(), extra_assembled_bytes.end());
 
+	hook_handler_bytes.insert(hook_handler_bytes.end(), original_bytes.first.begin(), original_bytes.first.end());
+	hook_handler_bytes.insert(hook_handler_bytes.end(), post_original_assembled_bytes.begin(),
+	                          post_original_assembled_bytes.end());
 	hook_handler_bytes.insert(hook_handler_bytes.end(), return_to_original_bytes.begin(),
 	                          return_to_original_bytes.end());
 
@@ -435,6 +518,16 @@ static std::uint8_t detour_in_rel32(const std::uint64_t site)
 		static_cast<std::int64_t>(site + 5);
 
 	return static_cast<std::uint8_t>(near_edge >= -static_cast<std::int64_t>(0x80000000) && far_edge <= 0x7FFFFFFF);
+}
+
+static std::uint64_t inline_patch_length(const std::uint64_t site)
+{
+	if (kernel_detour_holder_base != 0 && detour_in_rel32(site) == 1)
+	{
+		return inline_jump_rel32_size;
+	}
+
+	return inline_hook_bytes_size;
 }
 
 //
@@ -545,6 +638,8 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 
 	if (kernel_hook_list.contains(routine_to_hook_virtual))
 	{
+		LOG_ERR("kernel hook already exists");
+
 		return 0;
 	}
 
@@ -557,30 +652,63 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 	}
 
 	const std::uint64_t page_offset = routine_to_hook_physical & 0xFFF;
-	const std::uint64_t hook_end = page_offset + inline_hook_bytes_size + extra_assembled_bytes.size();
+	const std::uint64_t patch_length = inline_patch_length(routine_to_hook_virtual);
+	const std::uint64_t hook_end = page_offset + patch_length;
 
 	const std::uint8_t is_overflow_hook = static_cast<const std::uint8_t>(page_size < hook_end);
+	const std::uint64_t page_pfn = routine_to_hook_physical >> 12;
+	std::uint8_t existing_overflow = 0;
+	void* const shared_shadow = shadow_for_page(page_pfn, existing_overflow);
 
-	void* shadow_page_virtual = sys::user::allocate_locked_memory(is_overflow_hook == 1 ? (page_size * 2) : page_size,
-	                                                              PAGE_READWRITE);
+	//
+	// The SLAT hook is one entry per 4 KiB page. A second function on that
+	// page patches the shadow already installed for the first.
+	//
+	if (shared_shadow != nullptr && (is_overflow_hook == 1 || existing_overflow == 1))
+	{
+		LOG_ERR("kernel hook crosses a page that is already hooked");
+
+		return 0;
+	}
+
+	void* shadow_page_virtual = shared_shadow;
+	std::uint64_t shadow_page_physical = 0;
+	std::pair<std::vector<std::uint8_t>, std::uint64_t> original_bytes = {};
 
 	if (shadow_page_virtual == nullptr)
 	{
-		return 0;
+		shadow_page_virtual = sys::user::allocate_locked_memory(is_overflow_hook == 1 ? (page_size * 2) : page_size,
+		                                                        PAGE_READWRITE);
+
+		if (shadow_page_virtual == nullptr)
+		{
+			return 0;
+		}
+
+		shadow_page_physical = hypercall::translate_guest_virtual_address(
+			reinterpret_cast<std::uint64_t>(shadow_page_virtual), sys::directory_for_local_memory());
+
+		if (shadow_page_physical == 0)
+		{
+			return 0;
+		}
+
+		original_bytes = load_original_bytes_into_shadow_page(static_cast<std::uint8_t*>(shadow_page_virtual),
+		                                                     routine_to_hook_virtual, is_overflow_hook, patch_length);
 	}
-
-	const std::uint64_t shadow_page_physical = hypercall::translate_guest_virtual_address(
-		reinterpret_cast<std::uint64_t>(shadow_page_virtual), sys::directory_for_local_memory());
-
-	if (shadow_page_physical == 0)
+	else
 	{
-		return 0;
-	}
+		std::vector<std::uint8_t> page(page_size);
+		const std::uint64_t page_virtual = routine_to_hook_virtual & ~(static_cast<std::uint64_t>(page_size) - 1);
 
-	const auto original_bytes = load_original_bytes_into_shadow_page(static_cast<std::uint8_t*>(shadow_page_virtual),
-	                                                                 routine_to_hook_virtual, is_overflow_hook,
-	                                                                 extra_assembled_bytes.size() +
-	                                                                 post_original_assembled_bytes.size());
+		if (hypercall::read_guest_virtual_memory(page.data(), page_virtual, sys::current_cr3, page_size) != page_size)
+		{
+			return 0;
+		}
+
+		original_bytes = hook_disasm::get_routine_aligned_bytes(page.data() + page_offset, patch_length,
+		                                                     routine_to_hook_virtual);
+	}
 
 	if (original_bytes.first.empty())
 	{
@@ -600,13 +728,34 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 
 	const std::uint64_t detour_address = kernel_detour_holder_base + detour_holder_shadow_offset;
 
+	if (original_bytes.second < patch_length)
+	{
+		LOG_ERR("kernel hook entry is shorter than the jump");
+
+		return 0;
+	}
+
+	if (shared_shadow != nullptr &&
+	    (page_offset + patch_length > page_size || patch_overlaps(page_pfn, page_offset, patch_length) == 1))
+	{
+		LOG_ERR("kernel hook overlaps an existing hook");
+
+		return 0;
+	}
+
+	auto* const shadow_before_patch = static_cast<std::uint8_t*>(shadow_page_virtual);
+	kernel_hook_patch_t saved_patch = {};
+
+	saved_patch.offset = page_offset;
+	saved_patch.original.assign(shadow_before_patch + page_offset,
+	                            shadow_before_patch + page_offset + patch_length);
+
 	std::uint64_t overflow_shadow_page_physical_address = 0;
 	std::uint64_t overflow_page_physical_address = 0;
 
 	std::uint64_t hook_status = set_up_inline_hook(static_cast<std::uint8_t*>(shadow_page_virtual),
 	                                               routine_to_hook_virtual, routine_to_hook_physical, detour_address,
-	                                               original_bytes, extra_assembled_bytes, post_original_assembled_bytes,
-	                                               is_overflow_hook, overflow_shadow_page_physical_address,
+	                                               patch_length, is_overflow_hook, overflow_shadow_page_physical_address,
 	                                               overflow_page_physical_address);
 
 	if (hook_status == 0)
@@ -614,28 +763,27 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 		return 0;
 	}
 
+	kernel_hook_patches[routine_to_hook_virtual] = std::move(saved_patch);
+
 	const std::uint64_t page_virtual = routine_to_hook_virtual & ~(static_cast<std::uint64_t>(page_size) - 1);
-	std::uint64_t patch_length = extra_assembled_bytes.size() + inline_hook_bytes_size;
-
-	if (post_original_assembled_bytes.empty() == false)
-	{
-		patch_length = original_bytes.second;
-	}
-
 	auto* const shadow = static_cast<std::uint8_t*>(shadow_page_virtual);
 	const std::uint64_t page_patch = page_offset + patch_length > page_size ? page_size - page_offset : patch_length;
 
-	if (relocate_page_span(shadow, page_virtual, page_offset, page_patch) == 0)
+	if (shared_shadow == nullptr && relocate_page_span(shadow, page_virtual, page_offset, page_patch) == 0)
 	{
+		kernel_hook_patches.erase(routine_to_hook_virtual);
+
 		return 0;
 	}
 
-	if (is_overflow_hook == 1)
+	if (shared_shadow == nullptr && is_overflow_hook == 1)
 	{
 		const std::uint64_t overflow_patch = page_offset + patch_length - page_size;
 
 		if (relocate_page_span(shadow + page_size, page_virtual + page_size, 0, overflow_patch) == 0)
 		{
+			kernel_hook_patches.erase(routine_to_hook_virtual);
+
 			return 0;
 		}
 	}
@@ -644,13 +792,33 @@ std::uint8_t hook::add_kernel_hook(const std::uint64_t routine_to_hook_virtual,
 
 	//
 	// Translation includes the byte offset inside the page. The SLAT hook
-	// names the 4 KiB page, and a non-zero offset is rejected.
+	// names the 4 KiB page, and a non-zero offset is rejected. A page that
+	// already has a hook keeps that entry; the edited shadow is copied again
+	// by the flush.
 	//
-	hook_status = hypercall::add_slat_code_hook(routine_to_hook_physical & ~0xFFFull,
-	                                            shadow_page_physical & ~0xFFFull);
-
-	if (hook_status == 0)
+	if (shared_shadow == nullptr)
 	{
+		hook_status = hypercall::add_slat_code_hook(routine_to_hook_physical & ~0xFFFull,
+		                                            shadow_page_physical & ~0xFFFull);
+
+		if (hook_status == 0)
+		{
+			kernel_hook_patches.erase(routine_to_hook_virtual);
+
+			return 0;
+		}
+	}
+	else if (hypercall::flush_slat_cache() == 0)
+	{
+		const auto failed = kernel_hook_patches.find(routine_to_hook_virtual);
+
+		if (failed != kernel_hook_patches.end() && failed->second.original.empty() == false)
+		{
+			memcpy(shadow + failed->second.offset, failed->second.original.data(), failed->second.original.size());
+		}
+
+		kernel_hook_patches.erase(routine_to_hook_virtual);
+
 		return 0;
 	}
 
@@ -683,21 +851,39 @@ std::uint8_t hook::remove_kernel_hook(const std::uint64_t hooked_routine_virtual
 	}
 
 	const kernel_hook_info_t hook_info = kernel_hook_list[hooked_routine_virtual];
+	const auto patch = kernel_hook_patches.find(hooked_routine_virtual);
+	const std::uint8_t keep_page = shadow_still_used(hook_info.mapped_shadow_page(), hooked_routine_virtual);
 
-	if (hypercall::remove_slat_code_hook(hook_info.original_page_pfn() << 12) == 0)
+	if (keep_page == 1)
 	{
-		LOG_ERR("unable to remove slat counterpart of kernel hook");
+		if (patch != kernel_hook_patches.end() && patch->second.original.empty() == false)
+		{
+			auto* const shadow = static_cast<std::uint8_t*>(hook_info.mapped_shadow_page());
 
-		return 0;
+			memcpy(shadow + patch->second.offset, patch->second.original.data(), patch->second.original.size());
+			publish_shadow_bytes(shadow + patch->second.offset, patch->second.original.size());
+			hypercall::flush_slat_cache();
+		}
+	}
+	else
+	{
+		if (hypercall::remove_slat_code_hook(hook_info.original_page_pfn() << 12) == 0)
+		{
+			LOG_ERR("unable to remove slat counterpart of kernel hook");
+
+			return 0;
+		}
+
+		if (hook_info.overflow_page_pfn() != 0 &&
+		    hypercall::remove_slat_code_hook(hook_info.overflow_page_pfn() << 12) == 0)
+		{
+			LOG_ERR("unable to remove slat counterpart of kernel hook (2)");
+
+			return 0;
+		}
 	}
 
-	if (hook_info.overflow_page_pfn() != 0 && hypercall::remove_slat_code_hook(hook_info.overflow_page_pfn() << 12) ==
-		0)
-	{
-		LOG_ERR("unable to remove slat counterpart of kernel hook (2)");
-
-		return 0;
-	}
+	kernel_hook_patches.erase(hooked_routine_virtual);
 
 	if (do_list_erase == 1)
 	{
@@ -709,7 +895,7 @@ std::uint8_t hook::remove_kernel_hook(const std::uint64_t hooked_routine_virtual
 
 	kernel_detour_holder::free_memory(detour_holder_allocation);
 
-	if (sys::user::free_memory(hook_info.mapped_shadow_page()) == 0)
+	if (keep_page == 0 && sys::user::free_memory(hook_info.mapped_shadow_page()) == 0)
 	{
 		LOG_ERR("unable to deallocate mapped shadow page");
 

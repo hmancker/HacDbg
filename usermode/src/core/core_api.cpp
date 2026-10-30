@@ -211,6 +211,10 @@ namespace
 			HACDBG_CORE_MONITOR item = {};
 			item.Address = site.address;
 			item.Hits = site.hits;
+
+			const std::size_t symbol_length = (std::min)(site.symbol.size(), sizeof(item.Symbol) - 1);
+			std::memcpy(item.Symbol, site.symbol.data(), symbol_length);
+			item.Symbol[symbol_length] = '\0';
 			core->monitors.push_back(item);
 		}
 	}
@@ -1150,6 +1154,7 @@ namespace
 
 	void worker_loop(HACDBG_CORE* const core)
 	{
+		commands::mark_command_thread();
 
 		while (true)
 		{

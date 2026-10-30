@@ -39,6 +39,7 @@
 #include "../script/script.h"
 
 static std::uint8_t preempt_view();
+static std::string format_nearest_symbol(std::uint64_t address);
 
 constexpr std::uint64_t command_memory_size_limit = 0x1000000;
 
@@ -554,6 +555,7 @@ static void process_akh(const CLI::App* const akh)
 		// mov r8, function; cpuid; pop r8; pop rdx; pop rcx.
 		// imm32 has log_current_state and hypercall_log_breakpoint_flag.
 		// The driver records r8 and restores the three saved registers.
+		// These bytes run in the detour. The function entry is only a jump.
 		//
 		std::array<std::uint8_t, 30> monitor_bytes = {
 			0x51, 0x52, 0x41, 0x50, 0xB9, 0x00, 0x00, 0x00, 0x00, 0xBA, 0x00, 0x00, 0x00, 0x00, 0x49, 0xB8, 0x00, 0x00,
@@ -585,7 +587,12 @@ static void process_akh(const CLI::App* const akh)
 		//
 		if (monitor == 1 && asm_bytes.empty() == false)
 		{
-			if (breakpoint::add_monitor(virtual_address, virtual_address, asm_bytes.size()) == 0)
+			//
+			// Resolve once here. The monitor view prints this cached name and
+			// does not look the address up again for each hit.
+			//
+			if (breakpoint::add_monitor(virtual_address, virtual_address, asm_bytes.size(),
+			                            format_nearest_symbol(virtual_address)) == 0)
 			{
 				LOG_ERR("monitor list is full");
 			}
@@ -1642,7 +1649,10 @@ static void unassemble_guest_code(const unassemble_request_t& request)
 
 	if (build_disassembly(request, 0, instructions, next_address, error) == 0)
 	{
-		LOG_ERR("{}", error);
+		if (error.empty() == false)
+		{
+			LOG_ERR("{}", error);
+		}
 
 		return;
 	}
@@ -10855,9 +10865,20 @@ static void announce_breakpoint_hit()
 static std::atomic<std::uint8_t> console_cancel = 0;
 static std::uint8_t (*g_view_preempt)() = nullptr;
 static std::uint8_t g_view_preempted = 0;
+static thread_local std::uint8_t t_command_thread = 0;
 
 static std::uint8_t preempt_view()
 {
+	//
+	// The command thread is the work the view is supposed to yield for.
+	// command_active is set for that whole command, so treating it as a
+	// preempt aborts u with an empty error.
+	//
+	if (t_command_thread != 0)
+	{
+		return 0;
+	}
+
 	if (g_view_preempt == nullptr)
 	{
 		return 0;
@@ -10960,6 +10981,11 @@ void commands::clear_cancel()
 std::uint8_t commands::interrupt_requested()
 {
 	return console_cancel.load();
+}
+
+void commands::mark_command_thread()
+{
+	t_command_thread = 1;
 }
 
 void commands::set_view_preempt(std::uint8_t (*preempt)())

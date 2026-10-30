@@ -1,5 +1,6 @@
 #pragma once
 #include <cstdint>
+#include <string>
 #include <string_view>
 #include <vector>
 
@@ -72,6 +73,8 @@ namespace breakpoint
 		std::uint64_t log_rip = 0;
 		std::uint64_t span = 0;
 		std::uint64_t hits = 0;
+		// module!name resolved once when the hook is installed.
+		std::string symbol = {};
 	};
 
 	struct monitor_hit_t
@@ -81,7 +84,7 @@ namespace breakpoint
 		trap_frame_log_t log = {};
 	};
 
-	std::uint8_t add_monitor(std::uint64_t address, std::uint64_t log_rip, std::uint64_t span);
+	std::uint8_t add_monitor(std::uint64_t address, std::uint64_t log_rip, std::uint64_t span, std::string_view symbol);
 	void remove_monitor(std::uint64_t address);
 	void note_monitor_logs(const trap_frame_log_t* logs, std::uint64_t count);
 	std::vector<monitor_site_t> monitor_sites();

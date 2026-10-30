@@ -496,12 +496,14 @@ uint32_t HacDbgCoreCopyCompletions(HACDBG_CORE* Core, uint64_t RequestId,
 
 /**
  * @brief One akh --monitor hook. Address is the hooked function. Hits is the
- * number of mailbox records matched since the hook was installed.
+ * number of mailbox records matched since the hook was installed. Symbol is
+ * the module!name resolved when the hook was installed, or empty.
  */
 typedef struct _HACDBG_CORE_MONITOR
 {
     uint64_t Address;
     uint64_t Hits;
+    char Symbol[HACDBG_CORE_SYMBOL_SIZE];
 } HACDBG_CORE_MONITOR;
 
 /**
@@ -559,7 +561,7 @@ uint32_t HacDbgCoreCopyMonitorHits(HACDBG_CORE* Core, HACDBG_CORE_MONITOR_HIT* I
 static_assert(sizeof(HACDBG_CORE_TRACE_STATUS) == 80, "core trace status ABI changed");
 static_assert(sizeof(HACDBG_CORE_COMPLETION) == 512, "core completion ABI changed");
 static_assert(sizeof(HACDBG_CORE_COMPLETION_STATUS) == 32, "core completion status ABI changed");
-static_assert(sizeof(HACDBG_CORE_MONITOR) == 16, "core monitor ABI changed");
+static_assert(sizeof(HACDBG_CORE_MONITOR) == 208, "core monitor ABI changed");
 static_assert(sizeof(HACDBG_CORE_MONITOR_HIT) == 200, "core monitor hit ABI changed");
 static_assert(HACDBG_CORE_MONITOR_STACK == 5, "core monitor stack ABI changed");
 #endif
