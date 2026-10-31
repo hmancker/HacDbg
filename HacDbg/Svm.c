@@ -686,7 +686,8 @@ SvmInitialize(
             SVM_INTERCEPT_MISC2_STGI | SVM_INTERCEPT_MISC2_CLGI | SVM_INTERCEPT_MISC2_SKINIT;
 #endif
         ProcessorContext->GuestVmcb->ControlArea.MsrpmBasePa = g_MsrpmPa;
-        ProcessorContext->GuestVmcb->ControlArea.GuestAsid = (UINT32)GuestAsid;
+        ProcessorContext->GuestVmcb->ControlArea.GuestAsid = SVM_ASID_MAIN;
+        UNREFERENCED_PARAMETER(GuestAsid);
         ProcessorContext->GuestVmcb->ControlArea.NpEnable = SVM_NP_ENABLE;
         ProcessorContext->GuestVmcb->ControlArea.NCr3 = NptRootPa;
 
@@ -1266,7 +1267,7 @@ SvmHandleVmExit(
         HypercallNoteKernelCr3(vmcb->StateSaveArea.Cr3);
     }
     vmcb->ControlArea.TlbControl =
-        InterlockedExchange(&processor->TlbFlushRequested, 0) != 0 ? SVM_TLB_CONTROL_FLUSH_GUEST : 0;
+        InterlockedExchange(&processor->TlbFlushRequested, 0) != 0 ? SVM_TLB_CONTROL_FLUSH_CURRENT_ASID : 0;
 
     if (processor->StopRequested != FALSE)
     {
@@ -1285,7 +1286,7 @@ SvmHandleVmExit(
         (UINT32)GuestContext->Registers->Rcx == HACDBG_FLUSH_CPUID_SUBLEAF)
     {
         GuestContext->Registers->Rax = 1;
-        vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_GUEST;
+        vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_CURRENT_ASID;
         vmcb->ControlArea.VmcbClean &= ~(1ull << 4);
         SvmAdvanceRip(vmcb);
         vmcb->StateSaveArea.Rax = GuestContext->Registers->Rax;
@@ -1419,7 +1420,7 @@ SvmFlushAllProcessors(
         if (processor != NULL)
         {
             InterlockedExchange(&processor->TlbFlushRequested, 1);
-            processor->GuestVmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_GUEST;
+            processor->GuestVmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_CURRENT_ASID;
         }
     }
 

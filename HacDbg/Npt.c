@@ -8,6 +8,7 @@
 #include "Npt.h"
 #include "Debug.h"
 #include "PhysicalMemory.h"
+#include "Svm.h"
 
 #define HACDBG_NPT_TAG              'TcaH'
 #define HACDBG_NPT_MAX_HOOKS        256
@@ -1040,8 +1041,12 @@ NptHandleNestedPageFault(
     {
         if (currentRoot != (g_HookRootPa & NPT_ADDRESS_MASK))
         {
+            //
+            // ASID 2 holds translations for the hook NPT root. The main root
+            // stays cached under ASID 1, so this switch does not flush.
+            //
+            Vmcb->ControlArea.GuestAsid = SVM_ASID_HOOK;
             Vmcb->ControlArea.NCr3 = g_HookRootPa;
-            Vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_GUEST;
             Vmcb->ControlArea.VmcbClean &= ~(1ull << 4);
         }
 
@@ -1077,8 +1082,8 @@ NptHandleNestedPageFault(
             return TRUE;
         }
 
+        Vmcb->ControlArea.GuestAsid = SVM_ASID_MAIN;
         Vmcb->ControlArea.NCr3 = g_MainRootPa;
-        Vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_GUEST;
         Vmcb->ControlArea.VmcbClean &= ~(1ull << 4);
         return TRUE;
     }

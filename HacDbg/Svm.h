@@ -66,6 +66,14 @@
 
 #define SVM_TLB_CONTROL_FLUSH_GUEST           3ull
 
+//
+// TLB_CONTROL 1 drops translations for the current ASID. The hook NPT root
+// uses the next ASID, so switching nCR3 does not flush either set.
+//
+#define SVM_TLB_CONTROL_FLUSH_CURRENT_ASID    1ull
+#define SVM_ASID_MAIN                         1u
+#define SVM_ASID_HOOK                         2u
+
 #define HACDBG_STOP_CPUID_LEAF                0x48444300u
 #define HACDBG_STOP_CPUID_SUBLEAF             0x44424748u
 #define HACDBG_FLUSH_CPUID_LEAF               0x48444301u
