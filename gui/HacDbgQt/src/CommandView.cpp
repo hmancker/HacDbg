@@ -302,6 +302,11 @@ void CommandView::setInputEnabled(bool enabled)
     m_input->setEnabled(enabled);
 }
 
+void CommandView::setInputPlaceholder(const QString& text)
+{
+    m_input->setPlaceholderText(text);
+}
+
 void CommandView::focusInput()
 {
     m_input->setFocus();

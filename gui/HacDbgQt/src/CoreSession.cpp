@@ -219,6 +219,8 @@ void CoreSession::loadAndStartAsync(const QString& directory)
         m_startThread.join();
     }
 
+    m_discardStart = false;
+    m_startBusy.store(true);
     m_startThread = std::thread([this, directory]
     {
         QString error;
@@ -226,10 +228,7 @@ void CoreSession::loadAndStartAsync(const QString& directory)
         if (load(directory, &error) == false)
         {
             m_startError = error;
-            QMetaObject::invokeMethod(this, [this]
-            {
-                emit startFinished(HacDbgCoreStatusState);
-            }, Qt::QueuedConnection);
+            postStartFinished(HacDbgCoreStatusState);
             return;
         }
 
@@ -238,30 +237,40 @@ void CoreSession::loadAndStartAsync(const QString& directory)
         if (m_core == nullptr)
         {
             m_startError = QStringLiteral("核心处于无效状态，无法启动调试会话。");
-            QMetaObject::invokeMethod(this, [this]
-            {
-                emit startFinished(HacDbgCoreStatusState);
-            }, Qt::QueuedConnection);
+            postStartFinished(HacDbgCoreStatusState);
             return;
         }
 
-        const std::uint32_t status = m_start(m_core);
-        QMetaObject::invokeMethod(this, [this, status]
-        {
-            if (m_core == nullptr)
-            {
-                return;
-            }
-
-            m_started = status == HacDbgCoreStatusOk;
-            emit startFinished(status);
-        }, Qt::QueuedConnection);
+        postStartFinished(m_start(m_core));
     });
 }
 
 QString CoreSession::startError() const
 {
     return m_startError;
+}
+
+void CoreSession::retryStart()
+{
+    if (m_discardStart || m_started || m_core == nullptr || m_start == nullptr)
+    {
+        return;
+    }
+
+    if (m_startBusy.exchange(true))
+    {
+        return;
+    }
+
+    if (m_startThread.joinable())
+    {
+        m_startThread.join();
+    }
+
+    m_startThread = std::thread([this]
+    {
+        postStartFinished(m_start(m_core));
+    });
 }
 
 void CoreSession::startAsync()
@@ -302,6 +311,8 @@ void CoreSession::startAsync()
 
 void CoreSession::shutdown()
 {
+    m_discardStart = true;
+
     if (m_startThread.joinable())
     {
         m_startThread.join();
@@ -604,6 +615,31 @@ void CoreSession::drainOutput(int maximum, std::vector<OutputRecord>* records)
     m_output.erase(m_output.begin(), m_output.begin() + count);
 }
 
+void CoreSession::postStartFinished(std::uint32_t status)
+{
+    QMetaObject::invokeMethod(this, [this, status]
+    {
+        m_startBusy.store(false);
+
+        if (m_discardStart)
+        {
+            return;
+        }
+
+        if (m_core != nullptr)
+        {
+            m_started = status == HacDbgCoreStatusOk;
+
+            if (m_started)
+            {
+                m_dedupeStartErrors.store(false);
+            }
+        }
+
+        emit startFinished(status);
+    }, Qt::QueuedConnection);
+}
+
 void CoreSession::enqueueOutput(std::uint32_t kind, const char* text, std::uint32_t length)
 {
     OutputRecord record;
@@ -615,6 +651,32 @@ void CoreSession::enqueueOutput(std::uint32_t kind, const char* text, std::uint3
     }
 
     std::lock_guard<std::mutex> guard(m_outputLock);
+
+    if (kind == HacDbgOutputError)
+    {
+        //
+        // The hypervisor is not loaded yet. The window retries until CPUID
+        // answers. This line is not a failed session.
+        //
+        if (record.text.contains(QStringLiteral("hypervisor does not answer CPUID hypercalls")))
+        {
+            return;
+        }
+
+        if (m_dedupeStartErrors.load())
+        {
+            for (const QString& shown : m_startErrorsShown)
+            {
+                if (shown == record.text)
+                {
+                    return;
+                }
+            }
+
+            m_startErrorsShown.push_back(record.text);
+        }
+    }
+
     m_output.push_back(std::move(record));
 
     if (m_output.size() > kMaximumQueuedOutput)

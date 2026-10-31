@@ -9,6 +9,9 @@
   <Project Path="symbol-parser/symbol-parser.vcxproj" Id="b7e4a1c2-6f0d-4a88-9c31-5d2e8a7b4f10" />
   <Project Path="usermode/HacDbgCore.vcxproj" Id="8f3c2a11-4b6d-4f2e-9a7c-1d2e3f4a5b6c" />
   <Project Path="usermode/usermode.vcxproj" Id="2ea786e4-1147-4804-aead-17975e24ec46" />
+  <Project Path="plugins/HacDbgMapper/HacDbgMapper.vcxproj" Id="e7b4c1a8-2d55-4f19-9c30-6a1d8e2b4f70">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
   <Project Path="gui/HacDbgTrace/HacDbgTrace.vcxproj" Id="c81a7d45-3f66-4d91-9c4a-58e2f1d6b7a3">
     <Platform Solution="*|x64" Project="x64" />
   </Project>

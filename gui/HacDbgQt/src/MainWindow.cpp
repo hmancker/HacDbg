@@ -14,6 +14,7 @@
 #include <QCoreApplication>
 #include <QLabel>
 #include <QMenuBar>
+#include <QMessageBox>
 #include <QPainter>
 #include <QPainterPath>
 #include <QPixmap>
@@ -33,6 +34,7 @@ namespace
 {
 constexpr std::uint32_t kExpectedHypercallAbi = 2;
 constexpr int kIdlePollMs = 100;
+constexpr int kDriverRetryMs = 500;
 constexpr int kStepPollMs = 16;
 
 enum DebugIcon
@@ -153,6 +155,8 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     resize(1400, 900);
 
     auto* fileMenu = menuBar()->addMenu(QStringLiteral("文件"));
+    fileMenu->addAction(QStringLiteral("驱动映射"), this, &MainWindow::openMapper);
+    fileMenu->addSeparator();
     fileMenu->addAction(QStringLiteral("退出"), this, &QWidget::close);
     auto* viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
     viewMenu->addAction(QStringLiteral("实时 trace"), this, &MainWindow::openTrace);
@@ -199,6 +203,10 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     m_stack = new QStackedWidget(central);
     m_command = new CommandView(m_stack);
     m_command->setSession(&m_session);
+    if (connectCore)
+    {
+        m_command->setInputPlaceholder(QStringLiteral("等待驱动"));
+    }
     m_stack->addWidget(m_command);
 
     for (int index = PageDisassembly; index <= PageProcesses; ++index)
@@ -216,7 +224,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     m_tabs->setCurrentIndex(PageCommand);
     connect(m_tabs, &QTabBar::currentChanged, this, &MainWindow::onTabChanged);
 
-    m_connection = new QLabel(connectCore ? QStringLiteral("未连接") : QStringLiteral("UI only"), this);
+    m_connection = new QLabel(connectCore ? QStringLiteral("等待驱动") : QStringLiteral("UI only"), this);
     m_paused = new QLabel(QStringLiteral("—"), this);
     m_cr3 = new QLabel(QStringLiteral("CR3 —"), this);
     m_version = new QLabel(this);
@@ -242,6 +250,9 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     m_timer = new QTimer(this);
     m_timer->setInterval(kIdlePollMs);
     connect(m_timer, &QTimer::timeout, this, &MainWindow::tick);
+    m_connectRetry = new QTimer(this);
+    m_connectRetry->setInterval(kDriverRetryMs);
+    connect(m_connectRetry, &QTimer::timeout, this, &MainWindow::retryCore);
     m_debugIdle = new QTimer(this);
     m_debugIdle->setSingleShot(true);
     m_debugIdle->setInterval(300);
@@ -250,6 +261,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
 
 MainWindow::~MainWindow()
 {
+    m_connectRetry->stop();
     m_session.shutdown();
 }
 
@@ -384,6 +396,7 @@ void MainWindow::closeEvent(QCloseEvent* event)
         return;
     }
 
+    m_connectRetry->stop();
     m_session.shutdown();
     event->accept();
 }
@@ -398,6 +411,7 @@ void MainWindow::startCore()
 
     if (isAdministrator() == false)
     {
+        m_command->setInputPlaceholder(QString());
         m_command->appendLocalError(QStringLiteral("GUI 未以管理员身份运行，无法连接驱动。请从 UAC 提示中允许提权后重试。"));
         m_connection->setText(QStringLiteral("未连接"));
         return;
@@ -410,17 +424,51 @@ void MainWindow::startCore()
 
 void MainWindow::onStarted(quint32 status)
 {
-    if (status != HacDbgCoreStatusOk)
+    if (status == HacDbgCoreStatusOk)
     {
-        const QString detail = m_session.startError();
-        m_command->appendLocalError(detail.isEmpty() ? startFailure(status) : detail);
-        m_connection->setText(QStringLiteral("未连接"));
+        m_connectRetry->stop();
+        m_connection->setText(QStringLiteral("已连接"));
+        m_command->setInputPlaceholder(QString());
+        m_command->setInputEnabled(true);
+
+        if (isActiveWindow())
+        {
+            m_command->focusInput();
+        }
+
         return;
     }
 
-    m_connection->setText(QStringLiteral("已连接"));
-    m_command->setInputEnabled(true);
-    m_command->focusInput();
+    if (status == HacDbgCoreStatusDriver)
+    {
+        m_connection->setText(QStringLiteral("等待驱动"));
+        m_command->setInputEnabled(false);
+        m_command->setInputPlaceholder(QStringLiteral("等待驱动"));
+
+        if (m_connectRetry->isActive() == false)
+        {
+            m_connectRetry->start();
+        }
+
+        return;
+    }
+
+    m_connectRetry->stop();
+    m_command->setInputPlaceholder(QString());
+    const QString detail = m_session.startError();
+    m_command->appendLocalError(detail.isEmpty() ? startFailure(status) : detail);
+    m_connection->setText(QStringLiteral("未连接"));
+}
+
+void MainWindow::retryCore()
+{
+    if (m_session.isStarted())
+    {
+        m_connectRetry->stop();
+        return;
+    }
+
+    m_session.retryStart();
 }
 
 void MainWindow::tick()
@@ -614,6 +662,32 @@ void MainWindow::refreshVisiblePage()
 QWidget* MainWindow::holder(int index)
 {
     return m_holders[index];
+}
+
+void MainWindow::openMapper()
+{
+    const QString path = QCoreApplication::applicationDirPath() + QStringLiteral("\\HacDbgMapper.dll");
+    static HMODULE module = nullptr;
+    if (module == nullptr)
+    {
+        module = LoadLibraryW(reinterpret_cast<const wchar_t*>(path.utf16()));
+    }
+
+    if (module == nullptr)
+    {
+        QMessageBox::warning(this, QStringLiteral("驱动映射"), QStringLiteral("缺少 HacDbgMapper.dll。"));
+        return;
+    }
+
+    using show_fn = void (*)(HWND);
+    const auto show = reinterpret_cast<show_fn>(GetProcAddress(module, "HacDbgMapperShow"));
+    if (show == nullptr)
+    {
+        QMessageBox::warning(this, QStringLiteral("驱动映射"), QStringLiteral("HacDbgMapper.dll 没有窗口入口。"));
+        return;
+    }
+
+    show(reinterpret_cast<HWND>(winId()));
 }
 
 void MainWindow::openTrace()

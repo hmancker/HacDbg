@@ -1,0 +1,5 @@
+LIBRARY HacDbgMapper
+
+EXPORTS
+    HacDbgMapperMap
+    HacDbgMapperShow

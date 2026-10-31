@@ -21,6 +21,7 @@ public:
 
     void setSession(CoreSession* session);
     void setInputEnabled(bool enabled);
+    void setInputPlaceholder(const QString& text);
     void focusInput();
     QWidget* commandBar() const;
     void openFind();

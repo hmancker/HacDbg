@@ -68,6 +68,19 @@ static PVOID g_PowerCallbackRegistration;
 static BOOLEAN g_VirtualizationSuspended;
 static PDEVICE_OBJECT g_DeviceObject;
 
+NTKERNELAPI
+NTSTATUS
+NTAPI
+IoCreateDriver(
+    _In_opt_ PUNICODE_STRING DriverName,
+    _In_ PDRIVER_INITIALIZE InitializationFunction
+    );
+
+static VOID
+DriverUnload(
+    _In_ PDRIVER_OBJECT DriverObject
+    );
+
 #if !HACDBG_BACKEND_INTEL
 EXTERN_C VOID
 SvmLaunchVm(
@@ -715,8 +728,8 @@ DriverUnload(
 // 驱动入口：按固定顺序初始化各模块，最后虚拟化所有处理器。
 EXTERN_C NTSTATUS
 DriverEntry(
-    _In_ PDRIVER_OBJECT DriverObject,
-    _In_ PUNICODE_STRING RegistryPath
+    _In_opt_ PDRIVER_OBJECT DriverObject,
+    _In_opt_ PUNICODE_STRING RegistryPath
     )
 {
     NTSTATUS status;
@@ -726,6 +739,18 @@ DriverEntry(
 
     HACDBG_LOG("HacDbg: DriverEntry start: driver version %s (%s).\n",
              HACDBG_VERSION_STRING, HACDBG_VENDOR_NAME);
+
+    if (DriverObject == NULL)
+    {
+        UNICODE_STRING driverName;
+
+        //
+        // Manual mapping calls DriverEntry without a DRIVER_OBJECT.
+        // IoCreateDriver builds one and re-enters this function.
+        //
+        RtlInitUnicodeString(&driverName, L"\\Driver\\HacDbg");
+        return IoCreateDriver(&driverName, DriverEntry);
+    }
 
 #if !HACDBG_DIAGNOSTICS
     UNREFERENCED_PARAMETER(RegistryPath);

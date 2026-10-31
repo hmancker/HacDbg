@@ -75,6 +75,11 @@
     <ProjectReference Include="..\..\usermode\HacDbgCore.vcxproj">
       <Project>{8f3c2a11-4b6d-4f2e-9a7c-1d2e3f4a5b6c}</Project>
     </ProjectReference>
+    <ProjectReference Include="..\..\plugins\HacDbgMapper\HacDbgMapper.vcxproj">
+      <Project>{E7B4C1A8-2D55-4F19-9C30-6A1D8E2B4F70}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
     <ProjectReference Include="..\HacDbgTrace\HacDbgTrace.vcxproj">
       <Project>{c81a7d45-3f66-4d91-9c4a-58e2f1d6b7a3}</Project>
     </ProjectReference>

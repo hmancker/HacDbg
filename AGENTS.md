@@ -273,6 +273,14 @@ Intel VT-x 与上面的 AMD 规则并列，不替换它们：
 * HyperDbg 位于 `D:\\Project\\github\\HyperDbg`，仓库根许可证是 GPL-3.0。本仓库的 Intel 驱动启动、VMX 启用、VMCS、`VMXON`、`VMLAUNCH`、`VMRESUME` 循环和 EPT 对照 `hyperdbg/hyperhv`，再按 Intel SDM 写进 `HacDbg/`。复制了实质片段时，保留其版权声明。不搬 `libhyperdbg`、`hyperkd`、脚本引擎和 `hwdbg`。
 * pulzar 本机路径未确认。只在对照 NPT 或 VMEXIT 分工时阅读。不把它的 UEFI loader、handoff 或固件客户搬进本仓库，也不把 Rust 译成 C。
 
+### kdmapper
+
+三环可以把 `HacDbg.sys` 手工映射进内核。实现是独立插件 `plugins/HacDbgMapper/`，生成 `HacDbgMapper.dll`。来源是公开的 kdmapper，以及本机 `DriverTools` 里那份 Intel 漏洞驱动封装。保留原文件语言和命名。不把漏洞驱动当生产签名方案，也不把它写进 WDK 驱动工程。三环只 `LoadLibrary` 这个插件，不静态链接它。
+
+* 调试器启动时不映射驱动。`HacDbgQt.exe` 的「文件 → 驱动映射」打开插件窗口，由用户选择要映射的 `.sys`。
+* 映射时 `DriverEntry` 的 `DRIVER_OBJECT` 为空，驱动用 `IoCreateDriver` 再建对象。
+* 这条路径需要管理员，并且本机允许加载嵌入的 Intel 漏洞驱动。Memory Integrity / HVCI 会让它失败。
+
 ### 其他依赖
 
 * 引入第三方库之前，先确认 hyper-reV 和本仓库都没有同样的功能，说明许可证。用户同意之后再加。

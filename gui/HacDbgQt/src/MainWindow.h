@@ -47,12 +47,14 @@ private:
 
     void startCore();
     void onStarted(quint32 status);
+    void retryCore();
     void tick();
     void executeDebug(const QString& command);
     void beginDebug(const QString& command, bool echoNow);
     void finishDebugCommand(bool failed);
     void refreshDebugViews();
     void openTrace();
+    void openMapper();
     void updateState(const HACDBG_CORE_STATE& state);
     void onTabChanged(int index);
     void ensurePage(int index);
@@ -74,6 +76,7 @@ private:
     QStackedWidget* m_stack = nullptr;
     QWidget* m_holders[6] = {};
     QTimer* m_timer = nullptr;
+    QTimer* m_connectRetry = nullptr;
     QTimer* m_debugIdle = nullptr;
     QLabel* m_connection = nullptr;
     QLabel* m_paused = nullptr;

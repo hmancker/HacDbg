@@ -5,6 +5,7 @@
 
 #include <hacdbg_core_api.h>
 
+#include <atomic>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -28,6 +29,7 @@ public:
     bool load(const QString& directory, QString* error);
     void loadAndStartAsync(const QString& directory);
     void startAsync();
+    void retryStart();
     void shutdown();
     QString startError() const;
 
@@ -76,11 +78,16 @@ signals:
 
 private:
     void enqueueOutput(std::uint32_t kind, const char* text, std::uint32_t length);
+    void postStartFinished(std::uint32_t status);
     static void __cdecl outputThunk(std::uint32_t kind, const char* text, std::uint32_t length, void* context);
 
     void* m_module = nullptr;
     HACDBG_CORE* m_core = nullptr;
     bool m_started = false;
+    bool m_discardStart = false;
+    std::atomic<bool> m_startBusy{false};
+    std::atomic<bool> m_dedupeStartErrors{true};
+    std::vector<QString> m_startErrorsShown;
     QString m_startError;
     std::thread m_startThread;
     std::mutex m_outputLock;
