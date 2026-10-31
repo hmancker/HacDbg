@@ -280,10 +280,19 @@ SvmStartAllProcessors(
         if (context != NULL)
         {
             g_Contexts[index] = context;
-            context->TraceState = TraceCpuState((UINT32)index);
-            status = context->TraceState == NULL
-                         ? STATUS_INSUFFICIENT_RESOURCES
-                         : SvmInitialize(context, NptMainRootPa(), 1);
+            status = SvmInitialize(context, NptMainRootPa(), 1);
+            if (NT_SUCCESS(status))
+            {
+                //
+                // SvmInitialize clears the context. The trace slot has to be
+                // stored after that, or every VM-exit is dropped.
+                //
+                context->TraceState = TraceCpuState((UINT32)index);
+                if (context->TraceState == NULL)
+                {
+                    status = STATUS_INSUFFICIENT_RESOURCES;
+                }
+            }
         }
         else
         {
