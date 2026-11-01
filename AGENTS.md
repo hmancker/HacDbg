@@ -278,7 +278,7 @@ Intel VT-x 与上面的 AMD 规则并列，不替换它们：
 三环可以把 `HacDbg.sys` 手工映射进内核。实现是独立插件 `plugins/HacDbgMapper/`，生成 `HacDbgMapper.dll`。来源是公开的 kdmapper，以及本机 `DriverTools` 里那份 Intel 漏洞驱动封装。保留原文件语言和命名。不把漏洞驱动当生产签名方案，也不把它写进 WDK 驱动工程。三环只 `LoadLibrary` 这个插件，不静态链接它。
 
 * 调试器启动时不映射驱动。`HacDbgQt.exe` 的「文件 → 驱动映射」打开插件窗口，由用户选择要映射的 `.sys`。
-* 映射时 `DriverEntry` 的 `DRIVER_OBJECT` 为空，驱动用 `IoCreateDriver` 再建对象。
+* 映射时如果没有把分配地址当作入口参数，先 `IoCreateDriver` 再建对象，然后进入 `DriverEntry`。空的 `DRIVER_OBJECT` 会在写 `DriverUnload`（偏移 `0x68`）时访问违例。
 * 这条路径需要管理员，并且本机允许加载嵌入的 Intel 漏洞驱动。Memory Integrity / HVCI 会让它失败。
 
 ### 其他依赖

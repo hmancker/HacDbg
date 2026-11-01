@@ -19,6 +19,50 @@ void RelocateImageByDelta(mapper_pe::vec_relocs relocs, const ULONG64 delta) {
 	}
 }
 
+bool CallDriverEntryWithObject(ULONG64 entry, NTSTATUS* status_out)
+{
+	const uint64_t create_driver = intel_driver::GetKernelModuleExport(intel_driver::ntoskrnlAddr, "IoCreateDriver");
+	if (!create_driver) {
+		kdmLog(L"[-] IoCreateDriver was not found" << std::endl);
+		return false;
+	}
+
+	wchar_t driver_name[48] = {};
+	swprintf_s(driver_name, L"\\Driver\\Map%08X", GetTickCount());
+	const size_t name_bytes = (wcslen(driver_name) + 1) * sizeof(wchar_t);
+	const uint64_t block = intel_driver::AllocatePool(nt::POOL_TYPE::NonPagedPool, sizeof(UNICODE_STRING) + name_bytes);
+	if (!block) {
+		kdmLog(L"[-] Failed to allocate the driver object name" << std::endl);
+		return false;
+	}
+
+	UNICODE_STRING name = {};
+	name.Length = static_cast<USHORT>(wcslen(driver_name) * sizeof(wchar_t));
+	name.MaximumLength = static_cast<USHORT>(name_bytes);
+	name.Buffer = reinterpret_cast<PWSTR>(block + sizeof(UNICODE_STRING));
+
+	const bool wrote_name = intel_driver::WriteMemory(block, &name, sizeof(name)) &&
+		intel_driver::WriteMemory(block + sizeof(UNICODE_STRING), driver_name, name_bytes);
+	if (!wrote_name) {
+		intel_driver::FreePool(block);
+		kdmLog(L"[-] Failed to write the driver object name" << std::endl);
+		return false;
+	}
+
+	kdmLog(L"[+] Calling IoCreateDriver " << driver_name << std::endl);
+	NTSTATUS status = 0;
+	const bool called = intel_driver::CallKernelFunction(&status, create_driver, block, entry);
+	intel_driver::FreePool(block);
+	if (!called) {
+		return false;
+	}
+
+	if (status_out) {
+		*status_out = status;
+	}
+	return true;
+}
+
 // Fix cookie by @Jerem584
 bool FixSecurityCookie(void* local_image, ULONG64 kernel_image_base)
 {
@@ -241,7 +285,23 @@ ULONG64 kdmapper::MapDriver(BYTE* data, ULONG64 param1, ULONG64 param2, bool fre
 		}
 
 		NTSTATUS status = 0;
-		if (!intel_driver::CallKernelFunction(&status, address_of_entry_point, (PassAllocationAddressAsFirstParam ? realBase : param1), param2)) {
+		const bool needs_driver_object = !PassAllocationAddressAsFirstParam && param1 == 0;
+		bool called = false;
+
+		if (needs_driver_object) {
+			//
+			// A normal WDM DriverEntry writes DriverUnload at offset 0x68.
+			// Calling it with a null object is an access violation and stops
+			// the machine when a kernel debugger is attached.
+			//
+			called = CallDriverEntryWithObject(address_of_entry_point, &status);
+		}
+		else {
+			called = intel_driver::CallKernelFunction(&status, address_of_entry_point,
+				(PassAllocationAddressAsFirstParam ? realBase : param1), param2);
+		}
+
+		if (!called) {
 			kdmLog(L"[-] Failed to call driver entry" << std::endl);
 			kernel_image_base = realBase;
 			break;
