@@ -281,6 +281,14 @@ Intel VT-x 与上面的 AMD 规则并列，不替换它们：
 * 映射时如果没有把分配地址当作入口参数，先 `IoCreateDriver` 再建对象，然后进入 `DriverEntry`。空的 `DRIVER_OBJECT` 会在写 `DriverUnload`（偏移 `0x68`）时访问违例。
 * 这条路径需要管理员，并且本机允许加载嵌入的 Intel 漏洞驱动。Memory Integrity / HVCI 会让它失败。
 
+### 进程转储
+
+三环可以把目标进程的主模块内存转储成一份可重建的 PE。实现是独立插件 `plugins/HacDbgDumper/`，生成 `HacDbgDumper.dll`。通信驱动是 `plugins/ProcessIoctlDrv/`，生成 `ProcessIoctlDrv.sys`，设备名 `\\.\PdIoctl`。来源是本机 DriverTools 的进程转储。保留原文件语言和命名。不搬字符串加密，不把 Intel 漏洞驱动再嵌进这个插件。三环只 `LoadLibrary` 这个插件，不静态链接它。
+
+* 调试器启动时不转储进程。`HacDbgQt.exe` 的「文件 → 进程转储」打开插件窗口。用户输入 PID 和输出路径，再附加、监控页面，最后保存。
+* 窗口不映射驱动。先用「文件 → 驱动映射」加载 `ProcessIoctlDrv.sys`，勾选「分配地址作为入口参数」。入口自己调用 `IoCreateDriver` 创建 `\\Device\\PdIoctl`。
+* 这条路径需要管理员。通信驱动能读所选进程的虚拟内存，并能挂起或恢复该进程。
+
 ### 其他依赖
 
 * 引入第三方库之前，先确认 hyper-reV 和本仓库都没有同样的功能，说明许可证。用户同意之后再加。

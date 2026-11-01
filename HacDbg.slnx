@@ -12,6 +12,12 @@
   <Project Path="plugins/HacDbgMapper/HacDbgMapper.vcxproj" Id="e7b4c1a8-2d55-4f19-9c30-6a1d8e2b4f70">
     <Platform Solution="*|x64" Project="x64" />
   </Project>
+  <Project Path="plugins/HacDbgDumper/HacDbgDumper.vcxproj" Id="c4e8a1d2-6b37-4f90-8a15-2d9e7c3b5a61">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
+  <Project Path="plugins/ProcessIoctlDrv/ProcessIoctlDrv.vcxproj" Id="b8f2d4c6-1a73-4e55-9c28-5f6a0e3d7b14">
+    <Platform Solution="*|x64" Project="x64" />
+  </Project>
   <Project Path="gui/HacDbgTrace/HacDbgTrace.vcxproj" Id="c81a7d45-3f66-4d91-9c4a-58e2f1d6b7a3">
     <Platform Solution="*|x64" Project="x64" />
   </Project>

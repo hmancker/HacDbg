@@ -156,6 +156,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
 
     auto* fileMenu = menuBar()->addMenu(QStringLiteral("文件"));
     fileMenu->addAction(QStringLiteral("驱动映射"), this, &MainWindow::openMapper);
+    fileMenu->addAction(QStringLiteral("进程转储"), this, &MainWindow::openDumper);
     fileMenu->addSeparator();
     fileMenu->addAction(QStringLiteral("退出"), this, &QWidget::close);
     auto* viewMenu = menuBar()->addMenu(QStringLiteral("视图"));
@@ -684,6 +685,32 @@ void MainWindow::openMapper()
     if (show == nullptr)
     {
         QMessageBox::warning(this, QStringLiteral("驱动映射"), QStringLiteral("HacDbgMapper.dll 没有窗口入口。"));
+        return;
+    }
+
+    show(reinterpret_cast<HWND>(winId()));
+}
+
+void MainWindow::openDumper()
+{
+    const QString path = QCoreApplication::applicationDirPath() + QStringLiteral("\\HacDbgDumper.dll");
+    static HMODULE module = nullptr;
+    if (module == nullptr)
+    {
+        module = LoadLibraryW(reinterpret_cast<const wchar_t*>(path.utf16()));
+    }
+
+    if (module == nullptr)
+    {
+        QMessageBox::warning(this, QStringLiteral("进程转储"), QStringLiteral("缺少 HacDbgDumper.dll。"));
+        return;
+    }
+
+    using show_fn = void (*)(HWND);
+    const auto show = reinterpret_cast<show_fn>(GetProcAddress(module, "HacDbgDumperShow"));
+    if (show == nullptr)
+    {
+        QMessageBox::warning(this, QStringLiteral("进程转储"), QStringLiteral("HacDbgDumper.dll 没有窗口入口。"));
         return;
     }
 

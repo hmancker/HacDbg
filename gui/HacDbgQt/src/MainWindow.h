@@ -55,6 +55,7 @@ private:
     void refreshDebugViews();
     void openTrace();
     void openMapper();
+    void openDumper();
     void updateState(const HACDBG_CORE_STATE& state);
     void onTabChanged(int index);
     void ensurePage(int index);

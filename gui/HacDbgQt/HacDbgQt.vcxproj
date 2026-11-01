@@ -80,6 +80,16 @@
       <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
       <LinkLibraryDependencies>false</LinkLibraryDependencies>
     </ProjectReference>
+    <ProjectReference Include="..\..\plugins\HacDbgDumper\HacDbgDumper.vcxproj">
+      <Project>{C4E8A1D2-6B37-4F90-8A15-2D9E7C3B5A61}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
+    <ProjectReference Include="..\..\plugins\ProcessIoctlDrv\ProcessIoctlDrv.vcxproj">
+      <Project>{B8F2D4C6-1A73-4E55-9C28-5F6A0E3D7B14}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+      <LinkLibraryDependencies>false</LinkLibraryDependencies>
+    </ProjectReference>
     <ProjectReference Include="..\HacDbgTrace\HacDbgTrace.vcxproj">
       <Project>{c81a7d45-3f66-4d91-9c4a-58e2f1d6b7a3}</Project>
     </ProjectReference>
