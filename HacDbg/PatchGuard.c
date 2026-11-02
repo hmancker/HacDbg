@@ -1,6 +1,7 @@
 /**
  * @file PatchGuard.c
- * @brief Runtime Kernel Patch Protection disable for Windows 11 26100.
+ * @brief Runtime Kernel Patch Protection disable for Windows 10 1903
+ * through Windows 11 26H2.
  *
  * @author HacDbg
  */
@@ -224,6 +225,36 @@ static PVOID g_SwallowHaltTops[PATCH_GUARD_MAX_PROCESSORS];
 static volatile LONG g_SwallowActive[PATCH_GUARD_MAX_PROCESSORS];
 static volatile LONG g_SwallowedBugcheck;
 static KEVENT g_SwallowPark;
+
+typedef struct _PATCH_GUARD_LAYOUT
+{
+    ULONG BuildMin;
+    ULONG BuildMax;
+    ULONG TimerTable;
+    ULONG DpcData;
+    ULONG ThreadListHead;
+    ULONG ThreadListEntry;
+    ULONG StartAddress;
+    ULONG Win32StartAddress;
+    ULONG SameThreadPassive;
+    const CHAR* Name;
+} PATCH_GUARD_LAYOUT;
+
+//
+// TimerTable and DpcData for 18362.476 and 19041.2965/19041.6328 are the
+// immediates in KiInsertTimerTable and KiInsertQueueDpc. Thread list
+// offsets are the displacements in PsGetNextProcessThread. 22000-22631
+// fields are the Vergilius Windows 11 21H2 and 23H2 layouts, which match
+// each other. 26100 is the layout used by 10.0.26100.9711.
+//
+static const PATCH_GUARD_LAYOUT g_PatchGuardLayouts[] = {
+    { 18362, 18363, 0x3680, 0x2E00, 0x488, 0x6B8, 0x620, 0x6A0, 0x6E4, "18362" },
+    { 19041, 19045, 0x3940, 0x30C0, 0x5E0, 0x4E8, 0x4D0, 0x450, 0, "19041" },
+    { 22000, 22631, 0x3C00, 0x3340, 0x5E0, 0x538, 0x4A0, 0x520, 0x564, "22000" },
+    { 26100, 26999, 0x4100, 0x3840, 0x370, 0x578, 0x4E0, 0x560, 0x5A4, "26100" },
+};
+
+static const PATCH_GUARD_LAYOUT* g_Layout;
 
 typedef struct _PATCH_GUARD_SYSTEM_MODULE
 {
@@ -600,6 +631,487 @@ PatchGuardFindExport(
     return NULL;
 }
 
+static BOOLEAN
+PatchGuardReadRipTarget(
+    _In_ const UCHAR* Instruction,
+    _Out_ PVOID* Target
+    )
+{
+    if (Instruction[0] != 0x48 && Instruction[0] != 0x4C)
+    {
+        return FALSE;
+    }
+
+    if (Instruction[1] != 0x8B && Instruction[1] != 0x33)
+    {
+        return FALSE;
+    }
+
+    if ((Instruction[2] & 0xC7) != 0x05)
+    {
+        return FALSE;
+    }
+
+    *Target = PatchGuardRipTarget((PVOID)Instruction, 3, 7);
+    return TRUE;
+}
+
+static BOOLEAN
+PatchGuardPointersNear(
+    _In_ PVOID Left,
+    _In_ PVOID Right
+    )
+{
+    UINT64 First;
+    UINT64 Second;
+    UINT64 Distance;
+
+    First = (UINT64)Left;
+    Second = (UINT64)Right;
+    Distance = First > Second ? First - Second : Second - First;
+    return Distance != 0 &&
+           Distance <= 0x800 &&
+           (First & 7) == 0 &&
+           (Second & 7) == 0;
+}
+
+static ULONG
+PatchGuardCountRipRefs(
+    _In_ const UCHAR* Text,
+    _In_ SIZE_T Size,
+    _In_ PVOID Target
+    )
+{
+    SIZE_T Index;
+    ULONG Count;
+    PVOID Resolved;
+
+    Count = 0;
+    for (Index = 0; Index + 7 < Size; Index++)
+    {
+        if (PatchGuardReadRipTarget(Text + Index, &Resolved) == FALSE)
+        {
+            continue;
+        }
+
+        if (Resolved == Target)
+        {
+            Count += 1;
+        }
+    }
+
+    return Count;
+}
+
+static BOOLEAN
+PatchGuardOutsideText(
+    _In_ PVOID TextBase,
+    _In_ ULONG TextSize,
+    _In_ PVOID Pointer
+    )
+{
+    return PatchGuardPointerInImage(Pointer) != FALSE &&
+           ((UCHAR*)Pointer < (UCHAR*)TextBase ||
+            (UCHAR*)Pointer >= (UCHAR*)TextBase + TextSize);
+}
+
+static BOOLEAN
+PatchGuardTakeWaitPair(
+    _In_ PVOID TextBase,
+    _In_ ULONG TextSize,
+    _In_ PVOID Never,
+    _In_ PVOID Always,
+    _In_ const CHAR* How
+    )
+{
+    if (PatchGuardOutsideText(TextBase, TextSize, Never) == FALSE ||
+        PatchGuardOutsideText(TextBase, TextSize, Always) == FALSE ||
+        PatchGuardPointersNear(Never, Always) == FALSE)
+    {
+        return FALSE;
+    }
+
+    g_KiWaitNever = (UINT64*)Never;
+    g_KiWaitAlways = (UINT64*)Always;
+    HACDBG_LOG("HacDbg: PatchGuard KiWaitNever matched %s.\n", How);
+    return TRUE;
+}
+
+static BOOLEAN
+PatchGuardFindWaitByPattern(
+    _In_ PVOID TextBase,
+    _In_ ULONG TextSize,
+    _In_reads_(PatternLength) const UCHAR* Pattern,
+    _In_reads_(PatternLength) const CHAR* Mask,
+    _In_ SIZE_T PatternLength,
+    _In_ ULONG AlwaysOffset,
+    _In_ const CHAR* How
+    )
+{
+    PVOID Match;
+    PVOID Never;
+    PVOID Always;
+
+    Match = PatchGuardFindPattern(TextBase, TextSize, Pattern, Mask, PatternLength);
+    if (Match == NULL)
+    {
+        return FALSE;
+    }
+
+    Never = PatchGuardRipTarget(Match, 3, 7);
+    Always = PatchGuardRipTarget((UCHAR*)Match + AlwaysOffset, 3, 7);
+    return PatchGuardTakeWaitPair(TextBase, TextSize, Never, Always, How);
+}
+
+static BOOLEAN
+PatchGuardFindWaitPair(
+    _In_ PVOID TextBase,
+    _In_ ULONG TextSize
+    )
+{
+    const UCHAR* Text;
+    SIZE_T Index;
+    SIZE_T Delta;
+    ULONG SeenIndex;
+    PVOID Never;
+    PVOID Always;
+    PVOID BestNever;
+    PVOID BestAlways;
+    PVOID SeenNever[256];
+    ULONG SeenCount;
+    ULONG BestCount;
+    ULONG Count;
+    ULONG Paired;
+    BOOLEAN Seen;
+    static const UCHAR Wait19041[] = {
+        0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8B, 0xF9, 0x48, 0x8B, 0x35
+    };
+    static const CHAR Wait19041Mask[] = "xxx????xxxxxx";
+    static const UCHAR Wait26100[] = {
+        0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xEE, 0x48, 0x33, 0x2D
+    };
+    static const CHAR Wait26100Mask[] = "xxx????xxxxxx";
+
+    //
+    // 18362 and 19041 KiSetTimerEx load KiWaitNever, move rcx to rdi, then
+    // load KiWaitAlways. 26100 xors KiWaitAlways after saving rbp.
+    //
+    if (PatchGuardFindWaitByPattern(TextBase,
+                                    TextSize,
+                                    Wait19041,
+                                    Wait19041Mask,
+                                    sizeof(Wait19041),
+                                    10,
+                                    "19041") != FALSE ||
+        PatchGuardFindWaitByPattern(TextBase,
+                                    TextSize,
+                                    Wait26100,
+                                    Wait26100Mask,
+                                    sizeof(Wait26100),
+                                    10,
+                                    "26100") != FALSE)
+    {
+        return TRUE;
+    }
+
+    Text = (const UCHAR*)TextBase;
+    BestNever = NULL;
+    BestAlways = NULL;
+    BestCount = 0;
+    SeenCount = 0;
+    Paired = 0;
+    for (Index = 0; Index + 24 < TextSize; Index++)
+    {
+        if (PatchGuardReadRipTarget(Text + Index, &Never) == FALSE ||
+            PatchGuardOutsideText(TextBase, TextSize, Never) == FALSE)
+        {
+            continue;
+        }
+
+        Seen = FALSE;
+        for (SeenIndex = 0; SeenIndex < SeenCount; SeenIndex++)
+        {
+            if (SeenNever[SeenIndex] == Never)
+            {
+                Seen = TRUE;
+                break;
+            }
+        }
+
+        if (Seen != FALSE)
+        {
+            continue;
+        }
+
+        Always = NULL;
+        for (Delta = 7; Delta <= 16; Delta++)
+        {
+            if (PatchGuardReadRipTarget(Text + Index + Delta, &Always) != FALSE &&
+                PatchGuardPointersNear(Never, Always) != FALSE &&
+                PatchGuardOutsideText(TextBase, TextSize, Always) != FALSE)
+            {
+                break;
+            }
+
+            Always = NULL;
+        }
+
+        if (Always == NULL)
+        {
+            continue;
+        }
+
+        if (SeenCount < 256)
+        {
+            SeenNever[SeenCount] = Never;
+            SeenCount += 1;
+        }
+
+        Paired += 1;
+        Count = PatchGuardCountRipRefs(Text, TextSize, Never);
+        if (Count >= 8 && Count > BestCount)
+        {
+            BestCount = Count;
+            BestNever = Never;
+            BestAlways = Always;
+        }
+    }
+
+    if (BestNever == NULL)
+    {
+        HACDBG_LOG("HacDbg: Err, PatchGuard KiWaitNever candidates %lu.\n", Paired);
+        return FALSE;
+    }
+
+    g_KiWaitNever = (UINT64*)BestNever;
+    g_KiWaitAlways = (UINT64*)BestAlways;
+    HACDBG_LOG("HacDbg: PatchGuard KiWaitNever matched scan refs %lu.\n", BestCount);
+    return TRUE;
+}
+
+static PVOID
+PatchGuardFindTimerDispatch(
+    _In_ PVOID Image,
+    _In_ ULONG ImageSize
+    )
+{
+    const UCHAR* Bytes;
+    SIZE_T Index;
+    SIZE_T Delta;
+    SIZE_T Back;
+    BOOLEAN Lfence;
+    PVOID Entry;
+    PVOID Chosen;
+
+    Bytes = (const UCHAR*)Image;
+    Chosen = NULL;
+    for (Index = 16; Index + 20 < ImageSize; Index++)
+    {
+        if (Bytes[Index] != 0x48 ||
+            Bytes[Index + 1] != 0x9C ||
+            Bytes[Index + 2] != 0x56 ||
+            Bytes[Index + 3] != 0x57)
+        {
+            continue;
+        }
+
+        Lfence = FALSE;
+        for (Delta = 4; Delta < 16; Delta++)
+        {
+            if (Bytes[Index + Delta] == 0x0F &&
+                Bytes[Index + Delta + 1] == 0xAE &&
+                Bytes[Index + Delta + 2] == 0xE8)
+            {
+                Lfence = TRUE;
+                break;
+            }
+        }
+
+        if (Lfence == FALSE)
+        {
+            continue;
+        }
+
+        Entry = (PVOID)(Bytes + Index);
+        if (Bytes[Index - 5] == 0x48 &&
+            Bytes[Index - 4] == 0x89 &&
+            Bytes[Index - 3] == 0x5C &&
+            Bytes[Index - 2] == 0x24)
+        {
+            Entry = (PVOID)(Bytes + Index - 5);
+        }
+        else
+        {
+            for (Back = 3; Back <= 16; Back++)
+            {
+                if (Bytes[Index - Back] == 0x4C &&
+                    Bytes[Index - Back + 1] == 0x8B &&
+                    Bytes[Index - Back + 2] == 0xDC)
+                {
+                    Entry = (PVOID)(Bytes + Index - Back);
+                    break;
+                }
+            }
+        }
+
+        if (Index >= 16 && (Bytes[(UCHAR*)Entry - Bytes - 1] == 0xCC ||
+                            Bytes[(UCHAR*)Entry - Bytes - 1] == 0x90 ||
+                            Bytes[(UCHAR*)Entry - Bytes - 1] == 0xC3))
+        {
+            return Entry;
+        }
+
+        if (Chosen == NULL)
+        {
+            Chosen = Entry;
+        }
+    }
+
+    return Chosen;
+}
+
+static PVOID
+PatchGuardFindTimer2Collections(
+    _In_ PVOID TextBase,
+    _In_ ULONG TextSize,
+    _Out_ const UCHAR** Lea
+    )
+{
+    const UCHAR* Text;
+    SIZE_T Index;
+    SIZE_T Back;
+    BOOLEAN HasIndex;
+    BOOLEAN HasLoad;
+    PVOID Target;
+
+    Text = (const UCHAR*)TextBase;
+    for (Index = 16; Index + 12 < TextSize; Index++)
+    {
+        if (Text[Index] != 0x48 ||
+            Text[Index + 1] != 0x8D ||
+            Text[Index + 2] != 0x3C ||
+            Text[Index + 3] != 0xC1)
+        {
+            continue;
+        }
+
+        HasIndex = FALSE;
+        HasLoad = FALSE;
+        Target = NULL;
+        for (Back = 4; Back <= 14; Back++)
+        {
+            if (Text[Index - Back] == 0x48 &&
+                Text[Index - Back + 1] == 0x8D &&
+                Text[Index - Back + 2] == 0x04)
+            {
+                HasIndex = TRUE;
+            }
+
+            if (Text[Index - Back] == 0x48 &&
+                Text[Index - Back + 1] == 0x8D &&
+                Text[Index - Back + 2] == 0x0D)
+            {
+                Target = PatchGuardRipTarget((PVOID)(Text + Index - Back), 3, 7);
+                HasLoad = TRUE;
+            }
+        }
+
+        if (HasIndex == FALSE || HasLoad == FALSE ||
+            PatchGuardOutsideText(TextBase, TextSize, Target) == FALSE)
+        {
+            continue;
+        }
+
+        *Lea = Text + Index;
+        return Target;
+    }
+
+    *Lea = NULL;
+    return NULL;
+}
+
+static PVOID
+PatchGuardFindTimer2Lock(
+    _In_ PVOID TextBase,
+    _In_ const UCHAR* CollectionsLea
+    )
+{
+    const UCHAR* Window;
+    const UCHAR* Cursor;
+    PVOID Target;
+    static const UCHAR LockPat[] = {
+        0xF0, 0x48, 0x0F, 0xBA, 0x2D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x83
+    };
+    static const CHAR LockMask[] = "xxxxx????xxx";
+
+    Window = CollectionsLea - 0x200;
+    if (Window < (const UCHAR*)TextBase)
+    {
+        Window = (const UCHAR*)TextBase;
+    }
+
+    Cursor = (const UCHAR*)PatchGuardFindPattern((PVOID)Window,
+                                                 (SIZE_T)(CollectionsLea - Window),
+                                                 LockPat,
+                                                 LockMask,
+                                                 sizeof(LockPat));
+    if (Cursor != NULL)
+    {
+        return PatchGuardRipTarget((PVOID)Cursor, 5, 10);
+    }
+
+    Cursor = CollectionsLea;
+    while (Cursor >= Window + 7)
+    {
+        Cursor -= 1;
+        if (Cursor[0] != 0x48 || Cursor[1] != 0x8D || Cursor[2] != 0x0D)
+        {
+            continue;
+        }
+
+        Target = PatchGuardRipTarget((PVOID)Cursor, 3, 7);
+        if (PatchGuardPointerInImage(Target) != FALSE && Target != g_KiTimer2Collections)
+        {
+            return Target;
+        }
+    }
+
+    return NULL;
+}
+
+static NTSTATUS
+PatchGuardSelectLayout(
+    VOID
+    )
+{
+    RTL_OSVERSIONINFOW Version;
+    ULONG Build;
+    ULONG Index;
+
+    RtlZeroMemory(&Version, sizeof(Version));
+    Version.dwOSVersionInfoSize = sizeof(Version);
+    RtlGetVersion(&Version);
+    Build = Version.dwBuildNumber;
+    HACDBG_LOG("HacDbg: PatchGuard nt build %lu.\n", Build);
+
+    for (Index = 0; Index < sizeof(g_PatchGuardLayouts) / sizeof(g_PatchGuardLayouts[0]); Index++)
+    {
+        if (Build >= g_PatchGuardLayouts[Index].BuildMin &&
+            Build <= g_PatchGuardLayouts[Index].BuildMax)
+        {
+            g_Layout = &g_PatchGuardLayouts[Index];
+            HACDBG_LOG("HacDbg: PatchGuard layout %s timer 0x%x dpc 0x%x.\n",
+                       g_Layout->Name,
+                       g_Layout->TimerTable,
+                       g_Layout->DpcData);
+            return STATUS_SUCCESS;
+        }
+    }
+
+    HACDBG_LOG("HacDbg: Err, PatchGuard build %lu has no layout.\n", Build);
+    return STATUS_REVISION_MISMATCH;
+}
+
 static NTSTATUS
 PatchGuardResolve(
     VOID
@@ -608,10 +1120,10 @@ PatchGuardResolve(
     PVOID TextBase;
     ULONG TextSize;
     PVOID PageBase;
-    UCHAR* Window;
     ULONG PageSize;
     PVOID Match;
-    PVOID AlwaysInstruction;
+    const UCHAR* CollectionsLea;
+    NTSTATUS Status;
     static const UCHAR KiSwInterruptDispatchPat[] =
     {
         0x48, 0x89, 0x4C, 0x24, 0x00, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54,
@@ -630,11 +1142,6 @@ PatchGuardResolve(
         0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00, 0xC3
     };
     static const CHAR NtosReturnMask[] = "xxxxxxxxx";
-    static const UCHAR KiWaitNeverPat[] =
-    {
-        0x48, 0x8B, 0x05, 0x00, 0x00, 0x00, 0x00, 0x49, 0x8B, 0xEE, 0x48, 0x33, 0x2D
-    };
-    static const CHAR KiWaitNeverMask[] = "xxx????xxxxxx";
     static const UCHAR KiBalanceSetManagerPeriodicDpcPat[] =
     {
         0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x45, 0x33, 0xC0, 0x89, 0x05
@@ -659,23 +1166,12 @@ PatchGuardResolve(
         0xF1, 0xE8
     };
     static const CHAR CcBcbProfiler2Mask[] = "xxxx?xxxxxxxxxxxxxx?xxxx";
-    static const UCHAR KiTimer2CollectionsPat[] =
+
+    Status = PatchGuardSelectLayout();
+    if (!NT_SUCCESS(Status))
     {
-        0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00, 0x48, 0x8D, 0x04, 0x5B,
-        0x48, 0x8D, 0x3C, 0xC1, 0xB9, 0x18, 0x00, 0x00, 0x00
-    };
-    static const CHAR KiTimer2CollectionsMask[] = "xxx????xxxxxxxxxxxxx";
-    static const UCHAR KiTimer2CollectionLockPat[] =
-    {
-        0xF0, 0x48, 0x0F, 0xBA, 0x2D, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0F, 0x83
-    };
-    static const CHAR KiTimer2CollectionLockMask[] = "xxxxx????xxx";
-    static const UCHAR KiTimerDispatchPat[] =
-    {
-        0x48, 0x89, 0x5C, 0x24, 0x18, 0x48, 0x9C, 0x56, 0x57, 0x48, 0x83,
-        0xEC, 0x20, 0x4C, 0x8B, 0xD2, 0x0F, 0xAE, 0xE8
-    };
-    static const CHAR KiTimerDispatchMask[] = "xxxxxxxxxxxxxxxxxxx";
+        return Status;
+    }
 
     g_NtosBase = (UCHAR*)PatchGuardNtosBase(&g_NtosSize);
     if (g_NtosBase == NULL)
@@ -737,32 +1233,9 @@ PatchGuardResolve(
         return STATUS_NOT_FOUND;
     }
 
-    Match = PatchGuardFindPattern(TextBase,
-                                  TextSize,
-                                  KiWaitNeverPat,
-                                  KiWaitNeverMask,
-                                  sizeof(KiWaitNeverPat));
-    if (Match == NULL)
+    if (PatchGuardFindWaitPair(TextBase, TextSize) == FALSE)
     {
         HACDBG_LOG("HacDbg: Err, PatchGuard pattern KiWaitNever was not found.\n");
-        return STATUS_NOT_FOUND;
-    }
-
-    g_KiWaitNever = (UINT64*)PatchGuardRipTarget(Match, 3, 7);
-    AlwaysInstruction = (UCHAR*)Match + 10;
-    if (((UCHAR*)AlwaysInstruction)[0] != 0x48 ||
-        ((UCHAR*)AlwaysInstruction)[1] != 0x33 ||
-        ((UCHAR*)AlwaysInstruction)[2] != 0x2D)
-    {
-        HACDBG_LOG("HacDbg: Err, PatchGuard pattern KiWaitAlways was not found.\n");
-        return STATUS_NOT_FOUND;
-    }
-
-    g_KiWaitAlways = (UINT64*)PatchGuardRipTarget(AlwaysInstruction, 3, 7);
-    if (!PatchGuardPointerInImage(g_KiWaitNever) ||
-        !PatchGuardPointerInImage(g_KiWaitAlways))
-    {
-        HACDBG_LOG("HacDbg: Err, PatchGuard KiWaitNever is outside ntoskrnl.\n");
         return STATUS_NOT_FOUND;
     }
 
@@ -818,11 +1291,7 @@ PatchGuardResolve(
                                                  sizeof(CcBcbProfiler2Pat));
     }
 
-    g_KiTimerDispatch = PatchGuardFindPattern(g_NtosBase,
-                                              g_NtosSize,
-                                              KiTimerDispatchPat,
-                                              KiTimerDispatchMask,
-                                              sizeof(KiTimerDispatchPat));
+    g_KiTimerDispatch = PatchGuardFindTimerDispatch(g_NtosBase, g_NtosSize);
     if (g_CcBcbProfiler == NULL || g_KiTimerDispatch == NULL)
     {
         HACDBG_LOG("HacDbg: Err, PatchGuard check routine was not found. profiler %p dispatch %p.\n",
@@ -831,36 +1300,16 @@ PatchGuardResolve(
         return STATUS_NOT_FOUND;
     }
 
-    Match = PatchGuardFindPattern(TextBase,
-                                  TextSize,
-                                  KiTimer2CollectionsPat,
-                                  KiTimer2CollectionsMask,
-                                  sizeof(KiTimer2CollectionsPat));
-    if (Match == NULL)
+    g_KiTimer2Collections = PatchGuardFindTimer2Collections(TextBase, TextSize, &CollectionsLea);
+    if (g_KiTimer2Collections == NULL || CollectionsLea == NULL)
     {
         HACDBG_LOG("HacDbg: Err, PatchGuard pattern KiTimer2Collections was not found.\n");
         return STATUS_NOT_FOUND;
     }
 
-    g_KiTimer2Collections = PatchGuardRipTarget(Match, 3, 7);
-    if (!PatchGuardPointerInImage(g_KiTimer2Collections))
-    {
-        HACDBG_LOG("HacDbg: Err, PatchGuard KiTimer2Collections is outside ntoskrnl.\n");
-        return STATUS_NOT_FOUND;
-    }
-
-    Window = (UCHAR*)Match - 0x200;
-    if (Window < (UCHAR*)TextBase)
-    {
-        Window = (UCHAR*)TextBase;
-    }
-
-    Match = PatchGuardFindPattern(Window,
-                                  (SIZE_T)((UCHAR*)Match - Window),
-                                  KiTimer2CollectionLockPat,
-                                  KiTimer2CollectionLockMask,
-                                  sizeof(KiTimer2CollectionLockPat));
-    if (Match == NULL)
+    g_KiTimer2CollectionLock = (PKSPIN_LOCK)PatchGuardFindTimer2Lock(TextBase, CollectionsLea);
+    if (g_KiTimer2CollectionLock == NULL ||
+        PatchGuardPointerInImage(g_KiTimer2CollectionLock) == FALSE)
     {
         HACDBG_LOG("HacDbg: Err, PatchGuard pattern KiTimer2CollectionLock was not found.\n");
         return STATUS_NOT_FOUND;
@@ -874,13 +1323,6 @@ PatchGuardResolve(
     }
 
     HACDBG_LOG("HacDbg: PatchGuard PsLoadedModuleList %p.\n", g_LoadedModuleList);
-
-    g_KiTimer2CollectionLock = (PKSPIN_LOCK)PatchGuardRipTarget(Match, 5, 10);
-    if (!PatchGuardPointerInImage(g_KiTimer2CollectionLock))
-    {
-        HACDBG_LOG("HacDbg: Err, PatchGuard KiTimer2CollectionLock is outside ntoskrnl.\n");
-        return STATUS_NOT_FOUND;
-    }
 
     HACDBG_LOG("HacDbg: PatchGuard .text %p size 0x%x.\n", TextBase, TextSize);
     HACDBG_LOG("HacDbg: PatchGuard KiSwInterruptDispatch %p.\n", g_KiSwInterruptDispatch);
@@ -1039,7 +1481,7 @@ PatchGuardDisableTimersOnProcessor(
     ULONG Index;
 
     Prcb = (UCHAR*)__readgsqword(PATCH_GUARD_KPCR_CURRENT_PRCB);
-    Entries = (PATCH_GUARD_TIMER_TABLE_ENTRY*)(Prcb + PATCH_GUARD_PRCB_TIMER_TABLE +
+    Entries = (PATCH_GUARD_TIMER_TABLE_ENTRY*)(Prcb + g_Layout->TimerTable +
                                                PATCH_GUARD_TIMER_TABLE_ENTRIES);
 
     for (Index = 0; Index < PATCH_GUARD_TIMER_TABLE_ENTRY_COUNT; Index++)
@@ -1082,7 +1524,7 @@ PatchGuardDisableTimersOnProcessor(
         SINGLE_LIST_ENTRY* Entry;
         ULONG Walk;
 
-        DpcData = Prcb + PATCH_GUARD_PRCB_DPC_DATA + (Index * PATCH_GUARD_DPC_DATA_SIZE);
+        DpcData = Prcb + g_Layout->DpcData + (Index * PATCH_GUARD_DPC_DATA_SIZE);
         Entry = ((SINGLE_LIST_ENTRY*)DpcData)->Next;
         Walk = 0;
         while (Entry != NULL && Walk < PATCH_GUARD_DPC_WALK_LIMIT)
@@ -1710,13 +2152,13 @@ PatchGuardRetireSystemThreads(
     if (!PatchGuardIsCanonical((UINT64)Process) ||
         (UINT64)Process < PATCH_GUARD_KERNEL_VA_START ||
         MmGetPhysicalAddress(Process).QuadPart == 0 ||
-        MmGetPhysicalAddress(Process + PATCH_GUARD_EPROCESS_THREAD_LIST).QuadPart == 0)
+        MmGetPhysicalAddress(Process + g_Layout->ThreadListHead).QuadPart == 0)
     {
         HACDBG_LOG("HacDbg: Err, PatchGuard system process is not resident.\n");
         return;
     }
 
-    Head = (LIST_ENTRY*)(Process + PATCH_GUARD_EPROCESS_THREAD_LIST);
+    Head = (LIST_ENTRY*)(Process + g_Layout->ThreadListHead);
     if (!PatchGuardIsCanonical((UINT64)Head->Flink))
     {
         HACDBG_LOG("HacDbg: Err, PatchGuard system thread list is not canonical.\n");
@@ -1737,10 +2179,10 @@ PatchGuardRetireSystemThreads(
             break;
         }
 
-        Thread = (UCHAR*)Entry - PATCH_GUARD_ETHREAD_LIST_ENTRY;
+        Thread = (UCHAR*)Entry - g_Layout->ThreadListEntry;
         if (MmGetPhysicalAddress(Thread).QuadPart == 0 ||
-            MmGetPhysicalAddress(Thread + PATCH_GUARD_KTHREAD_START).QuadPart == 0 ||
-            MmGetPhysicalAddress(Thread + PATCH_GUARD_ETHREAD_WIN32_START).QuadPart == 0)
+            MmGetPhysicalAddress(Thread + g_Layout->StartAddress).QuadPart == 0 ||
+            MmGetPhysicalAddress(Thread + g_Layout->Win32StartAddress).QuadPart == 0)
         {
             break;
         }
@@ -1751,8 +2193,8 @@ PatchGuardRetireSystemThreads(
             break;
         }
 
-        Start = *(PVOID*)(Thread + PATCH_GUARD_KTHREAD_START);
-        Win32Start = *(PVOID*)(Thread + PATCH_GUARD_ETHREAD_WIN32_START);
+        Start = *(PVOID*)(Thread + g_Layout->StartAddress);
+        Win32Start = *(PVOID*)(Thread + g_Layout->Win32StartAddress);
         if (PatchGuardRetirePoolEntry(Start) != FALSE)
         {
             Retired += 1;
@@ -1795,7 +2237,7 @@ PatchGuardClearActiveDpc(
 
     for (Index = 0; Index < PATCH_GUARD_DPC_DATA_COUNT; Index++)
     {
-        *(PVOID*)(Prcb + PATCH_GUARD_PRCB_DPC_DATA +
+        *(PVOID*)(Prcb + g_Layout->DpcData +
                   (Index * PATCH_GUARD_DPC_DATA_SIZE) +
                   PATCH_GUARD_DPC_ACTIVE) = NULL;
     }
@@ -1873,15 +2315,20 @@ PatchGuardSwallowCorruption(
     {
         MiscFlags = *(ULONG*)(Thread + PATCH_GUARD_KTHREAD_MISC_FLAGS);
         ApcDisable = *(ULONG*)(Thread + PATCH_GUARD_KTHREAD_APC_DISABLE);
-        SamePassive = *(ULONG*)(Thread + PATCH_GUARD_ETHREAD_SAME_PASSIVE);
-        SameApc = *(ULONG*)(Thread + PATCH_GUARD_ETHREAD_SAME_APC);
-        CacheActive = *(ULONG*)(Thread + PATCH_GUARD_ETHREAD_CACHE_ACTIVE);
+        if (g_Layout != NULL && g_Layout->SameThreadPassive != 0)
+        {
+            SamePassive = *(ULONG*)(Thread + g_Layout->SameThreadPassive);
+            SameApc = *(ULONG*)(Thread + g_Layout->SameThreadPassive + 4);
+            CacheActive = *(ULONG*)(Thread + g_Layout->SameThreadPassive + 8);
+        }
     }
 
     Path = PATCH_GUARD_PATH_HALT;
     if (Thread != NULL && Thread != Idle && ApcDisable == 0 && SameApc == 0 && CacheActive == 0)
     {
         if ((MiscFlags & PATCH_GUARD_KTHREAD_SYSTEM) != 0 &&
+            g_Layout != NULL &&
+            g_Layout->SameThreadPassive != 0 &&
             (SamePassive & PATCH_GUARD_ACTIVE_EX_WORKER) == 0)
         {
             Path = PATCH_GUARD_PATH_TERMINATE;
