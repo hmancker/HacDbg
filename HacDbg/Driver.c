@@ -12,6 +12,7 @@
 #include "Logs.h"
 #include "PhysicalMemory.h"
 #include "Trace.h"
+#include "PatchGuard.h"
 #include "Debug.h"
 #include "../shared/hypercall/control.h"
 #if HACDBG_BACKEND_INTEL
@@ -714,6 +715,7 @@ DriverUnload(
     HacDbgDeleteDevice();
     TraceDisable();
     HACDBG_STOP_ALL();
+    PatchGuardCleanup();
     HACDBG_FREE_ALL();
     TraceCleanup();
 
@@ -759,6 +761,13 @@ DriverEntry(
     DriverObject->DriverUnload = DriverUnload;
     HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_START, STATUS_SUCCESS);
     HacDbgRecordLoadDetail(RegistryPath, 0);
+
+    status = PatchGuardDisable();
+    if (!NT_SUCCESS(status))
+    {
+        HACDBG_LOG("HacDbg: Err, PatchGuard disable failed: 0x%08x.\n", status);
+        return status;
+    }
 
     PhysicalMemorySetFiveLevelPaging((__readcr4() & (1ull << 12)) != 0);
 
@@ -833,27 +842,13 @@ DriverEntry(
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_POWER, status);
     }
 
-    g_PowerCallbackRegistration = ExRegisterCallback(callbackObject, SvmPowerCallback, NULL);
     ObDereferenceObject(callbackObject);
-
-    if (g_PowerCallbackRegistration == NULL)
-    {
-        HACDBG_LOG("HacDbg: Err, power callback registration failed.\n");
-        HacDbgDeleteDevice();
-        HACDBG_SHARED_CLEANUP();
-        LogsCleanup();
-        HACDBG_PAGING_CLEANUP();
-        PhysicalMemoryCleanup();
-        return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_POWER, STATUS_UNSUCCESSFUL);
-    }
 
     status = TraceInitialize();
     if (!NT_SUCCESS(status))
     {
         HACDBG_LOG("HacDbg: Err, trace initialization failed: 0x%08x.\n", status);
         HacDbgDeleteDevice();
-        ExUnregisterCallback(g_PowerCallbackRegistration);
-        g_PowerCallbackRegistration = NULL;
         HACDBG_SHARED_CLEANUP();
         LogsCleanup();
         HACDBG_PAGING_CLEANUP();
@@ -869,8 +864,6 @@ DriverEntry(
         TraceDisable();
         HACDBG_STOP_ALL();
         HacDbgDeleteDevice();
-        ExUnregisterCallback(g_PowerCallbackRegistration);
-        g_PowerCallbackRegistration = NULL;
         HACDBG_FREE_ALL();
         TraceCleanup();
 
@@ -879,6 +872,44 @@ DriverEntry(
         HACDBG_PAGING_CLEANUP();
         PhysicalMemoryCleanup();
         return status;
+    }
+
+    status = PatchGuardArmBugcheckHook();
+    if (!NT_SUCCESS(status))
+    {
+        HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck hook failed: 0x%08x.\n", status);
+        HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_PROCESSORS, status);
+        TraceDisable();
+        HACDBG_STOP_ALL();
+        PatchGuardCleanup();
+        HacDbgDeleteDevice();
+        HACDBG_FREE_ALL();
+        TraceCleanup();
+        LogsCleanup();
+        HACDBG_SHARED_CLEANUP();
+        HACDBG_PAGING_CLEANUP();
+        PhysicalMemoryCleanup();
+        return status;
+    }
+
+    g_PowerCallbackRegistration = ExRegisterCallback(
+        callbackObject,
+        (PCALLBACK_FUNCTION)(ULONG_PTR)SvmPowerCallback,
+        NULL);
+    if (g_PowerCallbackRegistration == NULL)
+    {
+        HACDBG_LOG("HacDbg: Err, power callback registration failed.\n");
+        HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_POWER, STATUS_UNSUCCESSFUL);
+        TraceDisable();
+        HACDBG_STOP_ALL();
+        HacDbgDeleteDevice();
+        HACDBG_FREE_ALL();
+        TraceCleanup();
+        LogsCleanup();
+        HACDBG_SHARED_CLEANUP();
+        HACDBG_PAGING_CLEANUP();
+        PhysicalMemoryCleanup();
+        return STATUS_UNSUCCESSFUL;
     }
 
     g_VirtualizationSuspended = FALSE;

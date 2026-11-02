@@ -185,6 +185,7 @@
   </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="Driver.c" />
+    <ClCompile Include="PatchGuard.c" />
     <ClCompile Include="Hypercall.c" />
     <ClCompile Include="Logs.c" />
     <ClCompile Include="Trace.c" />
@@ -215,6 +216,7 @@
   <ItemGroup>
     <ClInclude Include="Config.h" />
     <ClInclude Include="Debug.h" />
+    <ClInclude Include="PatchGuard.h" />
     <ClInclude Include="Hypercall.h" />
     <ClInclude Include="Logs.h" />
     <ClInclude Include="Trace.h" />

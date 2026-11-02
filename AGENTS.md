@@ -279,6 +279,7 @@ Intel VT-x 与上面的 AMD 规则并列，不替换它们：
 
 * 调试器启动时不映射驱动。`HacDbgQt.exe` 的「文件 → 驱动映射」打开插件窗口，由用户选择要映射的 `.sys`。
 * 映射时如果没有把分配地址当作入口参数，先 `IoCreateDriver` 再建对象，然后进入 `DriverEntry`。空的 `DRIVER_OBJECT` 会在写 `DriverUnload`（偏移 `0x68`）时访问违例。
+* `DriverEntry` 在启用虚拟化之前禁用运行时 PatchGuard。手工映射的回调、钩子和其它不在加载模块表里的地址因此不会触发 `CRITICAL_STRUCTURE_CORRUPTION`（`0x109`）。签名按 Windows 11 24H2/25H2/26H2（ntoskrnl 10.0.26100）解析。Memory Integrity / HVCI 会让这一步失败。
 * 这条路径需要管理员，并且本机允许加载嵌入的 Intel 漏洞驱动。Memory Integrity / HVCI 会让它失败。
 
 ### 进程转储
