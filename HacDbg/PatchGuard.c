@@ -67,6 +67,31 @@
 #define PATCH_GUARD_ALLOCATION_COUNT        6ul
 #define PATCH_GUARD_RETIRE_LOG_LIMIT        8ul
 #define PATCH_GUARD_STACK_PAGES             4ul
+#define PATCH_GUARD_MAX_PROCESSORS          64ul
+#define PATCH_GUARD_PRCB_NUMBER             0x24ul
+#define PATCH_GUARD_PRCB_CURRENT_THREAD     0x08ull
+#define PATCH_GUARD_PRCB_IDLE_THREAD        0x18ull
+#define PATCH_GUARD_KTHREAD_INITIAL_STACK   0x28ull
+#define PATCH_GUARD_KTHREAD_STACK_LIMIT     0x30ull
+#define PATCH_GUARD_KTHREAD_STACK_BASE      0x38ull
+#define PATCH_GUARD_KTHREAD_KERNEL_STACK    0x58ull
+#define PATCH_GUARD_KTHREAD_MISC_FLAGS      0x74ull
+#define PATCH_GUARD_KTHREAD_THREAD_FLAGS    0x78ull
+#define PATCH_GUARD_KTHREAD_SYSTEM          0x400ul
+#define PATCH_GUARD_KTHREAD_ENABLE_STACK_SWAP 0x40ul
+#define PATCH_GUARD_KTHREAD_APC_DISABLE     0x1e4ull
+#define PATCH_GUARD_ETHREAD_SAME_PASSIVE    0x5a4ull
+#define PATCH_GUARD_ETHREAD_SAME_APC        0x5a8ull
+#define PATCH_GUARD_ETHREAD_CACHE_ACTIVE    0x5acul
+#define PATCH_GUARD_ACTIVE_EX_WORKER        0x1ul
+#define PATCH_GUARD_DPC_ACTIVE              0x20ull
+#define PATCH_GUARD_PARK_PAGES              2ul
+#define PATCH_GUARD_PATH_TERMINATE          1ul
+#define PATCH_GUARD_PATH_PARK               2ul
+#define PATCH_GUARD_PATH_HALT               3ul
+
+C_ASSERT(PATCH_GUARD_PARK_PAGES < PATCH_GUARD_STACK_PAGES);
+C_ASSERT(PATCH_GUARD_KTHREAD_ENABLE_STACK_SWAP == (1ul << 6));
 #define PATCH_GUARD_TIMER2_COLLECTION_SPLIT 3ul
 #define PATCH_GUARD_TIMER2_CALLBACK         0x60ul
 #define PATCH_GUARD_TIMER2_CONTEXT          0x68ul
@@ -194,7 +219,11 @@ static LIST_ENTRY* g_LoadedModuleList;
 static PVOID g_HookAllocations[PATCH_GUARD_ALLOCATION_COUNT];
 static ULONG g_HookAllocationCount;
 static PVOID g_SwallowStack;
+static PVOID g_SwallowTops[PATCH_GUARD_MAX_PROCESSORS];
+static PVOID g_SwallowHaltTops[PATCH_GUARD_MAX_PROCESSORS];
+static volatile LONG g_SwallowActive[PATCH_GUARD_MAX_PROCESSORS];
 static volatile LONG g_SwallowedBugcheck;
+static KEVENT g_SwallowPark;
 
 typedef struct _PATCH_GUARD_SYSTEM_MODULE
 {
@@ -1743,35 +1772,152 @@ PatchGuardRetireSystemThreads(
                Retired);
 }
 
+static BOOLEAN
+PatchGuardBugcheckCanReturn(
+    _In_ UINT64 ReturnAddress
+    )
+{
+    //
+    // CRITICAL_STRUCTURE_CORRUPTION is raised by PatchGuard after it clears
+    // or forges the return address. Returning into ntoskrnl resumes that
+    // checker and wedges the processor. Never resume a 0x109.
+    //
+    UNREFERENCED_PARAMETER(ReturnAddress);
+    return FALSE;
+}
+
+static VOID
+PatchGuardClearActiveDpc(
+    _In_ UCHAR* Prcb
+    )
+{
+    ULONG Index;
+
+    for (Index = 0; Index < PATCH_GUARD_DPC_DATA_COUNT; Index++)
+    {
+        *(PVOID*)(Prcb + PATCH_GUARD_PRCB_DPC_DATA +
+                  (Index * PATCH_GUARD_DPC_DATA_SIZE) +
+                  PATCH_GUARD_DPC_ACTIVE) = NULL;
+    }
+}
+
+static VOID
+PatchGuardRetargetParkStack(
+    _In_ UCHAR* Thread,
+    _In_ ULONG Cpu
+    )
+{
+    UCHAR* Base;
+
+    Base = (UCHAR*)g_SwallowTops[Cpu] + 0x40;
+    *(PVOID*)(Thread + PATCH_GUARD_KTHREAD_STACK_BASE) = Base;
+    *(PVOID*)(Thread + PATCH_GUARD_KTHREAD_INITIAL_STACK) = Base;
+    *(PVOID*)(Thread + PATCH_GUARD_KTHREAD_STACK_LIMIT) = Base - (PATCH_GUARD_PARK_PAGES * PAGE_SIZE);
+    *(ULONG*)(Thread + PATCH_GUARD_KTHREAD_THREAD_FLAGS) &= ~PATCH_GUARD_KTHREAD_ENABLE_STACK_SWAP;
+}
+
 static DECLSPEC_NOINLINE VOID
 PatchGuardSwallowCorruption(
     VOID
     )
 {
+    ULONG Cpu;
     KIRQL Irql;
+    UCHAR* Prcb;
+    UCHAR* Thread;
+    UCHAR* Idle;
+    ULONG Path;
+    ULONG MiscFlags;
+    ULONG ApcDisable;
+    ULONG SamePassive;
+    ULONG SameApc;
+    ULONG CacheActive;
+
+    Cpu = KeGetCurrentProcessorNumber();
+    if (Cpu >= PATCH_GUARD_MAX_PROCESSORS)
+    {
+        Cpu = 0;
+    }
+
+    Prcb = (UCHAR*)__readgsqword(PATCH_GUARD_KPCR_CURRENT_PRCB);
+    Irql = KeGetCurrentIrql();
+    PatchGuardClearActiveDpc(Prcb);
+
+    //
+    // INVARIANT: CR8 is written to PASSIVE_LEVEL before this processor
+    // waits. KeAccumulateTicks counts time spent at DISPATCH_LEVEL or
+    // above and bugchecks 0x133 once that total reaches the watchdog
+    // period. KeLowerIrql is not used: it would drain DPCs while the
+    // checker may still hold a lock. IF is left set so an IPI completes.
+    //
+    __writecr8(PASSIVE_LEVEL);
+    _enable();
+
+    if (InterlockedCompareExchange(&g_SwallowActive[Cpu], 1, 0) != 0)
+    {
+        for (;;)
+        {
+            _enable();
+            __halt();
+        }
+    }
+
+    Thread = *(UCHAR**)(Prcb + PATCH_GUARD_PRCB_CURRENT_THREAD);
+    Idle = *(UCHAR**)(Prcb + PATCH_GUARD_PRCB_IDLE_THREAD);
+    MiscFlags = 0;
+    ApcDisable = 0;
+    SamePassive = 0;
+    SameApc = 0;
+    CacheActive = 0;
+    if (Thread != NULL)
+    {
+        MiscFlags = *(ULONG*)(Thread + PATCH_GUARD_KTHREAD_MISC_FLAGS);
+        ApcDisable = *(ULONG*)(Thread + PATCH_GUARD_KTHREAD_APC_DISABLE);
+        SamePassive = *(ULONG*)(Thread + PATCH_GUARD_ETHREAD_SAME_PASSIVE);
+        SameApc = *(ULONG*)(Thread + PATCH_GUARD_ETHREAD_SAME_APC);
+        CacheActive = *(ULONG*)(Thread + PATCH_GUARD_ETHREAD_CACHE_ACTIVE);
+    }
+
+    Path = PATCH_GUARD_PATH_HALT;
+    if (Thread != NULL && Thread != Idle && ApcDisable == 0 && SameApc == 0 && CacheActive == 0)
+    {
+        if ((MiscFlags & PATCH_GUARD_KTHREAD_SYSTEM) != 0 &&
+            (SamePassive & PATCH_GUARD_ACTIVE_EX_WORKER) == 0)
+        {
+            Path = PATCH_GUARD_PATH_TERMINATE;
+        }
+        else
+        {
+            Path = PATCH_GUARD_PATH_PARK;
+        }
+    }
 
     if (InterlockedCompareExchange(&g_SwallowedBugcheck, 1, 0) == 0)
     {
-        HACDBG_LOG("HacDbg: PatchGuard swallowed CRITICAL_STRUCTURE_CORRUPTION cpu %u irql %u.\n",
-                   KeGetCurrentProcessorNumber(),
-                   KeGetCurrentIrql());
+        HACDBG_LOG("HacDbg: PatchGuard swallowed CRITICAL_STRUCTURE_CORRUPTION cpu %u irql %u path %u.\n",
+                   Cpu,
+                   Irql,
+                   Path);
     }
 
-    Irql = KeGetCurrentIrql();
-    if (Irql <= APC_LEVEL && PsIsSystemThread((PETHREAD)KeGetCurrentThread()) != FALSE)
+    if (Path == PATCH_GUARD_PATH_TERMINATE)
     {
-        if (Irql != PASSIVE_LEVEL)
-        {
-            KeLowerIrql(PASSIVE_LEVEL);
-        }
-
         PsTerminateSystemThread(STATUS_SUCCESS);
     }
 
-    _enable();
+    if (Path == PATCH_GUARD_PATH_PARK)
+    {
+        PatchGuardRetargetParkStack(Thread, Cpu);
+        for (;;)
+        {
+            KeWaitForSingleObject(&g_SwallowPark, Executive, KernelMode, FALSE, NULL);
+        }
+    }
+
     for (;;)
     {
-        _mm_pause();
+        _enable();
+        __halt();
     }
 }
 
@@ -1807,13 +1953,20 @@ PatchGuardEmitBugcheckStub(
 {
     ULONG Cursor;
     ULONG JumpDisplacement;
-    UINT64 KernelStart;
+    UINT64 Decide;
     UINT64 Swallow;
+    UINT64 Tops;
+    UINT64 HaltTops;
+    UINT64 Active;
     INT32 Relative;
 
     Cursor = 0;
-    KernelStart = PATCH_GUARD_KERNEL_VA_START;
+    Decide = (UINT64)(ULONG_PTR)PatchGuardBugcheckCanReturn;
     Swallow = (UINT64)(ULONG_PTR)PatchGuardSwallowCorruption;
+    Tops = (UINT64)(ULONG_PTR)g_SwallowTops;
+    HaltTops = (UINT64)(ULONG_PTR)g_SwallowHaltTops;
+    Active = (UINT64)(ULONG_PTR)g_SwallowActive;
+    UNREFERENCED_PARAMETER(Stack);
 
     Page[Cursor++] = 0x81;
     Page[Cursor++] = 0xF9;
@@ -1828,23 +1981,84 @@ PatchGuardEmitBugcheckStub(
 
     Page[Cursor++] = 0x48;
     Page[Cursor++] = 0x8B;
-    Page[Cursor++] = 0x04;
+    Page[Cursor++] = 0x1C;
     Page[Cursor++] = 0x24;
     Page[Cursor++] = 0x49;
-    Page[Cursor++] = 0xBB;
-    RtlCopyMemory(Page + Cursor, &KernelStart, sizeof(KernelStart));
-    Cursor += sizeof(KernelStart);
-    Page[Cursor++] = 0x4C;
-    Page[Cursor++] = 0x39;
-    Page[Cursor++] = 0xD8;
-    Page[Cursor++] = 0x72;
-    Page[Cursor++] = 0x01;
-    Page[Cursor++] = 0xC3;
-
+    Page[Cursor++] = 0x89;
+    Page[Cursor++] = 0xE4;
+    Page[Cursor++] = 0x65;
     Page[Cursor++] = 0x48;
-    Page[Cursor++] = 0xBC;
-    RtlCopyMemory(Page + Cursor, &Stack, sizeof(Stack));
-    Cursor += sizeof(PVOID);
+    Page[Cursor++] = 0x8B;
+    Page[Cursor++] = 0x04;
+    Page[Cursor++] = 0x25;
+    *(ULONG*)(Page + Cursor) = PATCH_GUARD_KPCR_CURRENT_PRCB;
+    Cursor += sizeof(ULONG);
+    Page[Cursor++] = 0x8B;
+    Page[Cursor++] = 0x40;
+    Page[Cursor++] = PATCH_GUARD_PRCB_NUMBER;
+    Page[Cursor++] = 0x83;
+    Page[Cursor++] = 0xF8;
+    Page[Cursor++] = PATCH_GUARD_MAX_PROCESSORS;
+    Page[Cursor++] = 0x72;
+    Page[Cursor++] = 0x02;
+    Page[Cursor++] = 0x31;
+    Page[Cursor++] = 0xC0;
+    Page[Cursor++] = 0x89;
+    Page[Cursor++] = 0xC1;
+    Page[Cursor++] = 0x48;
+    Page[Cursor++] = 0xC1;
+    Page[Cursor++] = 0xE0;
+    Page[Cursor++] = 0x03;
+    Page[Cursor++] = 0x49;
+    Page[Cursor++] = 0xBB;
+    RtlCopyMemory(Page + Cursor, &Active, sizeof(Active));
+    Cursor += sizeof(Active);
+    Page[Cursor++] = 0x41;
+    Page[Cursor++] = 0x83;
+    Page[Cursor++] = 0x3C;
+    Page[Cursor++] = 0x8B;
+    Page[Cursor++] = 0x00;
+    Page[Cursor++] = 0x75;
+    Page[Cursor++] = 0x0C;
+    Page[Cursor++] = 0x49;
+    Page[Cursor++] = 0xBB;
+    RtlCopyMemory(Page + Cursor, &Tops, sizeof(Tops));
+    Cursor += sizeof(Tops);
+    Page[Cursor++] = 0xEB;
+    Page[Cursor++] = 0x0A;
+    Page[Cursor++] = 0x49;
+    Page[Cursor++] = 0xBB;
+    RtlCopyMemory(Page + Cursor, &HaltTops, sizeof(HaltTops));
+    Cursor += sizeof(HaltTops);
+    Page[Cursor++] = 0x49;
+    Page[Cursor++] = 0x8B;
+    Page[Cursor++] = 0x24;
+    Page[Cursor++] = 0x03;
+    Page[Cursor++] = 0x48;
+    Page[Cursor++] = 0x83;
+    Page[Cursor++] = 0xE4;
+    Page[Cursor++] = 0xF0;
+    Page[Cursor++] = 0x48;
+    Page[Cursor++] = 0x83;
+    Page[Cursor++] = 0xEC;
+    Page[Cursor++] = 0x20;
+    Page[Cursor++] = 0x48;
+    Page[Cursor++] = 0x89;
+    Page[Cursor++] = 0xD9;
+    Page[Cursor++] = 0x48;
+    Page[Cursor++] = 0xB8;
+    RtlCopyMemory(Page + Cursor, &Decide, sizeof(Decide));
+    Cursor += sizeof(Decide);
+    Page[Cursor++] = 0xFF;
+    Page[Cursor++] = 0xD0;
+    Page[Cursor++] = 0x84;
+    Page[Cursor++] = 0xC0;
+    Page[Cursor++] = 0x74;
+    Page[Cursor++] = 0x04;
+    Page[Cursor++] = 0x4C;
+    Page[Cursor++] = 0x89;
+    Page[Cursor++] = 0xE4;
+    Page[Cursor++] = 0xC3;
     Page[Cursor++] = 0x48;
     Page[Cursor++] = 0xB8;
     RtlCopyMemory(Page + Cursor, &Swallow, sizeof(Swallow));
@@ -1911,21 +2125,27 @@ PatchGuardAllocateSwallowStack(
     UCHAR* Raw;
     UCHAR* Aligned;
     UCHAR* Top;
+    ULONG Index;
+    SIZE_T Bytes;
 
-    Raw = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED,
-                                  (PATCH_GUARD_STACK_PAGES + 1) * PAGE_SIZE,
-                                  'PgaH');
+    Bytes = (SIZE_T)PATCH_GUARD_MAX_PROCESSORS * (PATCH_GUARD_STACK_PAGES + 1) * PAGE_SIZE;
+    Raw = (UCHAR*)ExAllocatePool2(POOL_FLAG_NON_PAGED, Bytes, 'PgaH');
     if (Raw == NULL)
     {
         return NULL;
     }
 
     Aligned = (UCHAR*)(((ULONG_PTR)Raw + (PAGE_SIZE - 1)) & ~(ULONG_PTR)(PAGE_SIZE - 1));
-    Top = Aligned + (PATCH_GUARD_STACK_PAGES * PAGE_SIZE);
-    Top = (UCHAR*)((ULONG_PTR)Top & ~(ULONG_PTR)0xF);
-    Top -= 0x20;
+    for (Index = 0; Index < PATCH_GUARD_MAX_PROCESSORS; Index++)
+    {
+        Top = Aligned + ((SIZE_T)(Index + 1) * PATCH_GUARD_STACK_PAGES * PAGE_SIZE);
+        Top = (UCHAR*)((ULONG_PTR)Top & ~(ULONG_PTR)0xF);
+        g_SwallowHaltTops[Index] = Top - 0x40;
+        g_SwallowTops[Index] = Top - (PATCH_GUARD_PARK_PAGES * PAGE_SIZE) - 0x40;
+    }
+
     g_SwallowStack = Raw;
-    return Top;
+    return g_SwallowTops;
 }
 
 static BOOLEAN
@@ -2141,6 +2361,7 @@ PatchGuardArmBugcheckHook(
         return STATUS_REVISION_MISMATCH;
     }
 
+    KeInitializeEvent(&g_SwallowPark, NotificationEvent, FALSE);
     Stack = PatchGuardAllocateSwallowStack();
     Stub = PatchGuardAllocateExecutablePage();
     if (Stack == NULL || Stub == NULL)
