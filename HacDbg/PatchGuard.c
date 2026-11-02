@@ -970,10 +970,50 @@ PatchGuardFindTimerDispatch(
     return Chosen;
 }
 
+static BOOLEAN
+PatchGuardSectionWritable(
+    _In_ PVOID Pointer
+    )
+{
+    IMAGE_DOS_HEADER* Dos;
+    IMAGE_NT_HEADERS64* Nt;
+    IMAGE_SECTION_HEADER* Section;
+    USHORT Index;
+    ULONG Rva;
+    ULONG Size;
+
+    if (g_NtosBase == NULL || PatchGuardPointerInImage(Pointer) == FALSE)
+    {
+        return FALSE;
+    }
+
+    Rva = (ULONG)((UCHAR*)Pointer - g_NtosBase);
+    Dos = (IMAGE_DOS_HEADER*)g_NtosBase;
+    Nt = (IMAGE_NT_HEADERS64*)((UCHAR*)g_NtosBase + Dos->e_lfanew);
+    Section = IMAGE_FIRST_SECTION(Nt);
+    for (Index = 0; Index < Nt->FileHeader.NumberOfSections; Index++)
+    {
+        Size = Section[Index].Misc.VirtualSize;
+        if (Section[Index].SizeOfRawData > Size)
+        {
+            Size = Section[Index].SizeOfRawData;
+        }
+
+        if (Rva >= Section[Index].VirtualAddress &&
+            Rva < Section[Index].VirtualAddress + Size)
+        {
+            return (Section[Index].Characteristics & IMAGE_SCN_MEM_WRITE) != 0;
+        }
+    }
+
+    return FALSE;
+}
+
 static PVOID
 PatchGuardFindTimer2Collections(
     _In_ PVOID TextBase,
     _In_ ULONG TextSize,
+    _In_ SIZE_T Start,
     _Out_ const UCHAR** Lea
     )
 {
@@ -985,7 +1025,12 @@ PatchGuardFindTimer2Collections(
     PVOID Target;
 
     Text = (const UCHAR*)TextBase;
-    for (Index = 16; Index + 12 < TextSize; Index++)
+    if (Start < 16)
+    {
+        Start = 16;
+    }
+
+    for (Index = Start; Index + 12 < TextSize; Index++)
     {
         if (Text[Index] != 0x48 ||
             Text[Index + 1] != 0x8D ||
@@ -1057,7 +1102,11 @@ PatchGuardFindTimer2Lock(
                                                  sizeof(LockPat));
     if (Cursor != NULL)
     {
-        return PatchGuardRipTarget((PVOID)Cursor, 5, 10);
+        Target = PatchGuardRipTarget((PVOID)Cursor, 5, 10);
+        if (PatchGuardSectionWritable(Target) != FALSE)
+        {
+            return Target;
+        }
     }
 
     Cursor = CollectionsLea;
@@ -1070,7 +1119,7 @@ PatchGuardFindTimer2Lock(
         }
 
         Target = PatchGuardRipTarget((PVOID)Cursor, 3, 7);
-        if (PatchGuardPointerInImage(Target) != FALSE && Target != g_KiTimer2Collections)
+        if (Target != g_KiTimer2Collections && PatchGuardSectionWritable(Target) != FALSE)
         {
             return Target;
         }
@@ -1123,6 +1172,7 @@ PatchGuardResolve(
     ULONG PageSize;
     PVOID Match;
     const UCHAR* CollectionsLea;
+    SIZE_T CollectionsStart;
     NTSTATUS Status;
     static const UCHAR KiSwInterruptDispatchPat[] =
     {
@@ -1300,19 +1350,30 @@ PatchGuardResolve(
         return STATUS_NOT_FOUND;
     }
 
-    g_KiTimer2Collections = PatchGuardFindTimer2Collections(TextBase, TextSize, &CollectionsLea);
-    if (g_KiTimer2Collections == NULL || CollectionsLea == NULL)
+    CollectionsStart = 0;
+    for (;;)
     {
-        HACDBG_LOG("HacDbg: Err, PatchGuard pattern KiTimer2Collections was not found.\n");
-        return STATUS_NOT_FOUND;
-    }
+        g_KiTimer2Collections = PatchGuardFindTimer2Collections(TextBase,
+                                                                TextSize,
+                                                                CollectionsStart,
+                                                                &CollectionsLea);
+        if (g_KiTimer2Collections == NULL || CollectionsLea == NULL)
+        {
+            HACDBG_LOG("HacDbg: Err, PatchGuard pattern KiTimer2Collections was not found.\n");
+            return STATUS_NOT_FOUND;
+        }
 
-    g_KiTimer2CollectionLock = (PKSPIN_LOCK)PatchGuardFindTimer2Lock(TextBase, CollectionsLea);
-    if (g_KiTimer2CollectionLock == NULL ||
-        PatchGuardPointerInImage(g_KiTimer2CollectionLock) == FALSE)
-    {
-        HACDBG_LOG("HacDbg: Err, PatchGuard pattern KiTimer2CollectionLock was not found.\n");
-        return STATUS_NOT_FOUND;
+        g_KiTimer2CollectionLock = (PKSPIN_LOCK)PatchGuardFindTimer2Lock(TextBase, CollectionsLea);
+        if (g_KiTimer2CollectionLock != NULL &&
+            PatchGuardSectionWritable(g_KiTimer2Collections) != FALSE)
+        {
+            break;
+        }
+
+        HACDBG_LOG("HacDbg: PatchGuard timer2 candidate %p lock %p skipped.\n",
+                   g_KiTimer2Collections,
+                   g_KiTimer2CollectionLock);
+        CollectionsStart = (SIZE_T)(CollectionsLea - (const UCHAR*)TextBase) + 1;
     }
 
     g_LoadedModuleList = (LIST_ENTRY*)PatchGuardFindExport(g_NtosBase, "PsLoadedModuleList");
