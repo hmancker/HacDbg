@@ -37,7 +37,6 @@
 #define PATCH_GUARD_KPCR_CURRENT_PRCB       0x20ull
 #define PATCH_GUARD_PRCB_TIMER_TABLE        0x4100ull
 #define PATCH_GUARD_PRCB_DPC_DATA           0x3840ull
-#define PATCH_GUARD_DPC_DATA_SIZE           0x30ull
 #define PATCH_GUARD_DPC_DATA_COUNT          2ul
 #define PATCH_GUARD_DPC_LIST_ENTRY          0x08ull
 #define PATCH_GUARD_DPC_WALK_LIMIT          256ul
@@ -67,6 +66,7 @@
 #define PATCH_GUARD_HOOK_PAGE_COUNT         12ul
 #define PATCH_GUARD_ALLOCATION_COUNT        16ul
 #define PATCH_GUARD_BUGCHECK_TAIL_LIMIT     8ul
+#define PATCH_GUARD_BUGCHECK_GATE_WINDOW    0x180ul
 #define PATCH_GUARD_FUNCTION_SCAN_LIMIT     0x40000ul
 #define PATCH_GUARD_RETIRE_LOG_LIMIT        8ul
 #define PATCH_GUARD_STACK_PAGES             4ul
@@ -234,6 +234,7 @@ typedef struct _PATCH_GUARD_LAYOUT
     ULONG BuildMax;
     ULONG TimerTable;
     ULONG DpcData;
+    ULONG DpcDataSize;
     ULONG ThreadListHead;
     ULONG ThreadListEntry;
     ULONG StartAddress;
@@ -252,15 +253,16 @@ typedef struct _PATCH_GUARD_LAYOUT
 // fields are the Vergilius Windows 11 21H2 and 23H2 layouts, which match
 // each other. 26100 is the layout used by 10.0.26100.9711.
 // DpcRoutineActive is the byte KiProcessExpiredTimerList sets before it
-// calls a timer DPC. 18362 and 22000/26100 values are the Vergilius
-// offsets; 19041 is left zero because that field was not in the fetched
-// page. CurrentDpcRoutine is absent on 18362.
+// calls a timer DPC. 19041 values are from the 19045 PDB: each KDPC_DATA
+// is 0x28 bytes, StartAddress shares ETHREAD+0x450 with PostBlockList,
+// and Win32StartAddress is +0x4D0. 26100 keeps the 0x30-byte DPC slot.
+// CurrentDpcRoutine is absent on 18362.
 //
 static const PATCH_GUARD_LAYOUT g_PatchGuardLayouts[] = {
-    { 18362, 18363, 0x3680, 0x2E00, 0x488, 0x6B8, 0x620, 0x6A0, 0x6E4, 0, 0, 0x2E6A, "18362" },
-    { 19041, 19045, 0x3940, 0x30C0, 0x5E0, 0x4E8, 0x4D0, 0x450, 0, 0, 0, 0, "19041" },
-    { 22000, 22631, 0x3C00, 0x3340, 0x5E0, 0x538, 0x4A0, 0x520, 0x564, 0x3320, 0x3330, 0x33BA, "22000" },
-    { 26100, 26999, 0x4100, 0x3840, 0x370, 0x578, 0x4E0, 0x560, 0x5A4, 0x3820, 0x3830, 0x38BA, "26100" },
+    { 18362, 18363, 0x3680, 0x2E00, 0x28, 0x488, 0x6B8, 0x620, 0x6A0, 0x6E4, 0, 0, 0x2E6A, "18362" },
+    { 19041, 19045, 0x3940, 0x30C0, 0x28, 0x5E0, 0x4E8, 0x450, 0x4D0, 0, 0x30A0, 0x30B0, 0x312A, "19041" },
+    { 22000, 22631, 0x3C00, 0x3340, 0x30, 0x5E0, 0x538, 0x4A0, 0x520, 0x564, 0x3320, 0x3330, 0x33BA, "22000" },
+    { 26100, 26999, 0x4100, 0x3840, 0x30, 0x370, 0x578, 0x4E0, 0x560, 0x5A4, 0x3820, 0x3830, 0x38BA, "26100" },
 };
 
 static const PATCH_GUARD_LAYOUT* g_Layout;
@@ -1594,7 +1596,7 @@ PatchGuardDisableTimersOnProcessor(
         SINGLE_LIST_ENTRY* Entry;
         ULONG Walk;
 
-        DpcData = Prcb + g_Layout->DpcData + (Index * PATCH_GUARD_DPC_DATA_SIZE);
+        DpcData = Prcb + g_Layout->DpcData + (Index * g_Layout->DpcDataSize);
         Entry = ((SINGLE_LIST_ENTRY*)DpcData)->Next;
         Walk = 0;
         while (Entry != NULL && Walk < PATCH_GUARD_DPC_WALK_LIMIT)
@@ -2199,6 +2201,52 @@ PatchGuardRetirePoolEntry(
     return TRUE;
 }
 
+static BOOLEAN
+PatchGuardPointerInObject(
+    _In_ UCHAR* Object,
+    _In_ ULONG ObjectSize,
+    _In_opt_ PVOID Pointer
+    )
+{
+    UINT64 Value;
+    UINT64 Base;
+
+    if (Pointer == NULL)
+    {
+        return FALSE;
+    }
+
+    Value = (UINT64)Pointer;
+    Base = (UINT64)Object;
+    return Value >= Base && Value < Base + ObjectSize;
+}
+
+static BOOLEAN
+PatchGuardLooksLikeListEntry(
+    _In_ PVOID Pointer
+    )
+{
+    PVOID Flink;
+    PVOID Blink;
+
+    if (MmGetPhysicalAddress(Pointer).QuadPart == 0 ||
+        MmGetPhysicalAddress((UCHAR*)Pointer + sizeof(PVOID)).QuadPart == 0)
+    {
+        return FALSE;
+    }
+
+    Flink = *(PVOID*)Pointer;
+    Blink = *(PVOID*)((UCHAR*)Pointer + sizeof(PVOID));
+    if (!PatchGuardIsCanonical((UINT64)Flink) ||
+        !PatchGuardIsCanonical((UINT64)Blink) ||
+        MmGetPhysicalAddress(Blink).QuadPart == 0)
+    {
+        return FALSE;
+    }
+
+    return *(PVOID*)Blink == Pointer;
+}
+
 static VOID
 PatchGuardRetireSystemThreads(
     VOID
@@ -2265,6 +2313,23 @@ PatchGuardRetireSystemThreads(
 
         Start = *(PVOID*)(Thread + g_Layout->StartAddress);
         Win32Start = *(PVOID*)(Thread + g_Layout->Win32StartAddress);
+        //
+        // On 19041, StartAddress shares storage with PostBlockList.Blink.
+        // An empty list stores the address of the thread object itself.
+        // Writing a ret there corrupts the thread as soon as it runs.
+        //
+        if (PatchGuardPointerInObject(Thread, 0x1000, Start) != FALSE ||
+            PatchGuardLooksLikeListEntry(Start) != FALSE)
+        {
+            Start = NULL;
+        }
+
+        if (PatchGuardPointerInObject(Thread, 0x1000, Win32Start) != FALSE ||
+            PatchGuardLooksLikeListEntry(Win32Start) != FALSE)
+        {
+            Win32Start = NULL;
+        }
+
         if (PatchGuardRetirePoolEntry(Start) != FALSE)
         {
             Retired += 1;
@@ -2336,7 +2401,7 @@ PatchGuardClearActiveDpc(
     for (Index = 0; Index < PATCH_GUARD_DPC_DATA_COUNT; Index++)
     {
         *(PVOID*)(Prcb + g_Layout->DpcData +
-                  (Index * PATCH_GUARD_DPC_DATA_SIZE) +
+                  (Index * g_Layout->DpcDataSize) +
                   PATCH_GUARD_DPC_ACTIVE) = NULL;
     }
 
@@ -3185,8 +3250,8 @@ PatchGuardHookBugcheckTails(
         const UCHAR* FunctionBegin;
         const UCHAR* FunctionEnd;
         const UCHAR* Epilogue;
+        const UCHAR* ContinueAt;
         const UCHAR* Look;
-        UCHAR Patch[5];
         ULONG FunctionSize;
         BOOLEAN SawCode;
         NTSTATUS Status;
@@ -3263,16 +3328,207 @@ PatchGuardHookBugcheckTails(
             return STATUS_NOT_FOUND;
         }
 
-        Patch[0] = 0xE9;
-        Relative = (INT32)(Epilogue - (Call + 5));
-        RtlCopyMemory(Patch + 1, &Relative, sizeof(Relative));
-        Status = PatchGuardInstallExecuteHook(Call,
-                                              Patch,
-                                              sizeof(Patch),
-                                              PageBases,
-                                              Shadows,
-                                              PhysicalPages,
-                                              PageCount);
+        ContinueAt = Epilogue;
+
+        //
+        // 19041 clears CR0.WP, copies memory, and takes bit locks before
+        // mov ecx, 109h. That sequence does not return. Jumping from it to
+        // the epilogue skips the success continuation, including sti, and
+        // the caller resumes a half-finished check. The gate is the near
+        // conditional jump just before mov r12, cr0 whose target lies
+        // between that instruction and the epilogue. Make the jump
+        // unconditional so both outcomes take the success continuation.
+        //
+        {
+            static const UCHAR RetWrite[] = {
+                0xC6, 0x00, 0xC3, 0x41, 0x0F, 0x22, 0xC4
+            };
+            static const UCHAR SaveCr0[] = {
+                0x41, 0x0F, 0x20, 0xC4
+            };
+            const UCHAR* RetWriteAt;
+            const UCHAR* SaveCr0At;
+            const UCHAR* Scan;
+            const UCHAR* Gate;
+            const UCHAR* GateTarget;
+            UCHAR* PatchAt;
+
+            RetWriteAt = NULL;
+            SaveCr0At = NULL;
+            Gate = NULL;
+            GateTarget = NULL;
+            for (Scan = FunctionBegin; Scan + sizeof(RetWrite) <= Call; Scan++)
+            {
+                if (RtlEqualMemory(Scan, RetWrite, sizeof(RetWrite)) != FALSE)
+                {
+                    RetWriteAt = Scan;
+                }
+            }
+
+            if (RetWriteAt != NULL)
+            {
+                for (Scan = FunctionBegin; Scan + sizeof(SaveCr0) <= RetWriteAt; Scan++)
+                {
+                    if (RtlEqualMemory(Scan, SaveCr0, sizeof(SaveCr0)) != FALSE)
+                    {
+                        SaveCr0At = Scan;
+                    }
+                }
+            }
+
+            if (RetWriteAt != NULL && SaveCr0At != NULL && Epilogue > SaveCr0At)
+            {
+                const UCHAR* Window;
+
+                if (SaveCr0At >= FunctionBegin + PATCH_GUARD_BUGCHECK_GATE_WINDOW)
+                {
+                    Window = SaveCr0At - PATCH_GUARD_BUGCHECK_GATE_WINDOW;
+                }
+                else
+                {
+                    Window = FunctionBegin;
+                }
+
+                for (Scan = Window; Scan + 6 <= SaveCr0At; Scan++)
+                {
+                    INT32 OldRelative;
+                    const UCHAR* JumpTarget;
+
+                    if (Scan[0] != 0x0F ||
+                        (Scan[1] != 0x84 && Scan[1] != 0x85))
+                    {
+                        continue;
+                    }
+
+                    OldRelative = *(INT32*)(Scan + 2);
+                    JumpTarget = Scan + 6 + OldRelative;
+                    if (JumpTarget <= SaveCr0At || JumpTarget >= Epilogue)
+                    {
+                        continue;
+                    }
+
+                    Gate = Scan;
+                    GateTarget = JumpTarget;
+                }
+            }
+
+            if (RetWriteAt != NULL && SaveCr0At != NULL)
+            {
+                UCHAR Patch[6];
+                INT32 NewRelative;
+
+                if (Gate == NULL)
+                {
+                    HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck pass was not found at %p.\n",
+                               Call);
+                    return STATUS_NOT_FOUND;
+                }
+
+                NewRelative = (INT32)(GateTarget - (Gate + 5));
+                Patch[0] = 0xE9;
+                RtlCopyMemory(Patch + 1, &NewRelative, sizeof(NewRelative));
+                Patch[5] = 0x90;
+                Status = PatchGuardInstallExecuteHook((PVOID)Gate,
+                                                      Patch,
+                                                      sizeof(Patch),
+                                                      PageBases,
+                                                      Shadows,
+                                                      PhysicalPages,
+                                                      PageCount);
+                if (NT_SUCCESS(Status))
+                {
+                    ContinueAt = GateTarget;
+                    HACDBG_LOG("HacDbg: PatchGuard bugcheck pass %p always %p.\n",
+                               Gate,
+                               GateTarget);
+                }
+            }
+            else
+            {
+                UCHAR* Stub;
+                UCHAR* Cursor;
+                UCHAR Jump[PATCH_GUARD_ABSOLUTE_JUMP];
+                UINT64 EpilogueAddress;
+                ULONG ActiveOffset;
+                static UCHAR* StubPage;
+                static ULONG StubUsed;
+
+                PatchAt = NULL;
+                Look = Call;
+                while (Look >= Text + sizeof(BugcheckCode))
+                {
+                    Look -= 1;
+                    if (Call - Look > 32)
+                    {
+                        break;
+                    }
+
+                    if (RtlEqualMemory(Look, BugcheckCode, sizeof(BugcheckCode)) != FALSE)
+                    {
+                        PatchAt = (UCHAR*)Look;
+                        break;
+                    }
+                }
+
+                if (PatchAt == NULL ||
+                    ((ULONG_PTR)PatchAt & (PAGE_SIZE - 1)) + PATCH_GUARD_ABSOLUTE_JUMP > PAGE_SIZE)
+                {
+                    HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck site %p has no room.\n", Call);
+                    return STATUS_NOT_FOUND;
+                }
+
+                if (StubPage == NULL || StubUsed + 48 > PAGE_SIZE)
+                {
+                    StubPage = (UCHAR*)PatchGuardAllocateExecutablePage();
+                    StubUsed = 0;
+                    if (StubPage == NULL)
+                    {
+                        return STATUS_INSUFFICIENT_RESOURCES;
+                    }
+                }
+
+                Stub = StubPage + StubUsed;
+                Cursor = Stub;
+                Cursor[0] = 0x31;
+                Cursor[1] = 0xC9;
+                Cursor[2] = 0x0F;
+                Cursor[3] = 0x22;
+                Cursor[4] = 0xC1;
+                Cursor += 5;
+                ActiveOffset = g_Layout == NULL ? 0 : g_Layout->DpcRoutineActive;
+                if (ActiveOffset != 0)
+                {
+                    static const UCHAR ReadPrcb[] = {
+                        0x65, 0x48, 0x8B, 0x04, 0x25, 0x20, 0x00, 0x00, 0x00
+                    };
+
+                    RtlCopyMemory(Cursor, ReadPrcb, sizeof(ReadPrcb));
+                    Cursor += sizeof(ReadPrcb);
+                    Cursor[0] = 0xC6;
+                    Cursor[1] = 0x80;
+                    RtlCopyMemory(Cursor + 2, &ActiveOffset, sizeof(ActiveOffset));
+                    Cursor[6] = 0;
+                    Cursor += 7;
+                }
+
+                Cursor[0] = 0x48;
+                Cursor[1] = 0xB8;
+                EpilogueAddress = (UINT64)Epilogue;
+                RtlCopyMemory(Cursor + 2, &EpilogueAddress, sizeof(EpilogueAddress));
+                Cursor[10] = 0xFF;
+                Cursor[11] = 0xE0;
+                Cursor += 12;
+                StubUsed = (ULONG)(Cursor - StubPage);
+                PatchGuardWriteAbsoluteJump(Jump, Stub);
+                Status = PatchGuardInstallExecuteHook(PatchAt,
+                                                      Jump,
+                                                      sizeof(Jump),
+                                                      PageBases,
+                                                      Shadows,
+                                                      PhysicalPages,
+                                                      PageCount);
+            }
+        }
         if (!NT_SUCCESS(Status))
         {
             HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck tail hook failed at %p.\n", Call);
@@ -3280,7 +3536,7 @@ PatchGuardHookBugcheckTails(
         }
 
         Hooked += 1;
-        HACDBG_LOG("HacDbg: PatchGuard bugcheck tail %p returns at %p.\n", Call, Epilogue);
+        HACDBG_LOG("HacDbg: PatchGuard bugcheck tail %p returns at %p.\n", Call, ContinueAt);
         Index += 4;
     }
     }

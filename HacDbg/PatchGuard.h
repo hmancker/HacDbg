@@ -34,10 +34,13 @@ NTSTATUS
  * guest, and before registering a callback that is outside the loader
  * list. Reads of the ntoskrnl page still see the original bytes. An
  * instruction fetch of KeBugCheckEx continues the original function
- * unless the bugcheck code is 0x109. Calls that pass 0x109 into
- * SdbpCheckDll are turned into a jump to that function's epilogue, so
- * the checker returns before it clears the stack. A 0x109 that still
- * reaches KeBugCheckEx never returns to the caller. It switches to a
+ * unless the bugcheck code is 0x109. On 19041 the failure path clears
+ * CR0.WP, copies memory, and takes bit locks before it calls
+ * SdbpCheckDll. The near jump that skips that path is made
+ * unconditional, so the function's own success continuation runs. Other
+ * builds drop CR8 to PASSIVE_LEVEL at mov ecx, 109h, then jump to the
+ * epilogue. A 0x109 that still reaches KeBugCheckEx never returns to
+ * the caller. It switches to a
  * per-processor stack, drops CR8 to PASSIVE_LEVEL, and clears both
  * ActiveDpc and DpcRoutineActive. A system thread that is not an
  * executive worker, and was not interrupted by a DPC, is ended. Any
