@@ -36,6 +36,16 @@
 #endif
 
 //
+// 是否在加载时停掉运行中的 PatchGuard。
+//   1 - 开启。进入客户前改写定时器回调，进入客户后安装 KeBugCheckEx 执行钩子。
+//   0 - 关闭。这两段都不执行，PatchGuard 按系统原样运行。
+// 映射映像仍会注册电源回调。关闭后该回调不在加载模块表里，PatchGuard 仍会检查它。
+//
+#ifndef HACDBG_DISABLE_PATCHGUARD
+#define HACDBG_DISABLE_PATCHGUARD 1
+#endif
+
+//
 // 客户是否看到虚拟化能力。
 //   1 - 隐藏。Intel 清掉 CPUID.1 ECX[5]，CR4 读影子不带 VMXE，
 //       IA32_FEATURE_CONTROL 显示为已锁定且不允许 VMX，0x480-0x493 注入 #GP。

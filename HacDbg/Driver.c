@@ -762,12 +762,16 @@ DriverEntry(
     HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_START, STATUS_SUCCESS);
     HacDbgRecordLoadDetail(RegistryPath, 0);
 
+#if HACDBG_DISABLE_PATCHGUARD
     status = PatchGuardDisable();
     if (!NT_SUCCESS(status))
     {
         HACDBG_LOG("HacDbg: Err, PatchGuard disable failed: 0x%08x.\n", status);
         return status;
     }
+#else
+    HACDBG_LOG("HacDbg: PatchGuard disable is turned off.\n");
+#endif
 
     PhysicalMemorySetFiveLevelPaging((__readcr4() & (1ull << 12)) != 0);
 
@@ -874,6 +878,7 @@ DriverEntry(
         return status;
     }
 
+#if HACDBG_DISABLE_PATCHGUARD
     status = PatchGuardArmBugcheckHook();
     if (!NT_SUCCESS(status))
     {
@@ -891,6 +896,7 @@ DriverEntry(
         PhysicalMemoryCleanup();
         return status;
     }
+#endif
 
     g_PowerCallbackRegistration = ExRegisterCallback(
         callbackObject,
