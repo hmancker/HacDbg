@@ -64,8 +64,10 @@
 #define PATCH_GUARD_THREAD_WALK_LIMIT       4096ul
 #define PATCH_GUARD_BUGCHECK_PROLOGUE       15ul
 #define PATCH_GUARD_ABSOLUTE_JUMP           14ul
-#define PATCH_GUARD_HOOK_PAGE_COUNT         4ul
-#define PATCH_GUARD_ALLOCATION_COUNT        6ul
+#define PATCH_GUARD_HOOK_PAGE_COUNT         12ul
+#define PATCH_GUARD_ALLOCATION_COUNT        16ul
+#define PATCH_GUARD_BUGCHECK_TAIL_LIMIT     8ul
+#define PATCH_GUARD_FUNCTION_SCAN_LIMIT     0x40000ul
 #define PATCH_GUARD_RETIRE_LOG_LIMIT        8ul
 #define PATCH_GUARD_STACK_PAGES             4ul
 #define PATCH_GUARD_MAX_PROCESSORS          64ul
@@ -237,6 +239,9 @@ typedef struct _PATCH_GUARD_LAYOUT
     ULONG StartAddress;
     ULONG Win32StartAddress;
     ULONG SameThreadPassive;
+    ULONG CurrentDpcRoutine;
+    ULONG CurrentDpcStartTime;
+    ULONG DpcRoutineActive;
     const CHAR* Name;
 } PATCH_GUARD_LAYOUT;
 
@@ -246,12 +251,16 @@ typedef struct _PATCH_GUARD_LAYOUT
 // offsets are the displacements in PsGetNextProcessThread. 22000-22631
 // fields are the Vergilius Windows 11 21H2 and 23H2 layouts, which match
 // each other. 26100 is the layout used by 10.0.26100.9711.
+// DpcRoutineActive is the byte KiProcessExpiredTimerList sets before it
+// calls a timer DPC. 18362 and 22000/26100 values are the Vergilius
+// offsets; 19041 is left zero because that field was not in the fetched
+// page. CurrentDpcRoutine is absent on 18362.
 //
 static const PATCH_GUARD_LAYOUT g_PatchGuardLayouts[] = {
-    { 18362, 18363, 0x3680, 0x2E00, 0x488, 0x6B8, 0x620, 0x6A0, 0x6E4, "18362" },
-    { 19041, 19045, 0x3940, 0x30C0, 0x5E0, 0x4E8, 0x4D0, 0x450, 0, "19041" },
-    { 22000, 22631, 0x3C00, 0x3340, 0x5E0, 0x538, 0x4A0, 0x520, 0x564, "22000" },
-    { 26100, 26999, 0x4100, 0x3840, 0x370, 0x578, 0x4E0, 0x560, 0x5A4, "26100" },
+    { 18362, 18363, 0x3680, 0x2E00, 0x488, 0x6B8, 0x620, 0x6A0, 0x6E4, 0, 0, 0x2E6A, "18362" },
+    { 19041, 19045, 0x3940, 0x30C0, 0x5E0, 0x4E8, 0x4D0, 0x450, 0, 0, 0, 0, "19041" },
+    { 22000, 22631, 0x3C00, 0x3340, 0x5E0, 0x538, 0x4A0, 0x520, 0x564, 0x3320, 0x3330, 0x33BA, "22000" },
+    { 26100, 26999, 0x4100, 0x3840, 0x370, 0x578, 0x4E0, 0x560, 0x5A4, 0x3820, 0x3830, 0x38BA, "26100" },
 };
 
 static const PATCH_GUARD_LAYOUT* g_Layout;
@@ -2289,12 +2298,40 @@ PatchGuardBugcheckCanReturn(
     return FALSE;
 }
 
-static VOID
+static BOOLEAN
 PatchGuardClearActiveDpc(
     _In_ UCHAR* Prcb
     )
 {
+    BOOLEAN Active;
     ULONG Index;
+
+    //
+    // KiProcessExpiredTimerList sets DpcRoutineActive before the timer
+    // DPC runs. KiCallInterruptServiceRoutine treats a stale value as a
+    // stuck DPC and rewrites the trap frame from the clock interrupt.
+    // Clearing only ActiveDpc leaves that byte set.
+    //
+    Active = FALSE;
+    if (g_Layout->DpcRoutineActive != 0)
+    {
+        if (Prcb[g_Layout->DpcRoutineActive] != 0)
+        {
+            Active = TRUE;
+        }
+
+        Prcb[g_Layout->DpcRoutineActive] = 0;
+    }
+
+    if (g_Layout->CurrentDpcRoutine != 0)
+    {
+        *(PVOID*)(Prcb + g_Layout->CurrentDpcRoutine) = NULL;
+    }
+
+    if (g_Layout->CurrentDpcStartTime != 0)
+    {
+        *(UINT64*)(Prcb + g_Layout->CurrentDpcStartTime) = 0;
+    }
 
     for (Index = 0; Index < PATCH_GUARD_DPC_DATA_COUNT; Index++)
     {
@@ -2302,6 +2339,8 @@ PatchGuardClearActiveDpc(
                   (Index * PATCH_GUARD_DPC_DATA_SIZE) +
                   PATCH_GUARD_DPC_ACTIVE) = NULL;
     }
+
+    return Active;
 }
 
 static VOID
@@ -2335,6 +2374,7 @@ PatchGuardSwallowCorruption(
     ULONG SamePassive;
     ULONG SameApc;
     ULONG CacheActive;
+    BOOLEAN DpcWasActive;
 
     Cpu = KeGetCurrentProcessorNumber();
     if (Cpu >= PATCH_GUARD_MAX_PROCESSORS)
@@ -2344,7 +2384,7 @@ PatchGuardSwallowCorruption(
 
     Prcb = (UCHAR*)__readgsqword(PATCH_GUARD_KPCR_CURRENT_PRCB);
     Irql = KeGetCurrentIrql();
-    PatchGuardClearActiveDpc(Prcb);
+    DpcWasActive = PatchGuardClearActiveDpc(Prcb);
 
     //
     // INVARIANT: CR8 is written to PASSIVE_LEVEL before this processor
@@ -2387,7 +2427,12 @@ PatchGuardSwallowCorruption(
     Path = PATCH_GUARD_PATH_HALT;
     if (Thread != NULL && Thread != Idle && ApcDisable == 0 && SameApc == 0 && CacheActive == 0)
     {
-        if ((MiscFlags & PATCH_GUARD_KTHREAD_SYSTEM) != 0 &&
+        //
+        // A timer DPC interrupted this thread. Terminating it abandons
+        // whatever kernel lock the thread already held.
+        //
+        if (DpcWasActive == FALSE &&
+            (MiscFlags & PATCH_GUARD_KTHREAD_SYSTEM) != 0 &&
             g_Layout != NULL &&
             g_Layout->SameThreadPassive != 0 &&
             (SamePassive & PATCH_GUARD_ACTIVE_EX_WORKER) == 0)
@@ -2402,10 +2447,11 @@ PatchGuardSwallowCorruption(
 
     if (InterlockedCompareExchange(&g_SwallowedBugcheck, 1, 0) == 0)
     {
-        HACDBG_LOG("HacDbg: PatchGuard swallowed CRITICAL_STRUCTURE_CORRUPTION cpu %u irql %u path %u.\n",
+        HACDBG_LOG("HacDbg: PatchGuard swallowed CRITICAL_STRUCTURE_CORRUPTION cpu %u irql %u path %u dpc %u.\n",
                    Cpu,
                    Irql,
-                   Path);
+                   Path,
+                   DpcWasActive != FALSE ? 1 : 0);
     }
 
     if (Path == PATCH_GUARD_PATH_TERMINATE)
@@ -2831,6 +2877,423 @@ PatchGuardDisable(
     return STATUS_SUCCESS;
 }
 
+static const IMAGE_RUNTIME_FUNCTION_ENTRY*
+PatchGuardRuntimeFunction(
+    _In_ ULONG Rva
+    )
+{
+    IMAGE_DOS_HEADER* Dos;
+    IMAGE_NT_HEADERS64* Nt;
+    IMAGE_DATA_DIRECTORY* Directory;
+    IMAGE_RUNTIME_FUNCTION_ENTRY* Table;
+    ULONG Count;
+    ULONG Low;
+    ULONG High;
+
+    Dos = (IMAGE_DOS_HEADER*)g_NtosBase;
+    if (Dos->e_magic != IMAGE_DOS_SIGNATURE || Dos->e_lfanew < 0x40)
+    {
+        return NULL;
+    }
+
+    Nt = (IMAGE_NT_HEADERS64*)(g_NtosBase + Dos->e_lfanew);
+    Directory = &Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+    if (Directory->VirtualAddress == 0 ||
+        Directory->Size < sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY) ||
+        Directory->VirtualAddress > g_NtosSize ||
+        Directory->Size > g_NtosSize - Directory->VirtualAddress)
+    {
+        return NULL;
+    }
+
+    Table = (IMAGE_RUNTIME_FUNCTION_ENTRY*)(g_NtosBase + Directory->VirtualAddress);
+    Count = Directory->Size / sizeof(IMAGE_RUNTIME_FUNCTION_ENTRY);
+    Low = 0;
+    High = Count;
+    while (Low < High)
+    {
+        ULONG Mid;
+
+        Mid = Low + ((High - Low) / 2);
+        if (Rva < Table[Mid].BeginAddress)
+        {
+            High = Mid;
+        }
+        else if (Rva >= Table[Mid].EndAddress)
+        {
+            Low = Mid + 1;
+        }
+        else
+        {
+            return &Table[Mid];
+        }
+    }
+
+    return NULL;
+}
+
+static const UCHAR*
+PatchGuardEpilogue(
+    _In_ const UCHAR* Begin,
+    _In_ const UCHAR* End,
+    _In_ const UCHAR* Call
+    )
+{
+    const UCHAR* Cursor;
+    const UCHAR* Best;
+    ULONG BestDistance;
+
+    Best = NULL;
+    BestDistance = 0xFFFFFFFF;
+    Cursor = Begin;
+    while (Cursor < End)
+    {
+        const UCHAR* Pops;
+        const UCHAR* Start;
+        ULONG PopsCount;
+        ULONG Distance;
+
+        if (*Cursor != 0xC3)
+        {
+            Cursor += 1;
+            continue;
+        }
+
+        Pops = Cursor;
+        PopsCount = 0;
+        while (PopsCount < 12 && Pops > Begin)
+        {
+            if (Pops >= Begin + 2 &&
+                Pops[-2] == 0x41 &&
+                (Pops[-1] == 0x5C || Pops[-1] == 0x5D ||
+                 Pops[-1] == 0x5E || Pops[-1] == 0x5F))
+            {
+                Pops -= 2;
+                PopsCount += 1;
+                continue;
+            }
+
+            if (Pops[-1] == 0x5B || Pops[-1] == 0x5D ||
+                Pops[-1] == 0x5E || Pops[-1] == 0x5F)
+            {
+                Pops -= 1;
+                PopsCount += 1;
+                continue;
+            }
+
+            break;
+        }
+
+        Start = NULL;
+        if (PopsCount >= 4 &&
+            Pops >= Begin + 3 &&
+            Pops[-3] == 0x49 &&
+            Pops[-2] == 0x8B &&
+            Pops[-1] == 0xE3)
+        {
+            const UCHAR* Walk;
+
+            Walk = Pops - 3;
+            while (Walk >= Begin + 4 && Pops - Walk < 40)
+            {
+                if (Walk >= Begin + 8 &&
+                    Walk[-8] == 0x4C &&
+                    Walk[-7] == 0x8D &&
+                    Walk[-6] == 0x9C &&
+                    Walk[-5] == 0x24)
+                {
+                    Start = Walk - 8;
+                    break;
+                }
+
+                if (Walk[-4] == 0x49 &&
+                    Walk[-3] == 0x8B &&
+                    (Walk[-2] & 0xC7) == 0x43)
+                {
+                    Walk -= 4;
+                    continue;
+                }
+
+                if (Walk >= Begin + 3 &&
+                    Walk[-3] == 0x48 &&
+                    Walk[-2] == 0x8B &&
+                    (Walk[-1] & 0xF8) == 0xC0)
+                {
+                    Walk -= 3;
+                    continue;
+                }
+
+                break;
+            }
+        }
+        else if (PopsCount >= 4 &&
+                 Pops >= Begin + 7 &&
+                 Pops[-7] == 0x48 &&
+                 Pops[-6] == 0x81 &&
+                 Pops[-5] == 0xC4)
+        {
+            Start = Pops - 7;
+        }
+        else if (PopsCount >= 4 &&
+                 Pops >= Begin + 4 &&
+                 Pops[-4] == 0x48 &&
+                 Pops[-3] == 0x83 &&
+                 Pops[-2] == 0xC4)
+        {
+            Start = Pops - 4;
+        }
+
+        if (Start != NULL && Start >= Begin + 8)
+        {
+            const UCHAR* Walk;
+            ULONG Stepped;
+
+            Walk = Start;
+            Stepped = 0;
+            while (Walk >= Begin + 8 && Stepped < 4)
+            {
+                if (Walk[-8] == 0x48 &&
+                    Walk[-7] == 0x8B &&
+                    (Walk[-6] & 0xC7) == 0x84 &&
+                    Walk[-5] == 0x24)
+                {
+                    Walk -= 8;
+                    Start = Walk;
+                    Stepped += 1;
+                    continue;
+                }
+
+                if (Walk >= Begin + 5 &&
+                    Walk[-5] == 0x48 &&
+                    Walk[-4] == 0x8B &&
+                    (Walk[-3] & 0xC7) == 0x44 &&
+                    Walk[-2] == 0x24)
+                {
+                    Walk -= 5;
+                    Start = Walk;
+                    Stepped += 1;
+                    continue;
+                }
+
+                if (Walk >= Begin + 3 &&
+                    Walk[-3] == 0x49 &&
+                    Walk[-2] == 0x8B &&
+                    Walk[-1] == 0xC4)
+                {
+                    Walk -= 3;
+                    Start = Walk;
+                    Stepped += 1;
+                    continue;
+                }
+
+                break;
+            }
+        }
+
+        if (Start != NULL)
+        {
+            if (Call >= Start)
+            {
+                Distance = (ULONG)(Call - Start);
+            }
+            else
+            {
+                Distance = (ULONG)(Start - Call);
+            }
+
+            if (Best == NULL || Distance < BestDistance)
+            {
+                Best = Start;
+                BestDistance = Distance;
+            }
+        }
+
+        Cursor += 1;
+    }
+
+    return Best;
+}
+
+static NTSTATUS
+PatchGuardHookBugcheckTails(
+    _Inout_updates_(PATCH_GUARD_HOOK_PAGE_COUNT) PVOID* PageBases,
+    _Inout_updates_(PATCH_GUARD_HOOK_PAGE_COUNT) PVOID* Shadows,
+    _Inout_updates_(PATCH_GUARD_HOOK_PAGE_COUNT) UINT64* PhysicalPages,
+    _Inout_ PULONG PageCount
+    )
+{
+    static const UCHAR SdbpPrologue[] = {
+        0x48, 0x8B, 0x74, 0x24, 0x30, 0x48, 0x8B, 0x7C, 0x24, 0x28
+    };
+    static const UCHAR BugcheckCode[] = {
+        0xB9, 0x09, 0x01, 0x00, 0x00
+    };
+    IMAGE_DOS_HEADER* Dos;
+    IMAGE_NT_HEADERS64* Nt;
+    IMAGE_SECTION_HEADER* Section;
+    USHORT SectionIndex;
+    ULONG Hooked;
+
+    Dos = (IMAGE_DOS_HEADER*)g_NtosBase;
+    if (Dos->e_magic != IMAGE_DOS_SIGNATURE || Dos->e_lfanew < 0x40)
+    {
+        return STATUS_NOT_FOUND;
+    }
+
+    Nt = (IMAGE_NT_HEADERS64*)(g_NtosBase + Dos->e_lfanew);
+    Section = IMAGE_FIRST_SECTION(Nt);
+    Hooked = 0;
+    for (SectionIndex = 0;
+         SectionIndex < Nt->FileHeader.NumberOfSections &&
+         Hooked < PATCH_GUARD_BUGCHECK_TAIL_LIMIT;
+         SectionIndex++)
+    {
+        UCHAR* Text;
+        ULONG TextSize;
+        ULONG Index;
+
+        if ((Section[SectionIndex].Characteristics & IMAGE_SCN_MEM_EXECUTE) == 0)
+        {
+            continue;
+        }
+
+        TextSize = Section[SectionIndex].Misc.VirtualSize;
+        if (Section[SectionIndex].SizeOfRawData > TextSize)
+        {
+            TextSize = Section[SectionIndex].SizeOfRawData;
+        }
+
+        if (Section[SectionIndex].VirtualAddress > g_NtosSize ||
+            TextSize < 5 ||
+            TextSize > g_NtosSize - Section[SectionIndex].VirtualAddress)
+        {
+            continue;
+        }
+
+        Text = g_NtosBase + Section[SectionIndex].VirtualAddress;
+        if (PatchGuardPageResident(Text) == FALSE)
+        {
+            continue;
+        }
+
+    for (Index = 0; Index + 5 < TextSize && Hooked < PATCH_GUARD_BUGCHECK_TAIL_LIMIT; Index++)
+    {
+        UCHAR* Call;
+        UCHAR* Target;
+        INT32 Relative;
+        const IMAGE_RUNTIME_FUNCTION_ENTRY* Function;
+        const UCHAR* FunctionBegin;
+        const UCHAR* FunctionEnd;
+        const UCHAR* Epilogue;
+        const UCHAR* Look;
+        UCHAR Patch[5];
+        ULONG FunctionSize;
+        BOOLEAN SawCode;
+        NTSTATUS Status;
+
+        if (Text[Index] != 0xE8)
+        {
+            continue;
+        }
+
+        Call = Text + Index;
+        Relative = *(INT32*)(Call + 1);
+        if ((INT64)(Call - g_NtosBase) + 5 + Relative < (INT64)sizeof(SdbpPrologue) ||
+            (ULONG)((INT64)(Call - g_NtosBase) + 5 + Relative) >
+                g_NtosSize - sizeof(SdbpPrologue))
+        {
+            continue;
+        }
+
+        Target = g_NtosBase + (ULONG)((INT64)(Call - g_NtosBase) + 5 + Relative);
+        if (RtlEqualMemory(Target, SdbpPrologue, sizeof(SdbpPrologue)) == FALSE)
+        {
+            continue;
+        }
+
+        SawCode = FALSE;
+        if (Call >= Text + 32)
+        {
+            Look = Call - 32;
+        }
+        else
+        {
+            Look = Text;
+        }
+
+        while (Look + sizeof(BugcheckCode) <= Call)
+        {
+            if (RtlEqualMemory(Look, BugcheckCode, sizeof(BugcheckCode)) != FALSE)
+            {
+                SawCode = TRUE;
+                break;
+            }
+
+            Look += 1;
+        }
+
+        if (SawCode == FALSE)
+        {
+            continue;
+        }
+
+        Function = PatchGuardRuntimeFunction((ULONG)(Call - g_NtosBase));
+        if (Function == NULL ||
+            Function->EndAddress <= Function->BeginAddress ||
+            Function->EndAddress > g_NtosSize ||
+            Function->BeginAddress > g_NtosSize)
+        {
+            HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck call %p has no function.\n", Call);
+            return STATUS_NOT_FOUND;
+        }
+
+        FunctionSize = Function->EndAddress - Function->BeginAddress;
+        if (FunctionSize > PATCH_GUARD_FUNCTION_SCAN_LIMIT)
+        {
+            HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck function %p is too large.\n", Call);
+            return STATUS_NOT_FOUND;
+        }
+
+        FunctionBegin = g_NtosBase + Function->BeginAddress;
+        FunctionEnd = g_NtosBase + Function->EndAddress;
+        Epilogue = PatchGuardEpilogue(FunctionBegin, FunctionEnd, Call);
+        if (Epilogue == NULL)
+        {
+            HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck epilogue was not found at %p.\n", Call);
+            return STATUS_NOT_FOUND;
+        }
+
+        Patch[0] = 0xE9;
+        Relative = (INT32)(Epilogue - (Call + 5));
+        RtlCopyMemory(Patch + 1, &Relative, sizeof(Relative));
+        Status = PatchGuardInstallExecuteHook(Call,
+                                              Patch,
+                                              sizeof(Patch),
+                                              PageBases,
+                                              Shadows,
+                                              PhysicalPages,
+                                              PageCount);
+        if (!NT_SUCCESS(Status))
+        {
+            HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck tail hook failed at %p.\n", Call);
+            return Status;
+        }
+
+        Hooked += 1;
+        HACDBG_LOG("HacDbg: PatchGuard bugcheck tail %p returns at %p.\n", Call, Epilogue);
+        Index += 4;
+    }
+    }
+
+    if (Hooked == 0)
+    {
+        HACDBG_LOG("HacDbg: Err, PatchGuard bugcheck tail was not found.\n");
+        return STATUS_NOT_FOUND;
+    }
+
+    return STATUS_SUCCESS;
+}
+
 NTSTATUS
 PatchGuardArmBugcheckHook(
     VOID
@@ -2939,6 +3402,12 @@ PatchGuardArmBugcheckHook(
     else
     {
         HACDBG_LOG("HacDbg: PatchGuard CcBcbProfiler2 left unhooked.\n");
+    }
+
+    Status = PatchGuardHookBugcheckTails(PageBases, Shadows, PhysicalPages, &PageCount);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
     }
 
     Installed = 0;

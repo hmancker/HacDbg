@@ -34,12 +34,16 @@ NTSTATUS
  * guest, and before registering a callback that is outside the loader
  * list. Reads of the ntoskrnl page still see the original bytes. An
  * instruction fetch of KeBugCheckEx continues the original function
- * unless the bugcheck code is 0x109. A 0x109 never returns to the caller.
- * It switches to a per-processor stack, drops CR8 to PASSIVE_LEVEL, and
- * clears the active DPC. A system thread that is not an executive worker
- * is ended. Any other non-idle thread waits on an event that is never
- * signaled, so this processor returns to the dispatcher. The idle thread
- * waits in HLT with interrupts enabled. The same execute view turns
+ * unless the bugcheck code is 0x109. Calls that pass 0x109 into
+ * SdbpCheckDll are turned into a jump to that function's epilogue, so
+ * the checker returns before it clears the stack. A 0x109 that still
+ * reaches KeBugCheckEx never returns to the caller. It switches to a
+ * per-processor stack, drops CR8 to PASSIVE_LEVEL, and clears both
+ * ActiveDpc and DpcRoutineActive. A system thread that is not an
+ * executive worker, and was not interrupted by a DPC, is ended. Any
+ * other non-idle thread waits on an event that is never signaled, so
+ * this processor returns to the dispatcher. The idle thread waits in
+ * HLT with interrupts enabled. The same execute view turns
  * CcBcbProfiler and KiTimerDispatch into a return.
  *
  * @return STATUS_SUCCESS if every required hook is installed.
