@@ -484,6 +484,8 @@ SvmFreeAllProcessors(
 #endif
 
 // 睡眠前停止虚拟化，恢复后重新启动。
+// 映射映像不在加载模块表里，注册这个回调会让 PatchGuard 检查它。
+#if 0
 static VOID
 SvmPowerCallback(
     _In_ PVOID CallbackContext,
@@ -523,6 +525,7 @@ SvmPowerCallback(
         g_VirtualizationSuspended = TRUE;
     }
 }
+#endif
 
 // 完成一个成功返回的 IRP。
 static NTSTATUS
@@ -735,9 +738,6 @@ DriverEntry(
     )
 {
     NTSTATUS status;
-    UNICODE_STRING callbackName;
-    OBJECT_ATTRIBUTES callbackAttributes;
-    PCALLBACK_OBJECT callbackObject;
 
     HACDBG_LOG("HacDbg: DriverEntry start: driver version %s (%s).\n",
              HACDBG_VERSION_STRING, HACDBG_VENDOR_NAME);
@@ -831,22 +831,33 @@ DriverEntry(
 
     HypercallInitialize();
 
-    RtlInitUnicodeString(&callbackName, L"\\Callback\\PowerState");
-    InitializeObjectAttributes(&callbackAttributes, &callbackName, OBJ_CASE_INSENSITIVE, NULL, NULL);
-
-    status = ExCreateCallback(&callbackObject, &callbackAttributes, FALSE, TRUE);
-    if (!NT_SUCCESS(status))
+    //
+    // 电源回调不注册。映射映像里的回调不在加载模块表里。
+    //
+#if 0
     {
-        HACDBG_LOG("HacDbg: Err, power callback open failed: 0x%08x.\n", status);
-        HacDbgDeleteDevice();
-        HACDBG_SHARED_CLEANUP();
-        LogsCleanup();
-        HACDBG_PAGING_CLEANUP();
-        PhysicalMemoryCleanup();
-        return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_POWER, status);
-    }
+        UNICODE_STRING callbackName;
+        OBJECT_ATTRIBUTES callbackAttributes;
+        PCALLBACK_OBJECT callbackObject;
 
-    ObDereferenceObject(callbackObject);
+        RtlInitUnicodeString(&callbackName, L"\\Callback\\PowerState");
+        InitializeObjectAttributes(&callbackAttributes, &callbackName, OBJ_CASE_INSENSITIVE, NULL, NULL);
+
+        status = ExCreateCallback(&callbackObject, &callbackAttributes, FALSE, TRUE);
+        if (!NT_SUCCESS(status))
+        {
+            HACDBG_LOG("HacDbg: Err, power callback open failed: 0x%08x.\n", status);
+            HacDbgDeleteDevice();
+            HACDBG_SHARED_CLEANUP();
+            LogsCleanup();
+            HACDBG_PAGING_CLEANUP();
+            PhysicalMemoryCleanup();
+            return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_POWER, status);
+        }
+
+        ObDereferenceObject(callbackObject);
+    }
+#endif
 
     status = TraceInitialize();
     if (!NT_SUCCESS(status))
@@ -898,6 +909,7 @@ DriverEntry(
     }
 #endif
 
+#if 0
     g_PowerCallbackRegistration = ExRegisterCallback(
         callbackObject,
         (PCALLBACK_FUNCTION)(ULONG_PTR)SvmPowerCallback,
@@ -917,6 +929,7 @@ DriverEntry(
         PhysicalMemoryCleanup();
         return STATUS_UNSUCCESSFUL;
     }
+#endif
 
     g_VirtualizationSuspended = FALSE;
     HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_COMPLETE, STATUS_SUCCESS);

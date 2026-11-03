@@ -39,10 +39,10 @@
 // 是否在加载时停掉运行中的 PatchGuard。
 //   1 - 开启。进入客户前改写定时器回调，进入客户后安装 KeBugCheckEx 执行钩子。
 //   0 - 关闭。这两段都不执行，PatchGuard 按系统原样运行。
-// 映射映像仍会注册电源回调。关闭后该回调不在加载模块表里，PatchGuard 仍会检查它。
+// 电源回调当前不注册。
 //
 #ifndef HACDBG_DISABLE_PATCHGUARD
-#define HACDBG_DISABLE_PATCHGUARD 1
+#define HACDBG_DISABLE_PATCHGUARD 0
 #endif
 
 //
