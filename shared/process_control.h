@@ -26,6 +26,12 @@
 #define HACDBG_PROCESS_INJECT_APC       8u
 #define HACDBG_PROCESS_INJECT_PTE       9u
 
+//
+// HACDBG_PROCESS_QUERY_IMAGE writes the Win32 image path into Path.
+// The path comes from the process object's image name.
+//
+#define HACDBG_PROCESS_QUERY_IMAGE      10u
+
 #define HACDBG_PROCESS_FLAG_POISON 1u
 
 #define HACDBG_PPL_NONE         0u

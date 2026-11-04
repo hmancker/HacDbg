@@ -10,9 +10,9 @@
 #include <QDialog>
 #include <QMenu>
 #include <QMessageBox>
-#include <QProcess>
 
 #include <Windows.h>
+#include <shlobj.h>
 #include <TlHelp32.h>
 
 #ifndef WDA_EXCLUDEFROMCAPTURE
@@ -142,26 +142,36 @@ bool suspendProcess(std::uint32_t pid, bool resume, std::int32_t* status)
     return result >= 0;
 }
 
+bool selectImageFile(const wchar_t* path)
+{
+    PIDLIST_ABSOLUTE item = nullptr;
+    const HRESULT parsed = SHParseDisplayName(path, nullptr, &item, 0, nullptr);
+    if (FAILED(parsed) || item == nullptr)
+    {
+        return false;
+    }
+
+    const HRESULT opened = SHOpenFolderAndSelectItems(item, 0, nullptr, 0);
+    ILFree(item);
+    return SUCCEEDED(opened);
+}
+
 void openFileLocation(QWidget* parent, std::uint32_t pid)
 {
-    WCHAR path[MAX_PATH] = {};
-    DWORD size = MAX_PATH;
-    const HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-    if (process == nullptr || QueryFullProcessImageNameW(process, 0, path, &size) == FALSE)
+    wchar_t path[HACDBG_PROCESS_PATH_CHARS] = {};
+    std::int32_t status = 0;
+
+    if (processDriverImagePath(pid, path, HACDBG_PROCESS_PATH_CHARS, &status) == false)
     {
-        if (process != nullptr)
-        {
-            CloseHandle(process);
-        }
-        QMessageBox::warning(parent, QStringLiteral("打开文件位置"), QStringLiteral("读不到映像路径。"));
+        QMessageBox::warning(parent, QStringLiteral("打开文件位置"),
+                             QStringLiteral("读不到映像路径：%1").arg(statusText(status)));
         return;
     }
 
-    CloseHandle(process);
-    const QString argument = QStringLiteral("/select,\"%1\"").arg(QString::fromWCharArray(path));
-    if (QProcess::startDetached(QStringLiteral("explorer.exe"), {argument}) == false)
+    if (selectImageFile(path) == false)
     {
-        QMessageBox::warning(parent, QStringLiteral("打开文件位置"), QStringLiteral("无法打开资源管理器。"));
+        QMessageBox::warning(parent, QStringLiteral("打开文件位置"),
+                             QStringLiteral("无法在资源管理器中选中：%1").arg(QString::fromWCharArray(path)));
     }
 }
 

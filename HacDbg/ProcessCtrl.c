@@ -55,6 +55,9 @@
 #define PROCESS_CTRL_HANDLE_INTERVAL_MS 5000u
 #define PROCESS_CTRL_HANDLE_IDLE_MS 200u
 #define PROCESS_CTRL_IMAGE_CHARS 16u
+#define PROCESS_CTRL_NT_PATH_CHARS 520u
+#define PROCESS_CTRL_LINK_CHARS 128u
+#define PROCESS_CTRL_PATH_PASSES 6u
 
 typedef enum _PROCESS_CTRL_APC_ENVIRONMENT
 {
@@ -136,6 +139,8 @@ NTAPI
 RtlPcToFileHeader(PVOID PcValue, PVOID* BaseOfImage);
 
 C_ASSERT(HACDBG_HANDLE_NAME_CHARS * 2 <= HACDBG_PROCESS_PATH_CHARS);
+C_ASSERT(PROCESS_CTRL_LINK_CHARS * sizeof(WCHAR) <= 0xFFFFu);
+C_ASSERT(PROCESS_CTRL_NT_PATH_CHARS > HACDBG_PROCESS_PATH_CHARS);
 
 static BOOLEAN
 ProcessCtrlValidUser(UINT64 Value)
@@ -1976,6 +1981,351 @@ ProcessCtrlInjectApc(PEPROCESS Process, const WCHAR* Path, BOOLEAN Poison)
     return Status;
 }
 
+static BOOLEAN
+ProcessCtrlPrefixEqual(const WCHAR* Text, const WCHAR* Prefix, ULONG PrefixChars)
+{
+    ULONG Index;
+    WCHAR Left;
+    WCHAR Right;
+
+    for (Index = 0; Index < PrefixChars; Index++)
+    {
+        Left = Text[Index];
+        Right = Prefix[Index];
+        if (Left >= L'A' && Left <= L'Z')
+        {
+            Left = (WCHAR)(Left - L'A' + L'a');
+        }
+
+        if (Right >= L'A' && Right <= L'Z')
+        {
+            Right = (WCHAR)(Right - L'A' + L'a');
+        }
+
+        if (Left != Right)
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN
+ProcessCtrlStartsWith(const WCHAR* Text, ULONG Chars, const WCHAR* Prefix, ULONG* PrefixChars)
+{
+    ULONG Count;
+
+    Count = 0;
+    while (Prefix[Count] != L'\0')
+    {
+        Count++;
+    }
+
+    if (Count > Chars || ProcessCtrlPrefixEqual(Text, Prefix, Count) == FALSE)
+    {
+        return FALSE;
+    }
+
+    if (Count < Chars && Text[Count] != L'\\')
+    {
+        return FALSE;
+    }
+
+    *PrefixChars = Count;
+    return TRUE;
+}
+
+static BOOLEAN
+ProcessCtrlStripPrefix(WCHAR* Path, ULONG* Chars, const WCHAR* Prefix)
+{
+    ULONG PrefixChars;
+    ULONG Rest;
+
+    PrefixChars = 0;
+    while (Prefix[PrefixChars] != L'\0')
+    {
+        PrefixChars++;
+    }
+
+    if (*Chars < PrefixChars || ProcessCtrlPrefixEqual(Path, Prefix, PrefixChars) == FALSE)
+    {
+        return FALSE;
+    }
+
+    Rest = *Chars - PrefixChars;
+    RtlMoveMemory(Path, Path + PrefixChars, Rest * sizeof(WCHAR));
+    Path[Rest] = L'\0';
+    *Chars = Rest;
+    return TRUE;
+}
+
+static NTSTATUS
+ProcessCtrlQueryLink(const WCHAR* LinkPath, PWCHAR Target, ULONG Capacity, PUSHORT TargetChars)
+{
+    UNICODE_STRING Name;
+    OBJECT_ATTRIBUTES Attributes;
+    HANDLE Handle;
+    UNICODE_STRING Value;
+    ULONG Returned;
+    NTSTATUS Status;
+
+    if (Capacity < 2)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    RtlInitUnicodeString(&Name, LinkPath);
+    InitializeObjectAttributes(&Attributes, &Name, OBJ_KERNEL_HANDLE | OBJ_CASE_INSENSITIVE, NULL, NULL);
+    Status = ZwOpenSymbolicLinkObject(&Handle, SYMBOLIC_LINK_QUERY, &Attributes);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
+
+    Value.Buffer = Target;
+    Value.Length = 0;
+    Value.MaximumLength = (USHORT)((Capacity - 1) * sizeof(WCHAR));
+    Status = ZwQuerySymbolicLinkObject(Handle, &Value, &Returned);
+    ZwClose(Handle);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
+
+    *TargetChars = (USHORT)(Value.Length / sizeof(WCHAR));
+    Target[*TargetChars] = L'\0';
+    return STATUS_SUCCESS;
+}
+
+static NTSTATUS
+ProcessCtrlCopyDos(const WCHAR* Source, ULONG Chars, PWCHAR Dest, ULONG DestChars)
+{
+    if (Chars == 0 || Chars >= DestChars)
+    {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    RtlCopyMemory(Dest, Source, Chars * sizeof(WCHAR));
+    Dest[Chars] = L'\0';
+    return STATUS_SUCCESS;
+}
+
+static BOOLEAN
+ProcessCtrlIsDosPath(const WCHAR* Path, ULONG Chars)
+{
+    if (Chars < 3 || Path[1] != L':' || Path[2] != L'\\')
+    {
+        return FALSE;
+    }
+
+    return (Path[0] >= L'A' && Path[0] <= L'Z') || (Path[0] >= L'a' && Path[0] <= L'z');
+}
+
+static NTSTATUS
+ProcessCtrlMapDrive(const WCHAR* NtPath, ULONG NtChars, PWCHAR DosPath, ULONG DosChars)
+{
+    WCHAR Letter;
+    WCHAR Link[16];
+    WCHAR Target[PROCESS_CTRL_LINK_CHARS];
+    USHORT TargetChars;
+    NTSTATUS Status;
+    ULONG DosLength;
+
+    for (Letter = L'A'; Letter <= L'Z'; Letter++)
+    {
+        Link[0] = L'\\';
+        Link[1] = L'G';
+        Link[2] = L'L';
+        Link[3] = L'O';
+        Link[4] = L'B';
+        Link[5] = L'A';
+        Link[6] = L'L';
+        Link[7] = L'?';
+        Link[8] = L'?';
+        Link[9] = L'\\';
+        Link[10] = Letter;
+        Link[11] = L':';
+        Link[12] = L'\0';
+        Status = ProcessCtrlQueryLink(Link, Target, PROCESS_CTRL_LINK_CHARS, &TargetChars);
+        if (!NT_SUCCESS(Status) || TargetChars == 0 || NtChars <= TargetChars || NtPath[TargetChars] != L'\\')
+        {
+            continue;
+        }
+
+        if (ProcessCtrlPrefixEqual(NtPath, Target, TargetChars) == FALSE)
+        {
+            continue;
+        }
+
+        DosLength = 2 + NtChars - TargetChars;
+        if (DosLength >= DosChars)
+        {
+            return STATUS_NAME_TOO_LONG;
+        }
+
+        DosPath[0] = Letter;
+        DosPath[1] = L':';
+        RtlCopyMemory(DosPath + 2, NtPath + TargetChars, (NtChars - TargetChars) * sizeof(WCHAR));
+        DosPath[DosLength] = L'\0';
+        return STATUS_SUCCESS;
+    }
+
+    return STATUS_NOT_FOUND;
+}
+
+static NTSTATUS
+ProcessCtrlReplacePrefix(WCHAR* Path, ULONG* Chars, ULONG Capacity, ULONG PrefixChars, const WCHAR* Target,
+                         ULONG TargetChars)
+{
+    ULONG Rest;
+    ULONG NewChars;
+
+    if (PrefixChars > *Chars)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    Rest = *Chars - PrefixChars;
+    NewChars = TargetChars + Rest;
+    if (NewChars >= Capacity)
+    {
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    RtlMoveMemory(Path + TargetChars, Path + PrefixChars, Rest * sizeof(WCHAR));
+    RtlCopyMemory(Path, Target, TargetChars * sizeof(WCHAR));
+    Path[NewChars] = L'\0';
+    *Chars = NewChars;
+    return STATUS_SUCCESS;
+}
+
+static BOOLEAN
+ProcessCtrlExpandOneLink(WCHAR* Path, ULONG* Chars)
+{
+    static const WCHAR* const Links[] = {L"\\SystemRoot", L"\\Device\\BootDevice"};
+    ULONG Index;
+    ULONG PrefixChars;
+    WCHAR Target[PROCESS_CTRL_LINK_CHARS];
+    USHORT TargetChars;
+    NTSTATUS Status;
+
+    for (Index = 0; Index < sizeof(Links) / sizeof(Links[0]); Index++)
+    {
+        if (ProcessCtrlStartsWith(Path, *Chars, Links[Index], &PrefixChars) == FALSE)
+        {
+            continue;
+        }
+
+        Status = ProcessCtrlQueryLink(Links[Index], Target, PROCESS_CTRL_LINK_CHARS, &TargetChars);
+        if (!NT_SUCCESS(Status) || TargetChars == 0)
+        {
+            return FALSE;
+        }
+
+        Status = ProcessCtrlReplacePrefix(Path, Chars, PROCESS_CTRL_NT_PATH_CHARS, PrefixChars, Target, TargetChars);
+        return NT_SUCCESS(Status);
+    }
+
+    return FALSE;
+}
+
+static NTSTATUS
+ProcessCtrlNtPathToDos(WCHAR* Path, ULONG Chars, PWCHAR DosPath, ULONG DosChars)
+{
+    ULONG Pass;
+    NTSTATUS Status;
+
+    for (Pass = 0; Pass < PROCESS_CTRL_PATH_PASSES && Chars != 0; Pass++)
+    {
+        if (ProcessCtrlStripPrefix(Path, &Chars, L"\\GLOBAL??\\") != FALSE ||
+            ProcessCtrlStripPrefix(Path, &Chars, L"\\??\\") != FALSE)
+        {
+            continue;
+        }
+
+        if (ProcessCtrlIsDosPath(Path, Chars) != FALSE)
+        {
+            return ProcessCtrlCopyDos(Path, Chars, DosPath, DosChars);
+        }
+
+        Status = ProcessCtrlMapDrive(Path, Chars, DosPath, DosChars);
+        if (NT_SUCCESS(Status) || Status == STATUS_NAME_TOO_LONG)
+        {
+            return Status;
+        }
+
+        if (ProcessCtrlExpandOneLink(Path, &Chars) == FALSE)
+        {
+            break;
+        }
+    }
+
+    return STATUS_NOT_FOUND;
+}
+
+static NTSTATUS
+ProcessCtrlQueryImagePath(ULONG Pid, PWCHAR DosPath, ULONG DosChars)
+{
+    PEPROCESS Process;
+    PUNICODE_STRING ImageName;
+    WCHAR Work[PROCESS_CTRL_NT_PATH_CHARS];
+    ULONG Chars;
+    NTSTATUS Status;
+
+    if (DosPath == NULL || DosChars < 4)
+    {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    DosPath[0] = L'\0';
+    if (Pid == 0)
+    {
+        return STATUS_NOT_FOUND;
+    }
+
+    Status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)Pid, &Process);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
+
+    //
+    // SeLocateProcessImageName copies EPROCESS.SeAuditProcessCreationInfo.
+    // The string is the image's NT path, not the 15-character ImageFileName.
+    //
+    ImageName = NULL;
+    Status = SeLocateProcessImageName(Process, &ImageName);
+    ObDereferenceObject(Process);
+    if (!NT_SUCCESS(Status))
+    {
+        return Status;
+    }
+
+    if (ImageName == NULL || ImageName->Buffer == NULL || ImageName->Length < sizeof(WCHAR) ||
+        (ImageName->Length & 1u) != 0)
+    {
+        if (ImageName != NULL)
+        {
+            ExFreePool(ImageName);
+        }
+
+        return STATUS_NOT_FOUND;
+    }
+
+    Chars = ImageName->Length / sizeof(WCHAR);
+    if (Chars >= PROCESS_CTRL_NT_PATH_CHARS)
+    {
+        ExFreePool(ImageName);
+        return STATUS_NAME_TOO_LONG;
+    }
+
+    RtlCopyMemory(Work, ImageName->Buffer, ImageName->Length);
+    Work[Chars] = L'\0';
+    ExFreePool(ImageName);
+    return ProcessCtrlNtPathToDos(Work, Chars, DosPath, DosChars);
+}
+
 NTSTATUS
 ProcessCtrlExecute(
     _Inout_ HACDBG_PROCESS_REQUEST* Request
@@ -2034,6 +2384,10 @@ ProcessCtrlExecute(
                 ObDereferenceObject(Process);
             }
         }
+        break;
+    case HACDBG_PROCESS_QUERY_IMAGE:
+        RtlZeroMemory(Request->Path, sizeof(Request->Path));
+        Status = ProcessCtrlQueryImagePath(Request->Pid, (WCHAR*)Request->Path, HACDBG_PROCESS_PATH_CHARS);
         break;
     default:
         Status = STATUS_INVALID_PARAMETER;

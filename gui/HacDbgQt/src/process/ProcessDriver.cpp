@@ -54,6 +54,56 @@ bool processDriverCall(std::uint32_t operation, std::uint32_t pid, std::uint32_t
     return request.Status >= 0;
 }
 
+bool processDriverImagePath(std::uint32_t pid, wchar_t* path, std::uint32_t pathChars, std::int32_t* status)
+{
+    HACDBG_PROCESS_REQUEST request = {};
+    DWORD returned = 0;
+    HANDLE device;
+
+    if (path == nullptr || pathChars == 0)
+    {
+        return false;
+    }
+
+    path[0] = L'\0';
+    request.Operation = HACDBG_PROCESS_QUERY_IMAGE;
+    request.Pid = pid;
+    device = CreateFileW(HACDBG_PROCESS_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (device == INVALID_HANDLE_VALUE)
+    {
+        if (status != nullptr)
+        {
+            *status = static_cast<std::int32_t>(GetLastError());
+        }
+        return false;
+    }
+
+    const BOOL ok = DeviceIoControl(device, HACDBG_PROCESS_IOCTL, &request, sizeof(request), &request, sizeof(request),
+                                    &returned, nullptr);
+    CloseHandle(device);
+    if (ok == FALSE)
+    {
+        if (status != nullptr)
+        {
+            *status = static_cast<std::int32_t>(GetLastError());
+        }
+        return false;
+    }
+
+    if (status != nullptr)
+    {
+        *status = request.Status;
+    }
+    if (request.Status < 0)
+    {
+        return false;
+    }
+
+    wcsncpy_s(path, pathChars, reinterpret_cast<const wchar_t*>(request.Path), _TRUNCATE);
+    return path[0] != L'\0';
+}
+
 bool processDriverHandleCall(std::uint32_t parameter, std::uint32_t pid, const wchar_t* actor, const wchar_t* victim,
                              std::int32_t* status)
 {
