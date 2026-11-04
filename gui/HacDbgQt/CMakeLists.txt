@@ -32,6 +32,15 @@ set(HACDBG_QT_SOURCES
     src/SymbolView.h
     src/ProcessThreadView.cpp
     src/ProcessThreadView.h
+    src/process/ProcessRecord.h
+    src/process/ProcessDriver.cpp
+    src/process/ProcessDriver.h
+    src/process/ProcessActions.cpp
+    src/process/ProcessActions.h
+    src/process/InjectDialog.cpp
+    src/process/InjectDialog.h
+    src/process/HandleDialog.cpp
+    src/process/HandleDialog.h
     src/TraceWindow.cpp
     src/TraceWindow.h
     src/MainWindow.cpp
@@ -63,7 +72,7 @@ if(MSVC)
         /external:anglebrackets)
 endif()
 
-target_link_libraries(HacDbgQt PRIVATE Qt6::Widgets advapi32)
+target_link_libraries(HacDbgQt PRIVATE Qt6::Widgets advapi32 user32 shell32)
 
 if(MSVC)
     target_link_options(HacDbgQt PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")

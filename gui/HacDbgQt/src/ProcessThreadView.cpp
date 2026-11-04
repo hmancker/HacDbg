@@ -1,6 +1,7 @@
 #include "ProcessThreadView.h"
 
 #include "Format.h"
+#include "process/ProcessActions.h"
 
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -84,6 +85,7 @@ ProcessThreadView::ProcessThreadView(QWidget* parent)
     m_processModel->setHorizontalHeaderLabels(
         {QStringLiteral("PID"), QStringLiteral("映像"), QStringLiteral("父 PID"), QStringLiteral("EPROCESS"), QStringLiteral("CR3")});
     m_processes->setModel(m_processModel);
+    m_processes->setContextMenuPolicy(Qt::CustomContextMenu);
     processLayout->addWidget(m_processes, 1);
 
     auto* threadPane = new QWidget(split);
@@ -115,6 +117,24 @@ ProcessThreadView::ProcessThreadView(QWidget* parent)
     connect(refresh, &QPushButton::clicked, this, &ProcessThreadView::refresh);
     connect(m_processFilter, &QLineEdit::textChanged, this, &ProcessThreadView::showProcesses);
     connect(m_threadFilter, &QLineEdit::textChanged, this, &ProcessThreadView::showThreads);
+    connect(m_processes, &QWidget::customContextMenuRequested, this, [this](const QPoint& point) {
+        const QModelIndex index = m_processes->indexAt(point);
+        if (index.isValid() == false || index.row() < 0 ||
+            index.row() >= static_cast<int>(m_visibleProcesses.size()))
+        {
+            return;
+        }
+
+        const ProcessItem& item = m_visibleProcesses[static_cast<std::size_t>(index.row())];
+        ProcessRecord record;
+        record.eprocess = item.eprocess;
+        record.pid = item.pid;
+        record.parentPid = item.parentPid;
+        record.cr3 = item.cr3;
+        record.image = item.image;
+        showProcessMenu(this, record, [this]() { emit dumpRequested(); });
+        this->refresh();
+    });
     connect(m_processes->selectionModel(), &QItemSelectionModel::currentRowChanged, this,
             [this](const QModelIndex& current, const QModelIndex&)
             {

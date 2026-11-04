@@ -13,6 +13,7 @@
 #include "PhysicalMemory.h"
 #include "Trace.h"
 #include "PatchGuard.h"
+#include "ProcessCtrl.h"
 #include "Debug.h"
 #include "../shared/hypercall/control.h"
 #if HACDBG_BACKEND_INTEL
@@ -594,6 +595,7 @@ HacDbgDeviceControl(
 
     inputLength = stack->Parameters.DeviceIoControl.InputBufferLength;
     outputLength = stack->Parameters.DeviceIoControl.OutputBufferLength;
+    Irp->IoStatus.Information = 0;
 
     token = PsReferencePrimaryToken(PsGetCurrentProcess());
     if (token == NULL)
@@ -612,6 +614,14 @@ HacDbgDeviceControl(
                  stack->Parameters.DeviceIoControl.IoControlCode);
         status = STATUS_ACCESS_DENIED;
     }
+    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_PROCESS &&
+             inputLength >= sizeof(HACDBG_PROCESS_REQUEST) &&
+             outputLength >= sizeof(HACDBG_PROCESS_REQUEST))
+    {
+        ProcessCtrlExecute((HACDBG_PROCESS_REQUEST*)Irp->AssociatedIrp.SystemBuffer);
+        status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = sizeof(HACDBG_PROCESS_REQUEST);
+    }
     else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FLUSH_SLAT ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_HYPERCALL ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_QUERY_VERSION)
@@ -628,7 +638,6 @@ HacDbgDeviceControl(
     }
 
     Irp->IoStatus.Status = status;
-    Irp->IoStatus.Information = 0;
     IoCompleteRequest(Irp, IO_NO_INCREMENT);
     return status;
 }
@@ -708,6 +717,7 @@ DriverUnload(
     UNREFERENCED_PARAMETER(DriverObject);
 
     HACDBG_LOG("HacDbg: DriverUnload start.\n");
+    ProcessCtrlCleanup();
 
     if (g_PowerCallbackRegistration != NULL)
     {

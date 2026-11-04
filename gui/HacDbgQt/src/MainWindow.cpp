@@ -583,6 +583,7 @@ void MainWindow::ensurePage(int index)
         m_processes->setSession(&m_session);
         holder(index)->layout()->addWidget(m_processes);
         connect(m_processes, &ProcessThreadView::addressActivated, this, &MainWindow::openDisassembly);
+        connect(m_processes, &ProcessThreadView::dumpRequested, this, &MainWindow::openDumper);
         m_processes->refresh();
     }
 }

@@ -45,6 +45,9 @@
     <ClCompile Include="PhysicalMemory.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="ProcessCtrl.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Svm.c">
       <Filter>Source Files</Filter>
     </ClCompile>

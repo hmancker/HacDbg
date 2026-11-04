@@ -65,6 +65,15 @@
     <None Include="src\SymbolView.h" />
     <None Include="src\ProcessThreadView.cpp" />
     <None Include="src\ProcessThreadView.h" />
+    <None Include="src\process\ProcessRecord.h" />
+    <None Include="src\process\ProcessDriver.cpp" />
+    <None Include="src\process\ProcessDriver.h" />
+    <None Include="src\process\ProcessActions.cpp" />
+    <None Include="src\process\ProcessActions.h" />
+    <None Include="src\process\InjectDialog.cpp" />
+    <None Include="src\process\InjectDialog.h" />
+    <None Include="src\process\HandleDialog.cpp" />
+    <None Include="src\process\HandleDialog.h" />
     <None Include="src\TraceWindow.cpp" />
     <None Include="src\TraceWindow.h" />
     <None Include="src\MainWindow.cpp" />
