@@ -32,6 +32,12 @@ set(HACDBG_QT_SOURCES
     src/SymbolView.h
     src/ProcessThreadView.cpp
     src/ProcessThreadView.h
+    src/WindowProtectView.cpp
+    src/WindowProtectView.h
+    src/window/WindowAffinity.cpp
+    src/window/WindowAffinity.h
+    src/window/WindowDriver.cpp
+    src/window/WindowDriver.h
     src/process/ProcessRecord.h
     src/process/ProcessDriver.cpp
     src/process/ProcessDriver.h

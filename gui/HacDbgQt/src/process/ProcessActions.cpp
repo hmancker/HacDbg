@@ -15,10 +15,6 @@
 #include <shlobj.h>
 #include <TlHelp32.h>
 
-#ifndef WDA_EXCLUDEFROMCAPTURE
-#define WDA_EXCLUDEFROMCAPTURE 0x00000011
-#endif
-
 namespace
 {
 using NtProcess = LONG(NTAPI*)(HANDLE);
@@ -175,36 +171,6 @@ void openFileLocation(QWidget* parent, std::uint32_t pid)
     }
 }
 
-struct WindowEnumContext
-{
-    DWORD pid;
-    int changed;
-};
-
-BOOL CALLBACK protectOneWindow(HWND window, LPARAM parameter)
-{
-    auto* found = reinterpret_cast<WindowEnumContext*>(parameter);
-    DWORD owner = 0;
-    GetWindowThreadProcessId(window, &owner);
-    if (owner == found->pid && SetWindowDisplayAffinity(window, WDA_EXCLUDEFROMCAPTURE) != FALSE)
-    {
-        found->changed++;
-    }
-    return TRUE;
-}
-
-void protectWindows(QWidget* parent, std::uint32_t pid)
-{
-    WindowEnumContext context{pid, 0};
-
-    EnumWindows(protectOneWindow, reinterpret_cast<LPARAM>(&context));
-
-    if (context.changed == 0)
-    {
-        QMessageBox::warning(parent, QStringLiteral("窗口保护"), QStringLiteral("没有可排除截图的顶层窗口。"));
-    }
-}
-
 void injectDll(QWidget* parent, const ProcessRecord& record)
 {
     InjectDialog dialog(record.pid, parent);
@@ -257,7 +223,8 @@ void handleAction(QWidget* parent, const ProcessRecord& record, bool upgrade)
 }
 }
 
-void showProcessMenu(QWidget* parent, const ProcessRecord& record, const std::function<void()>& dumpRequested)
+void showProcessMenu(QWidget* parent, const ProcessRecord& record, const std::function<void()>& dumpRequested,
+                     const std::function<void(std::uint32_t)>& protectRequested)
 {
     QMenu menu(parent);
     QMenu* state = menu.addMenu(QStringLiteral("设置状态"));
@@ -333,7 +300,10 @@ void showProcessMenu(QWidget* parent, const ProcessRecord& record, const std::fu
     }
     else if (chosen == window)
     {
-        protectWindows(parent, pid);
+        if (protectRequested)
+        {
+            protectRequested(pid);
+        }
     }
     else if (chosen == handleDown || chosen == handleUp)
     {

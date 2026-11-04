@@ -26,6 +26,7 @@ public:
 signals:
     void addressActivated(quint64 address, quint64 cr3);
     void dumpRequested();
+    void windowProtectRequested(quint32 pid);
 
 private:
     struct ProcessItem

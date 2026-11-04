@@ -132,7 +132,8 @@ ProcessThreadView::ProcessThreadView(QWidget* parent)
         record.parentPid = item.parentPid;
         record.cr3 = item.cr3;
         record.image = item.image;
-        showProcessMenu(this, record, [this]() { emit dumpRequested(); });
+        showProcessMenu(this, record, [this]() { emit dumpRequested(); },
+                        [this](std::uint32_t pid) { emit windowProtectRequested(pid); });
         this->refresh();
     });
     connect(m_processes->selectionModel(), &QItemSelectionModel::currentRowChanged, this,

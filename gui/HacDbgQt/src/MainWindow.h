@@ -11,6 +11,7 @@ class CommandView;
 class MonitorView;
 class CpuView;
 class ProcessThreadView;
+class WindowProtectView;
 class QLabel;
 class QShowEvent;
 class QStackedWidget;
@@ -42,7 +43,8 @@ private:
         PageBreakpoints,
         PageMonitors,
         PageSymbols,
-        PageProcesses
+        PageProcesses,
+        PageWindows
     };
 
     void startCore();
@@ -60,6 +62,7 @@ private:
     void onTabChanged(int index);
     void ensurePage(int index);
     void openDisassembly(std::uint64_t address, std::uint64_t cr3);
+    void openWindowProtect(std::uint32_t pid);
     void refreshVisiblePage();
     QWidget* holder(int index);
     static bool isAdministrator();
@@ -72,10 +75,12 @@ private:
     MonitorView* m_monitors = nullptr;
     SymbolView* m_symbols = nullptr;
     ProcessThreadView* m_processes = nullptr;
+    WindowProtectView* m_windows = nullptr;
     TraceWindow* m_trace = nullptr;
     QTabBar* m_tabs = nullptr;
     QStackedWidget* m_stack = nullptr;
-    QWidget* m_holders[6] = {};
+    QWidget* m_holders[7] = {};
+    std::uint32_t m_windowProtectPid = 0;
     QTimer* m_timer = nullptr;
     QTimer* m_connectRetry = nullptr;
     QTimer* m_debugIdle = nullptr;

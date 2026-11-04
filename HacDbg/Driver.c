@@ -14,6 +14,7 @@
 #include "Trace.h"
 #include "PatchGuard.h"
 #include "ProcessCtrl.h"
+#include "WindowProtect.h"
 #include "Debug.h"
 #include "../shared/hypercall/control.h"
 #if HACDBG_BACKEND_INTEL
@@ -622,6 +623,14 @@ HacDbgDeviceControl(
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = sizeof(HACDBG_PROCESS_REQUEST);
     }
+    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_WINDOW &&
+             inputLength >= sizeof(HACDBG_WINDOW_REQUEST) &&
+             outputLength >= sizeof(HACDBG_WINDOW_REQUEST))
+    {
+        WindowProtectExecute((HACDBG_WINDOW_REQUEST*)Irp->AssociatedIrp.SystemBuffer);
+        status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = sizeof(HACDBG_WINDOW_REQUEST);
+    }
     else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FLUSH_SLAT ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_HYPERCALL ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_QUERY_VERSION)
@@ -717,6 +726,7 @@ DriverUnload(
     UNREFERENCED_PARAMETER(DriverObject);
 
     HACDBG_LOG("HacDbg: DriverUnload start.\n");
+    WindowProtectCleanup();
     ProcessCtrlCleanup();
 
     if (g_PowerCallbackRegistration != NULL)

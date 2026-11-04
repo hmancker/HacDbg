@@ -7,6 +7,7 @@
 #include "Format.h"
 #include "ProcessThreadView.h"
 #include "SymbolView.h"
+#include "WindowProtectView.h"
 #include "TraceWindow.h"
 
 #include <QAction>
@@ -200,6 +201,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogInfoView), QStringLiteral("监控"));
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogContentsView), QStringLiteral("符号"));
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogListView), QStringLiteral("进程/线程"));
+    m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_MessageBoxWarning), QStringLiteral("窗口保护"));
 
     m_stack = new QStackedWidget(central);
     m_command = new CommandView(m_stack);
@@ -210,7 +212,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     }
     m_stack->addWidget(m_command);
 
-    for (int index = PageDisassembly; index <= PageProcesses; ++index)
+    for (int index = PageDisassembly; index <= PageWindows; ++index)
     {
         m_holders[index] = new QWidget(m_stack);
         auto* holderLayout = new QVBoxLayout(m_holders[index]);
@@ -533,10 +535,29 @@ void MainWindow::tick()
     m_command->pollCompletions(&m_session);
 }
 
+void MainWindow::openWindowProtect(std::uint32_t pid)
+{
+    m_windowProtectPid = pid;
+    if (m_tabs->currentIndex() == PageWindows)
+    {
+        onTabChanged(PageWindows);
+        return;
+    }
+
+    m_tabs->setCurrentIndex(PageWindows);
+}
+
 void MainWindow::onTabChanged(int index)
 {
     ensurePage(index);
     m_stack->setCurrentIndex(index);
+    if (index == PageWindows && m_windows != nullptr && m_windowProtectPid != 0)
+    {
+        const std::uint32_t pid = m_windowProtectPid;
+        m_windowProtectPid = 0;
+        m_windows->protectProcess(pid);
+    }
+
     refreshVisiblePage();
 
     if (index == PageCommand)
@@ -584,7 +605,17 @@ void MainWindow::ensurePage(int index)
         holder(index)->layout()->addWidget(m_processes);
         connect(m_processes, &ProcessThreadView::addressActivated, this, &MainWindow::openDisassembly);
         connect(m_processes, &ProcessThreadView::dumpRequested, this, &MainWindow::openDumper);
+        connect(m_processes, &ProcessThreadView::windowProtectRequested, this, &MainWindow::openWindowProtect);
         m_processes->refresh();
+    }
+    else if (index == PageWindows && m_windows == nullptr)
+    {
+        m_windows = new WindowProtectView(holder(index));
+        holder(index)->layout()->addWidget(m_windows);
+        if (m_windowProtectPid == 0)
+        {
+            m_windows->refresh();
+        }
     }
 }
 
