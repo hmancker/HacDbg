@@ -79,7 +79,29 @@
 #define INJECT_ERROR_BAD_EXE_FORMAT 193u
 #define INJECT_ERROR_DLL_INIT_FAILED 1114u
 #define INJECT_STACK_BYTES 0x100000u
+#define INJECT_STUB_BYTES 192u
+#define INJECT_KTHREAD_TRAP_FRAME 0x90u
+#define INJECT_TRAP_RAX 0x30u
+#define INJECT_TRAP_RCX 0x38u
+#define INJECT_TRAP_RDX 0x40u
+#define INJECT_TRAP_R8 0x48u
+#define INJECT_TRAP_R9 0x50u
+#define INJECT_TRAP_R10 0x58u
+#define INJECT_TRAP_R11 0x60u
+#define INJECT_TRAP_RBX 0x140u
+#define INJECT_TRAP_RDI 0x148u
+#define INJECT_TRAP_RSI 0x150u
+#define INJECT_TRAP_RBP 0x158u
+#define INJECT_TRAP_RIP 0x168u
+#define INJECT_TRAP_SEG_CS 0x170u
+#define INJECT_TRAP_EFLAGS 0x178u
+#define INJECT_TRAP_RSP 0x180u
+#define INJECT_USER_CS 0x33u
+#define INJECT_USER_SS 0x2Bu
 #define INJECT_USER_EFLAGS 0x202u
+#define INJECT_STATUS_ALERTED 0x101u
+#define INJECT_KTHREAD_THREAD_FLAGS 0x78u
+#define INJECT_ALERTED_BY_THREAD_ID 4u
 
 typedef NTSTATUS(NTAPI* INJECT_GET_NEXT_THREAD)(HANDLE ProcessHandle, HANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
                                                 ULONG HandleAttributes, ULONG Flags, PHANDLE NewThreadHandle);
@@ -1332,6 +1354,7 @@ InjectSuspendOne(
 }
 
 C_ASSERT(sizeof(CONTEXT) <= 0x800);
+C_ASSERT(INJECT_EXTRA_PAGES >= 3);
 C_ASSERT(FIELD_OFFSET(INJECT_LOAD_RESULT, LastError) == 4);
 C_ASSERT(FIELD_OFFSET(INJECT_LOAD_RESULT, Module) == 8);
 
@@ -2615,90 +2638,83 @@ InjectPageNonZero(
 }
 
 static VOID
-InjectWriteStub(
-    _Out_writes_(64) UCHAR* Stub,
-    _In_ UINT64 ImageBase,
-    _In_ UINT64 Entry,
-    _In_ UINT64 ExitThread
+InjectStoreReg(
+    _Inout_ UCHAR** Cursor,
+    _In_ UCHAR Rex,
+    _In_ UCHAR ModRm,
+    _In_ ULONG Offset
     )
 {
-    RtlZeroMemory(Stub, 64);
-    Stub[0] = 0x48;
-    Stub[1] = 0x83;
-    Stub[2] = 0xEC;
-    Stub[3] = 0x28;
-    Stub[4] = 0x48;
-    Stub[5] = 0xB9;
-    RtlCopyMemory(Stub + 6, &ImageBase, sizeof(ImageBase));
-    Stub[14] = 0xBA;
-    Stub[15] = 0x01;
-    Stub[19] = 0x45;
-    Stub[20] = 0x33;
-    Stub[21] = 0xC0;
-    Stub[22] = 0x48;
-    Stub[23] = 0xB8;
-    RtlCopyMemory(Stub + 24, &Entry, sizeof(Entry));
-    Stub[32] = 0xFF;
-    Stub[33] = 0xD0;
-    Stub[34] = 0x33;
-    Stub[35] = 0xC9;
-    Stub[36] = 0x48;
-    Stub[37] = 0xB8;
-    RtlCopyMemory(Stub + 38, &ExitThread, sizeof(ExitThread));
-    Stub[46] = 0xFF;
-    Stub[47] = 0xD0;
-    Stub[48] = 0xCC;
+    UCHAR* Out;
+
+    Out = *Cursor;
+    *Out++ = Rex;
+    *Out++ = 0x89;
+    *Out++ = ModRm;
+    RtlCopyMemory(Out, &Offset, sizeof(Offset));
+    *Cursor = Out + sizeof(Offset);
 }
 
-static NTSTATUS
-InjectMarkCallTarget(
-    _In_ PVOID SetVmRoutine,
-    _In_ PVOID Address
+static VOID
+InjectWriteStub(
+    _Out_writes_(INJECT_STUB_BYTES) UCHAR* Stub,
+    _In_ UINT64 ImageBase,
+    _In_ UINT64 Entry,
+    _In_ UINT64 NtContinue,
+    _In_ UINT64 Context
     )
 {
-    typedef struct _INJECT_MEMORY_RANGE
-    {
-        PVOID Address;
-        SIZE_T Bytes;
-    } INJECT_MEMORY_RANGE;
-    typedef struct _INJECT_CFG_TARGET
-    {
-        ULONG_PTR Offset;
-        ULONG_PTR Flags;
-    } INJECT_CFG_TARGET;
-    typedef struct _INJECT_CFG_INFORMATION
-    {
-        ULONG NumberOfEntries;
-        ULONG Reserved;
-        ULONG* Output;
-        INJECT_CFG_TARGET* Targets;
-        ULONG_PTR Unused0;
-        ULONG_PTR Unused1;
-    } INJECT_CFG_INFORMATION;
-    typedef NTSTATUS(NTAPI* INJECT_SET_VM)(HANDLE ProcessHandle, ULONG InformationClass, ULONG_PTR NumberOfEntries,
-                                           PVOID VirtualAddresses, PVOID VmInformation, ULONG VmInformationLength);
-    INJECT_SET_VM SetVm;
-    INJECT_MEMORY_RANGE Range;
-    INJECT_CFG_TARGET Target;
-    INJECT_CFG_INFORMATION Information;
-    ULONG Output;
+    UCHAR* Cursor;
 
-    SetVm = (INJECT_SET_VM)SetVmRoutine;
-    if (SetVm == NULL || Address == NULL)
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    Range.Address = Address;
-    Range.Bytes = PAGE_SIZE;
-    Target.Offset = 0;
-    Target.Flags = 1;
-    Output = 0;
-    RtlZeroMemory(&Information, sizeof(Information));
-    Information.NumberOfEntries = 1;
-    Information.Output = &Output;
-    Information.Targets = &Target;
-    return SetVm(ZwCurrentProcess(), 2, 1, &Range, &Information, sizeof(Information));
+    RtlZeroMemory(Stub, INJECT_STUB_BYTES);
+    Cursor = Stub;
+    *Cursor++ = 0x48;
+    *Cursor++ = 0x83;
+    *Cursor++ = 0xEC;
+    *Cursor++ = 0x28;
+    *Cursor++ = 0x48;
+    *Cursor++ = 0xB8;
+    RtlCopyMemory(Cursor, &Context, sizeof(Context));
+    Cursor += sizeof(Context);
+    InjectStoreReg(&Cursor, 0x48, 0x98, 0x90);
+    InjectStoreReg(&Cursor, 0x48, 0xA8, 0xA0);
+    InjectStoreReg(&Cursor, 0x48, 0xB0, 0xA8);
+    InjectStoreReg(&Cursor, 0x48, 0xB8, 0xB0);
+    InjectStoreReg(&Cursor, 0x4C, 0xA0, 0xD8);
+    InjectStoreReg(&Cursor, 0x4C, 0xA8, 0xE0);
+    InjectStoreReg(&Cursor, 0x4C, 0xB0, 0xE8);
+    InjectStoreReg(&Cursor, 0x4C, 0xB8, 0xF0);
+    *Cursor++ = 0x48;
+    *Cursor++ = 0xB9;
+    RtlCopyMemory(Cursor, &ImageBase, sizeof(ImageBase));
+    Cursor += sizeof(ImageBase);
+    *Cursor++ = 0xBA;
+    *Cursor++ = 0x01;
+    *Cursor++ = 0x00;
+    *Cursor++ = 0x00;
+    *Cursor++ = 0x00;
+    *Cursor++ = 0x45;
+    *Cursor++ = 0x33;
+    *Cursor++ = 0xC0;
+    *Cursor++ = 0x48;
+    *Cursor++ = 0xB8;
+    RtlCopyMemory(Cursor, &Entry, sizeof(Entry));
+    Cursor += sizeof(Entry);
+    *Cursor++ = 0xFF;
+    *Cursor++ = 0xD0;
+    *Cursor++ = 0x48;
+    *Cursor++ = 0xB9;
+    RtlCopyMemory(Cursor, &Context, sizeof(Context));
+    Cursor += sizeof(Context);
+    *Cursor++ = 0x33;
+    *Cursor++ = 0xD2;
+    *Cursor++ = 0x48;
+    *Cursor++ = 0xB8;
+    RtlCopyMemory(Cursor, &NtContinue, sizeof(NtContinue));
+    Cursor += sizeof(NtContinue);
+    *Cursor++ = 0xFF;
+    *Cursor++ = 0xE0;
+    *Cursor++ = 0xCC;
 }
 
 #define INJECT_SLAT_SLOTS 8u
@@ -2777,6 +2793,9 @@ InjectSlatAllow(
             g_SlatSlots[index].UserCr3 = UserCr3;
             g_SlatArmed = 1;
             KeMemoryBarrier();
+            HACDBG_LOG("HacDbg: DLL inject slat thread already allowed tid=%llu kernel=0x%I64x user=0x%I64x.\n",
+                       (UINT64)(ULONG_PTR)PsGetThreadId(Thread), KernelCr3 & INJECT_SLAT_CR3_MASK,
+                       UserCr3 & INJECT_SLAT_CR3_MASK);
             return TRUE;
         }
 
@@ -2852,184 +2871,132 @@ InjectSlatCr3Private(
 static NTSTATUS
 InjectStartEntry(
     _In_ PEPROCESS Process,
-    _In_ UINT64 StubVa
+    _In_ UINT64 StubVa,
+    _In_ PVOID ContextHost
     )
 {
-    INJECT_CREATE_THREAD Create;
-    INJECT_QUERY_THREAD Query;
-    PVOID SetVm;
-    INJECT_THREAD_BASIC Info;
-    KAPC_STATE State;
     HANDLE ThreadHandle;
-    CLIENT_ID ClientId;
-    PVOID Gate;
-    UCHAR GateBytes[16];
-    UINT64 Rip;
+    PETHREAD Thread;
+    CONTEXT* Captured;
+    PUCHAR Trap;
+    UINT64 OldRip;
     NTSTATUS Status;
-    NTSTATUS ExitStatus;
-    LARGE_INTEGER Delay;
+    ULONG PreviousSuspend;
+    BOOLEAN Kept;
+    USHORT Cs;
 
-    Create = (INJECT_CREATE_THREAD)InjectRoutine(L"RtlCreateUserThread");
-    Query = (INJECT_QUERY_THREAD)InjectRoutine(L"ZwQueryInformationThread");
-    SetVm = InjectRoutine(L"ZwSetInformationVirtualMemory");
-    if (Create == NULL || Query == NULL || SetVm == NULL || StubVa < 0x10000ull || StubVa > 0x00007FFFFFFFFFFFull)
+    PreviousSuspend = 0;
+    if (ContextHost == NULL || StubVa < 0x10000ull || StubVa > 0x00007FFFFFFFFFFFull)
     {
         return STATUS_NOT_SUPPORTED;
     }
 
-    //
-    // A thread created suspended has no trap frame yet. PsGetContextThread
-    // returns STATUS_UNSUCCESSFUL (0xc0000001) until that thread has run.
-    // The page-table stub also has no VAD, so it cannot be marked as a CFG
-    // call target. This gate is an ordinary executable allocation. The new
-    // thread starts there, on the stack RtlCreateUserThread committed, and
-    // the gate jumps to the stub.
-    //
-    Gate = NULL;
-    Status = InjectAllocUser(Process, PAGE_SIZE, PAGE_EXECUTE_READWRITE, &Gate);
+    Status = InjectSuspendOne(Process, &ThreadHandle, &Thread);
     if (!NT_SUCCESS(Status))
     {
-        HACDBG_LOG("HacDbg: Err, DLL inject gate alloc status=0x%08x stub=0x%I64x.\n", Status, StubVa);
+        HACDBG_LOG("HacDbg: Err, DLL inject found no thread to hijack: 0x%08x.\n", Status);
         return Status;
     }
 
-    RtlZeroMemory(GateBytes, sizeof(GateBytes));
-    GateBytes[0] = 0x48;
-    GateBytes[1] = 0xB8;
-    RtlCopyMemory(GateBytes + 2, &StubVa, sizeof(StubVa));
-    GateBytes[10] = 0xFF;
-    GateBytes[11] = 0xE0;
-    Status = InjectCopyUser(Process, Gate, GateBytes, sizeof(GateBytes));
-    if (!NT_SUCCESS(Status))
+    Captured = (CONTEXT*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(CONTEXT), INJECT_TAG);
+    if (Captured == NULL)
     {
-        HACDBG_LOG("HacDbg: Err, DLL inject gate copy status=0x%08x gate=0x%p.\n", Status, Gate);
-        return Status;
-    }
-
-    ThreadHandle = NULL;
-    RtlZeroMemory(&ClientId, sizeof(ClientId));
-    Rip = StubVa;
-    KeStackAttachProcess(Process, &State);
-    //
-    // INVARIANT: This processor is attached to the target. SMAP is on, so AC
-    // must be set before any kernel routine reads that process's user memory.
-    // MmGetSystemRoutineAddress was already called above. Calling it here
-    // reaches RtlpIsUtf8Process, which reads the PEB and bugchecks 0x50.
-    //
-    if ((__readcr4() & (1ull << 21)) != 0)
-    {
-        _stac();
-    }
-
-    __try
-    {
-        Status = InjectMarkCallTarget(SetVm, Gate);
-        if (!NT_SUCCESS(Status))
-        {
-            HACDBG_LOG("HacDbg: Err, DLL inject cfg mark status=0x%08x gate=0x%p stub=0x%I64x.\n", Status, Gate, Rip);
-        }
-        else
-        {
-            Status = Create(ZwCurrentProcess(), NULL, TRUE, 0, INJECT_STACK_BYTES, PAGE_SIZE, Gate, NULL,
-                            &ThreadHandle, &ClientId);
-        }
-    }
-    __finally
-    {
-        if ((__readcr4() & (1ull << 21)) != 0)
-        {
-            _clac();
-        }
-    }
-
-    if (!NT_SUCCESS(Status))
-    {
-        KeUnstackDetachProcess(&State);
-        if (ThreadHandle == NULL)
-        {
-            return Status;
-        }
-
-        HACDBG_LOG("HacDbg: Err, DLL inject start thread status=0x%08x gate=0x%p stub=0x%I64x.\n", Status, Gate, Rip);
-        return Status;
-    }
-
-    if (ThreadHandle != NULL)
-    {
-        PETHREAD threadObject = NULL;
-        BOOLEAN kept = FALSE;
-        ULONG previous = 0;
-
-        if (NT_SUCCESS(ObReferenceObjectByHandle(ThreadHandle, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
-                                                 (PVOID*)&threadObject, NULL)))
-        {
-            UINT64 kernelCr3 = InjectDirectory(Process, INJECT_DIR_TABLE);
-            UINT64 userCr3 = InjectUsableUserDirectory(Process, kernelCr3);
-
-            if (InjectSlatAllow(threadObject, kernelCr3, userCr3, &kept) == FALSE || kept == FALSE)
-            {
-                ObDereferenceObject(threadObject);
-                kept = FALSE;
-            }
-        }
-
-        if (kept == FALSE)
-        {
-            ZwClose(ThreadHandle);
-            KeUnstackDetachProcess(&State);
-            HACDBG_LOG("HacDbg: Err, DLL inject slat allow failed stub=0x%I64x.\n", Rip);
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        //
-        // The thread is still suspended. Arm CR3 exiting on every processor
-        // before it runs, or it executes on the main root and reads a zero
-        // import table.
-        //
-        if (InjectFlush() == FALSE)
-        {
-            ZwClose(ThreadHandle);
-            KeUnstackDetachProcess(&State);
-            HACDBG_LOG("HacDbg: Err, DLL inject slat flush failed stub=0x%I64x.\n", Rip);
-            return STATUS_UNSUCCESSFUL;
-        }
-
-        Status = ZwResumeThread(ThreadHandle, &previous);
-        if (!NT_SUCCESS(Status))
-        {
-            ZwClose(ThreadHandle);
-            KeUnstackDetachProcess(&State);
-            HACDBG_LOG("HacDbg: Err, DLL inject resume status=0x%08x stub=0x%I64x.\n", Status, Rip);
-            return Status;
-        }
-    }
-
-    Delay.QuadPart = -3000000;
-    KeDelayExecutionThread(KernelMode, FALSE, &Delay);
-    ExitStatus = STATUS_PENDING;
-    if (Query != NULL && ThreadHandle != NULL)
-    {
-        RtlZeroMemory(&Info, sizeof(Info));
-        if (NT_SUCCESS(Query(ThreadHandle, 0, &Info, sizeof(Info), NULL)))
-        {
-            ExitStatus = Info.ExitStatus;
-        }
-    }
-
-    if (ThreadHandle != NULL)
-    {
+        ZwResumeThread(ThreadHandle, &PreviousSuspend);
+        ObDereferenceObject(Thread);
         ZwClose(ThreadHandle);
+        return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    KeUnstackDetachProcess(&State);
-    HACDBG_LOG("HacDbg: DLL inject start tid=%llu exit=0x%08x stub=0x%I64x gate=0x%p.\n",
-               (UINT64)(ULONG_PTR)ClientId.UniqueThread, ExitStatus, Rip, Gate);
-    if (ExitStatus == STATUS_PENDING || ExitStatus == STATUS_SUCCESS)
+    RtlZeroMemory(Captured, sizeof(CONTEXT));
+    Trap = *(PUCHAR*)((PUCHAR)Thread + INJECT_KTHREAD_TRAP_FRAME);
+    Cs = Trap == NULL ? 0 : *(USHORT*)(Trap + INJECT_TRAP_SEG_CS);
+    OldRip = Trap == NULL ? 0 : *(UINT64*)(Trap + INJECT_TRAP_RIP);
+    if (Trap == NULL || Cs != INJECT_USER_CS || OldRip == 0 || OldRip >= 0xFFFF000000000000ull)
     {
-        return STATUS_SUCCESS;
+        HACDBG_LOG("HacDbg: Err, DLL inject thread has no user trap frame tid=%llu cs=0x%x rip=0x%I64x.\n",
+                   (UINT64)(ULONG_PTR)PsGetThreadId(Thread), Cs, OldRip);
+        ZwResumeThread(ThreadHandle, &PreviousSuspend);
+        ObDereferenceObject(Thread);
+        ZwClose(ThreadHandle);
+        ExFreePool(Captured);
+        return STATUS_UNSUCCESSFUL;
     }
 
-    return ExitStatus;
+    Captured->ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+    Captured->SegCs = Cs;
+    Captured->SegSs = INJECT_USER_SS;
+    Captured->EFlags = (*(ULONG*)(Trap + INJECT_TRAP_EFLAGS) | 2u) & ~0x100u;
+    Captured->Rip = OldRip;
+    Captured->Rsp = *(UINT64*)(Trap + INJECT_TRAP_RSP);
+    //
+    // NtWaitForAlertByThreadId returns STATUS_ALERTED when AlertedByThreadId
+    // is consumed. The stub later resumes at the saved user return address.
+    //
+    Captured->Rax = INJECT_STATUS_ALERTED;
+    Captured->Rcx = *(UINT64*)(Trap + INJECT_TRAP_RCX);
+    Captured->Rdx = *(UINT64*)(Trap + INJECT_TRAP_RDX);
+    Captured->Rbx = *(UINT64*)(Trap + INJECT_TRAP_RBX);
+    Captured->Rbp = *(UINT64*)(Trap + INJECT_TRAP_RBP);
+    Captured->Rsi = *(UINT64*)(Trap + INJECT_TRAP_RSI);
+    Captured->Rdi = *(UINT64*)(Trap + INJECT_TRAP_RDI);
+    Captured->R8 = *(UINT64*)(Trap + INJECT_TRAP_R8);
+    Captured->R9 = *(UINT64*)(Trap + INJECT_TRAP_R9);
+    Captured->R10 = *(UINT64*)(Trap + INJECT_TRAP_R10);
+    Captured->R11 = *(UINT64*)(Trap + INJECT_TRAP_R11);
+
+    RtlCopyMemory(ContextHost, Captured, sizeof(CONTEXT));
+    Kept = FALSE;
+    {
+        UINT64 kernelCr3 = InjectDirectory(Process, INJECT_DIR_TABLE);
+        UINT64 userCr3 = InjectUsableUserDirectory(Process, kernelCr3);
+
+        if (InjectSlatAllow(Thread, kernelCr3, userCr3, &Kept) == FALSE)
+        {
+            ZwResumeThread(ThreadHandle, &PreviousSuspend);
+            ObDereferenceObject(Thread);
+            ZwClose(ThreadHandle);
+            ExFreePool(Captured);
+            HACDBG_LOG("HacDbg: Err, DLL inject slat allow failed stub=0x%I64x.\n", StubVa);
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+
+    if (InjectFlush() == FALSE)
+    {
+        ZwResumeThread(ThreadHandle, &PreviousSuspend);
+        if (Kept == FALSE)
+        {
+            ObDereferenceObject(Thread);
+        }
+
+        ZwClose(ThreadHandle);
+        ExFreePool(Captured);
+        HACDBG_LOG("HacDbg: Err, DLL inject slat flush failed stub=0x%I64x.\n", StubVa);
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    //
+    // Notepad's UI thread waits in NtWaitForAlertByThreadId. That wait is not
+    // alertable, so a user APC stays queued and KeAlertThread does not wake
+    // it. KeWaitForAlertByThreadId returns STATUS_ALERTED when bit 4 of
+    // KTHREAD.ThreadFlags (AlertedByThreadId) is set. The suspended thread
+    // rechecks that bit after the suspend APC returns, then the patched trap
+    // frame RIP enters the stub.
+    //
+    *(UINT64*)(Trap + INJECT_TRAP_RIP) = StubVa;
+    _interlockedbittestandset((volatile LONG*)((PUCHAR)Thread + INJECT_KTHREAD_THREAD_FLAGS),
+                              INJECT_ALERTED_BY_THREAD_ID);
+    Status = ZwResumeThread(ThreadHandle, &PreviousSuspend);
+    HACDBG_LOG("HacDbg: DLL inject alerted-by-id tid=%llu status=0x%08x oldrip=0x%I64x stub=0x%I64x.\n",
+               (UINT64)(ULONG_PTR)PsGetThreadId(Thread), Status, OldRip, StubVa);
+    if (Kept == FALSE)
+    {
+        ObDereferenceObject(Thread);
+    }
+
+    ZwClose(ThreadHandle);
+    ExFreePool(Captured);
+    return Status;
 }
 
 static NTSTATUS
@@ -3039,11 +3006,12 @@ InjectMapImage(
     _In_ ULONG ImageBytes,
     _In_ UINT64 Base,
     _In_ const UCHAR* ExecuteBits,
-    _In_reads_bytes_(64) const UCHAR* Stub,
+    _In_reads_bytes_(INJECT_STUB_BYTES) const UCHAR* Stub,
     _In_ BOOLEAN HidePayload,
     _Out_ ULONG* HookCount,
     _Out_ ULONG* HiddenCount,
-    _Out_ ULONG* DataCount
+    _Out_ ULONG* DataCount,
+    _Out_ PVOID* ContextHost
     )
 {
     INJECT_OWNED* Owned;
@@ -3061,6 +3029,7 @@ InjectMapImage(
     *HookCount = 0;
     *HiddenCount = 0;
     *DataCount = 0;
+    *ContextHost = NULL;
     Directory = InjectDirectory(Process, INJECT_DIR_TABLE);
     UserDirectory = InjectUsableUserDirectory(Process, Directory);
     if (Directory == 0)
@@ -3113,6 +3082,11 @@ InjectMapImage(
         }
 
         RealIndex = Count - 1;
+        if (Index == Pages + 1)
+        {
+            *ContextHost = RealVirtual;
+        }
+
         Source = NULL;
         Execute = FALSE;
         if (Index < Pages)
@@ -3128,7 +3102,7 @@ InjectMapImage(
 
         if (Source != NULL)
         {
-            RtlCopyMemory(RealVirtual, Source, Index == Pages ? 64 : PAGE_SIZE);
+            RtlCopyMemory(RealVirtual, Source, Index == Pages ? INJECT_STUB_BYTES : PAGE_SIZE);
         }
 
         if (Execute != FALSE)
@@ -3660,7 +3634,7 @@ InjectPte(
     UCHAR* File;
     UCHAR* Image;
     UCHAR ExecuteBits[(INJECT_MAX_PAGES + 7) / 8];
-    UCHAR Stub[64];
+    UCHAR Stub[INJECT_STUB_BYTES];
     ULONG FileLength;
     IMAGE_DOS_HEADER* Dos;
     IMAGE_NT_HEADERS64* Nt;
@@ -3673,7 +3647,8 @@ InjectPte(
     ULONG Index;
     ULONG Place;
     UINT64 Ntdll;
-    UINT64 ExitThread;
+    UINT64 NtContinue;
+    PVOID ContextHost;
     ULONG Hooks;
     ULONG Hidden;
     ULONG Data;
@@ -3820,29 +3795,31 @@ InjectPte(
     }
 
     Ntdll = InjectModuleBase(Process, "ntdll.dll");
-    ExitThread = InjectResolve(Process, Ntdll, "RtlExitUserThread", 0);
-    if (ExitThread == 0)
+    NtContinue = InjectResolve(Process, Ntdll, "NtContinue", 0);
+    if (NtContinue == 0)
     {
-        HACDBG_LOG("HacDbg: Err, DLL inject found no RtlExitUserThread.\n");
+        HACDBG_LOG("HacDbg: Err, DLL inject found no NtContinue.\n");
         ExFreePool(Image);
         return STATUS_NOT_FOUND;
     }
 
     InjectMarkExecute(Image, Pages, ExecuteBits);
-    InjectWriteStub(Stub, Base, Base + ((IMAGE_NT_HEADERS64*)(Image + ((IMAGE_DOS_HEADER*)Image)->e_lfanew))->OptionalHeader.AddressOfEntryPoint,
-                    ExitThread);
+    InjectWriteStub(Stub, Base,
+                    Base + ((IMAGE_NT_HEADERS64*)(Image + ((IMAGE_DOS_HEADER*)Image)->e_lfanew))->OptionalHeader.AddressOfEntryPoint,
+                    NtContinue, Base + (((UINT64)Pages + 1) * PAGE_SIZE));
     Hooks = 0;
     Hidden = 0;
     Data = 0;
+    ContextHost = NULL;
     Status = InjectMapImage(Process, Image, Pages * PAGE_SIZE, Base, ExecuteBits, Stub, HidePayload, &Hooks, &Hidden,
-                            &Data);
+                            &Data, &ContextHost);
     ExFreePool(Image);
     if (!NT_SUCCESS(Status))
     {
         return Status;
     }
 
-    Status = InjectStartEntry(Process, Base + ((UINT64)Pages * PAGE_SIZE));
+    Status = InjectStartEntry(Process, Base + ((UINT64)Pages * PAGE_SIZE), ContextHost);
     if (!NT_SUCCESS(Status))
     {
         HACDBG_LOG("HacDbg: Err, DLL inject start failed: 0x%08x.\n", Status);
