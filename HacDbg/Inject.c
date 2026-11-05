@@ -71,8 +71,7 @@
 #define INJECT_ERROR_BAD_EXE_FORMAT 193u
 #define INJECT_ERROR_DLL_INIT_FAILED 1114u
 #define INJECT_STACK_BYTES 0x100000u
-#define INJECT_VM_CFG_CALL_TARGET 2u
-#define INJECT_CFG_CALL_TARGET_VALID 1ull
+#define INJECT_USER_EFLAGS 0x202u
 
 typedef NTSTATUS(NTAPI* INJECT_GET_NEXT_THREAD)(HANDLE ProcessHandle, HANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
                                                 ULONG HandleAttributes, ULONG Flags, PHANDLE NewThreadHandle);
@@ -98,39 +97,6 @@ typedef struct _INJECT_THREAD_BASIC
     LONG Priority;
     LONG BasePriority;
 } INJECT_THREAD_BASIC;
-
-typedef struct _INJECT_MEMORY_RANGE
-{
-    PVOID Address;
-    SIZE_T Bytes;
-} INJECT_MEMORY_RANGE;
-
-typedef struct _INJECT_CFG_TARGET
-{
-    ULONG_PTR Offset;
-    ULONG_PTR Flags;
-} INJECT_CFG_TARGET;
-
-//
-// VmCfgCallTargetInformation. The caller passes class 2 and 0x28 bytes.
-// The first ULONG is the target count and must be non-zero. The next ULONG
-// must be zero. The pointer at +8 receives a ULONG. The pointer at +0x10 is
-// an array of offset/flag pairs. CFG_CALL_TARGET_VALID is 1.
-//
-typedef struct _INJECT_CFG_INFORMATION
-{
-    ULONG NumberOfEntries;
-    ULONG Reserved;
-    ULONG* Output;
-    INJECT_CFG_TARGET* Targets;
-    ULONG_PTR Unused0;
-    ULONG_PTR Unused1;
-} INJECT_CFG_INFORMATION;
-
-C_ASSERT(sizeof(INJECT_CFG_INFORMATION) == 0x28);
-
-typedef NTSTATUS(NTAPI* INJECT_SET_VM)(HANDLE ProcessHandle, ULONG InformationClass, ULONG_PTR NumberOfEntries,
-                                       PVOID VirtualAddresses, PVOID VmInformation, ULONG VmInformationLength);
 
 typedef struct _INJECT_LOAD_RESULT
 {
@@ -2500,7 +2466,17 @@ InjectApplyRelocs(
     RelocSize = Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size;
     if (RelocRva == 0 || RelocSize < sizeof(IMAGE_BASE_RELOCATION))
     {
-        return STATUS_CONFLICTING_ADDRESSES;
+        //
+        // A dynamic-base image with an empty relocation directory has no
+        // absolute addresses to fix. The no-CRT test DLL is built that way.
+        //
+        if ((Nt->FileHeader.Characteristics & IMAGE_FILE_RELOCS_STRIPPED) != 0)
+        {
+            return STATUS_CONFLICTING_ADDRESSES;
+        }
+
+        HACDBG_LOG("HacDbg: DLL inject relocation directory is empty.\n");
+        return STATUS_SUCCESS;
     }
 
     Offset = 0;
@@ -2668,16 +2644,38 @@ InjectWriteStub(
 
 static NTSTATUS
 InjectMarkCallTarget(
+    _In_ PVOID SetVmRoutine,
     _In_ PVOID Address
     )
 {
+    typedef struct _INJECT_MEMORY_RANGE
+    {
+        PVOID Address;
+        SIZE_T Bytes;
+    } INJECT_MEMORY_RANGE;
+    typedef struct _INJECT_CFG_TARGET
+    {
+        ULONG_PTR Offset;
+        ULONG_PTR Flags;
+    } INJECT_CFG_TARGET;
+    typedef struct _INJECT_CFG_INFORMATION
+    {
+        ULONG NumberOfEntries;
+        ULONG Reserved;
+        ULONG* Output;
+        INJECT_CFG_TARGET* Targets;
+        ULONG_PTR Unused0;
+        ULONG_PTR Unused1;
+    } INJECT_CFG_INFORMATION;
+    typedef NTSTATUS(NTAPI* INJECT_SET_VM)(HANDLE ProcessHandle, ULONG InformationClass, ULONG_PTR NumberOfEntries,
+                                           PVOID VirtualAddresses, PVOID VmInformation, ULONG VmInformationLength);
     INJECT_SET_VM SetVm;
     INJECT_MEMORY_RANGE Range;
     INJECT_CFG_TARGET Target;
     INJECT_CFG_INFORMATION Information;
     ULONG Output;
 
-    SetVm = (INJECT_SET_VM)InjectRoutine(L"ZwSetInformationVirtualMemory");
+    SetVm = (INJECT_SET_VM)SetVmRoutine;
     if (SetVm == NULL || Address == NULL)
     {
         return STATUS_NOT_SUPPORTED;
@@ -2686,13 +2684,13 @@ InjectMarkCallTarget(
     Range.Address = Address;
     Range.Bytes = PAGE_SIZE;
     Target.Offset = 0;
-    Target.Flags = INJECT_CFG_CALL_TARGET_VALID;
+    Target.Flags = 1;
     Output = 0;
     RtlZeroMemory(&Information, sizeof(Information));
     Information.NumberOfEntries = 1;
     Information.Output = &Output;
     Information.Targets = &Target;
-    return SetVm(ZwCurrentProcess(), INJECT_VM_CFG_CALL_TARGET, 1, &Range, &Information, sizeof(Information));
+    return SetVm(ZwCurrentProcess(), 2, 1, &Range, &Information, sizeof(Information));
 }
 
 static NTSTATUS
@@ -2703,11 +2701,13 @@ InjectStartEntry(
 {
     INJECT_CREATE_THREAD Create;
     INJECT_QUERY_THREAD Query;
+    PVOID SetVm;
     INJECT_THREAD_BASIC Info;
     KAPC_STATE State;
     HANDLE ThreadHandle;
     CLIENT_ID ClientId;
-    PVOID CodePage;
+    PVOID Gate;
+    UCHAR GateBytes[16];
     UINT64 Rip;
     NTSTATUS Status;
     NTSTATUS ExitStatus;
@@ -2715,36 +2715,50 @@ InjectStartEntry(
 
     Create = (INJECT_CREATE_THREAD)InjectRoutine(L"RtlCreateUserThread");
     Query = (INJECT_QUERY_THREAD)InjectRoutine(L"ZwQueryInformationThread");
-    if (Create == NULL || StubVa < 0x10000ull || StubVa > 0x00007FFFFFFFFFFFull)
+    SetVm = InjectRoutine(L"ZwSetInformationVirtualMemory");
+    if (Create == NULL || Query == NULL || SetVm == NULL || StubVa < 0x10000ull || StubVa > 0x00007FFFFFFFFFFFull)
     {
         return STATUS_NOT_SUPPORTED;
     }
 
-    CodePage = (PVOID)(ULONG_PTR)StubVa;
+    //
+    // A thread created suspended has no trap frame yet. PsGetContextThread
+    // returns STATUS_UNSUCCESSFUL (0xc0000001) until that thread has run.
+    // The page-table stub also has no VAD, so it cannot be marked as a CFG
+    // call target. This gate is an ordinary executable allocation. The new
+    // thread starts there, on the stack RtlCreateUserThread committed, and
+    // the gate jumps to the stub.
+    //
+    Gate = NULL;
+    Status = InjectAllocUser(Process, PAGE_SIZE, PAGE_EXECUTE_READWRITE, &Gate);
+    if (!NT_SUCCESS(Status))
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject gate alloc status=0x%08x stub=0x%I64x.\n", Status, StubVa);
+        return Status;
+    }
+
+    RtlZeroMemory(GateBytes, sizeof(GateBytes));
+    GateBytes[0] = 0x48;
+    GateBytes[1] = 0xB8;
+    RtlCopyMemory(GateBytes + 2, &StubVa, sizeof(StubVa));
+    GateBytes[10] = 0xFF;
+    GateBytes[11] = 0xE0;
+    Status = InjectCopyUser(Process, Gate, GateBytes, sizeof(GateBytes));
+    if (!NT_SUCCESS(Status))
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject gate copy status=0x%08x gate=0x%p.\n", Status, Gate);
+        return Status;
+    }
+
     ThreadHandle = NULL;
     RtlZeroMemory(&ClientId, sizeof(ClientId));
     Rip = StubVa;
     KeStackAttachProcess(Process, &State);
     //
-    // BaseThreadInitThunk checks the start address in the CFG bitmap and
-    // fastfails the process with 0xc0000409 when the bit is clear. The stub
-    // is the page already written into the target page tables. This call uses
-    // the current process and must run while attached. A zero reserve or
-    // commit makes RtlCreateUserStack read the process image header. Commit
-    // is one page and stays below the reserve.
-    //
-    Status = InjectMarkCallTarget(CodePage);
-    if (!NT_SUCCESS(Status))
-    {
-        KeUnstackDetachProcess(&State);
-        HACDBG_LOG("HacDbg: Err, DLL inject cfg mark status=0x%08x va=0x%I64x.\n", Status, Rip);
-        return Status;
-    }
-
-    //
-    // RtlCreateUserStack reads PEB.MinimumStackCommit with the caller's AC
-    // flag. SMAP is enabled, so a clear AC flag bugchecks 0x50 before the
-    // new thread exists.
+    // INVARIANT: This processor is attached to the target. SMAP is on, so AC
+    // must be set before any kernel routine reads that process's user memory.
+    // MmGetSystemRoutineAddress was already called above. Calling it here
+    // reaches RtlpIsUtf8Process, which reads the PEB and bugchecks 0x50.
     //
     if ((__readcr4() & (1ull << 21)) != 0)
     {
@@ -2753,8 +2767,16 @@ InjectStartEntry(
 
     __try
     {
-        Status = Create(ZwCurrentProcess(), NULL, FALSE, 0, INJECT_STACK_BYTES, PAGE_SIZE, CodePage, NULL,
-                        &ThreadHandle, &ClientId);
+        Status = InjectMarkCallTarget(SetVm, Gate);
+        if (!NT_SUCCESS(Status))
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject cfg mark status=0x%08x gate=0x%p stub=0x%I64x.\n", Status, Gate, Rip);
+        }
+        else
+        {
+            Status = Create(ZwCurrentProcess(), NULL, FALSE, 0, INJECT_STACK_BYTES, PAGE_SIZE, Gate, NULL,
+                            &ThreadHandle, &ClientId);
+        }
     }
     __finally
     {
@@ -2767,7 +2789,12 @@ InjectStartEntry(
     if (!NT_SUCCESS(Status))
     {
         KeUnstackDetachProcess(&State);
-        HACDBG_LOG("HacDbg: Err, DLL inject start thread status=0x%08x stub=0x%I64x.\n", Status, Rip);
+        if (ThreadHandle == NULL)
+        {
+            return Status;
+        }
+
+        HACDBG_LOG("HacDbg: Err, DLL inject start thread status=0x%08x gate=0x%p stub=0x%I64x.\n", Status, Gate, Rip);
         return Status;
     }
 
@@ -2789,8 +2816,8 @@ InjectStartEntry(
     }
 
     KeUnstackDetachProcess(&State);
-    HACDBG_LOG("HacDbg: DLL inject start tid=%llu exit=0x%08x stub=0x%I64x.\n",
-               (UINT64)(ULONG_PTR)ClientId.UniqueThread, ExitStatus, Rip);
+    HACDBG_LOG("HacDbg: DLL inject start tid=%llu exit=0x%08x stub=0x%I64x gate=0x%p.\n",
+               (UINT64)(ULONG_PTR)ClientId.UniqueThread, ExitStatus, Rip, Gate);
     if (ExitStatus == STATUS_PENDING || ExitStatus == STATUS_SUCCESS)
     {
         return STATUS_SUCCESS;
@@ -3416,6 +3443,7 @@ InjectPte(
     if (FileLength < sizeof(IMAGE_DOS_HEADER))
     {
         ExFreePool(File);
+        HACDBG_LOG("HacDbg: Err, DLL inject image rejected: file is shorter than a DOS header.\n");
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -3423,6 +3451,8 @@ InjectPte(
     if (Dos->e_magic != IMAGE_DOS_SIGNATURE || Dos->e_lfanew <= 0 || (ULONG)Dos->e_lfanew + sizeof(IMAGE_NT_HEADERS64) > FileLength)
     {
         ExFreePool(File);
+        HACDBG_LOG("HacDbg: Err, DLL inject image rejected: DOS header magic=0x%04x lfanew=0x%x length=0x%x.\n",
+                   Dos->e_magic, Dos->e_lfanew, FileLength);
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
@@ -3431,6 +3461,8 @@ InjectPte(
         Nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC || Nt->OptionalHeader.AddressOfEntryPoint == 0)
     {
         ExFreePool(File);
+        HACDBG_LOG("HacDbg: Err, DLL inject image rejected: machine=0x%x magic=0x%x entry=0x%x.\n",
+                   Nt->FileHeader.Machine, Nt->OptionalHeader.Magic, Nt->OptionalHeader.AddressOfEntryPoint);
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
