@@ -48,6 +48,9 @@
     <ClCompile Include="ProcessCtrl.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Inject.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="WindowProtect.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -110,6 +113,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="WindowProtect.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="Inject.h">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>

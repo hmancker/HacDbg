@@ -197,6 +197,7 @@
     </ClCompile>
     <ClCompile Include="PhysicalMemory.c" />
     <ClCompile Include="ProcessCtrl.c" />
+    <ClCompile Include="Inject.c" />
     <ClCompile Include="WindowProtect.c" />
     <ClCompile Include="Svm.c">
       <ExcludedFromBuild Condition="'$(Configuration)'=='DebugIntel'">true</ExcludedFromBuild>
@@ -225,6 +226,7 @@
     <ClInclude Include="Npt.h" />
     <ClInclude Include="PhysicalMemory.h" />
     <ClInclude Include="ProcessCtrl.h" />
+    <ClInclude Include="Inject.h" />
     <ClInclude Include="WindowProtect.h" />
     <ClInclude Include="Ept.h" />
     <ClInclude Include="Guest.h" />

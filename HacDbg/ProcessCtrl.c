@@ -9,21 +9,13 @@
 #include <ntimage.h>
 
 #include "Debug.h"
+#include "Inject.h"
 #include "ProcessCtrl.h"
 
 #include "../shared/process_control.h"
 
 #define PROCESS_CTRL_TAG 'cPaH'
 #define PROCESS_CTRL_MAX_IMAGE (16u * 1024u * 1024u)
-#define PROCESS_CTRL_DIR_TABLE 0x28u
-#define PROCESS_CTRL_PTE_PRESENT 0x1ull
-#define PROCESS_CTRL_PTE_WRITE 0x2ull
-#define PROCESS_CTRL_PTE_USER 0x4ull
-#define PROCESS_CTRL_PTE_ACCESSED 0x20ull
-#define PROCESS_CTRL_PTE_DIRTY 0x40ull
-#define PROCESS_CTRL_PTE_LARGE 0x80ull
-#define PROCESS_CTRL_PTE_NX (1ull << 63)
-#define PROCESS_CTRL_PTE_FRAME 0x000FFFFFFFFFF000ull
 #define PROCESS_CTRL_VM_OPERATION 0x0008u
 #define PROCESS_CTRL_VM_READ 0x0010u
 #define PROCESS_CTRL_VM_WRITE 0x0020u
@@ -59,29 +51,7 @@
 #define PROCESS_CTRL_LINK_CHARS 128u
 #define PROCESS_CTRL_PATH_PASSES 6u
 
-typedef enum _PROCESS_CTRL_APC_ENVIRONMENT
-{
-    ProcessCtrlOriginalApc = 0
-} PROCESS_CTRL_APC_ENVIRONMENT;
-
-typedef VOID (*PROCESS_CTRL_NORMAL_ROUTINE)(PVOID NormalContext, PVOID SystemArgument1, PVOID SystemArgument2);
-typedef VOID (*PROCESS_CTRL_KERNEL_ROUTINE)(PKAPC Apc, PROCESS_CTRL_NORMAL_ROUTINE* NormalRoutine, PVOID* NormalContext,
-                                            PVOID* SystemArgument1, PVOID* SystemArgument2);
-
-NTKERNELAPI
-VOID
-KeInitializeApc(PKAPC Apc, PKTHREAD Thread, PROCESS_CTRL_APC_ENVIRONMENT Environment,
-                PROCESS_CTRL_KERNEL_ROUTINE KernelRoutine, PVOID RundownRoutine,
-                PROCESS_CTRL_NORMAL_ROUTINE NormalRoutine, KPROCESSOR_MODE ProcessorMode, PVOID NormalContext);
-
-NTKERNELAPI
-BOOLEAN
-KeInsertQueueApc(PKAPC Apc, PVOID SystemArgument1, PVOID SystemArgument2, KPRIORITY Increment);
-
 typedef NTSTATUS(NTAPI* PROCESS_SUSPEND)(PEPROCESS Process);
-typedef NTSTATUS(NTAPI* PROCESS_GET_NEXT_THREAD)(HANDLE ProcessHandle, HANDLE ThreadHandle,
-                                                 ACCESS_MASK DesiredAccess, ULONG HandleAttributes,
-                                                 ULONG Flags, PHANDLE NewThreadHandle);
 
 static ULONG g_LinkOffset;
 static ULONG g_PidOffset;
@@ -1501,351 +1471,6 @@ ProcessCtrlSetPpl(ULONG Pid, ULONG Parameter)
     return STATUS_SUCCESS;
 }
 
-static PVOID
-ProcessCtrlMapPhysical(UINT64 Physical)
-{
-    PHYSICAL_ADDRESS Address;
-
-    Address.QuadPart = (LONGLONG)(Physical & PROCESS_CTRL_PTE_FRAME);
-    return MmMapIoSpace(Address, PAGE_SIZE, MmCached);
-}
-
-static UINT64
-ProcessCtrlDirectory(PEPROCESS Process)
-{
-    UINT64 Value;
-
-    Value = *(UINT64*)((UCHAR*)Process + PROCESS_CTRL_DIR_TABLE);
-    Value &= PROCESS_CTRL_PTE_FRAME;
-    if ((Value & 0xFFF) != 0 || Value == 0)
-    {
-        return 0;
-    }
-
-    return Value;
-}
-
-static BOOLEAN
-ProcessCtrlFindFreeRun(UINT64 Directory, ULONG Pages, UINT64* VirtualAddress, UINT64* PtePhysical)
-{
-    ULONG Pml4Index;
-    ULONG PdptIndex;
-    ULONG PdIndex;
-    ULONG PtIndex;
-    UINT64* Pml4;
-    UINT64* Pdpt;
-    UINT64* Pd;
-    UINT64* Pt;
-    ULONG Run;
-
-    Pml4 = (UINT64*)ProcessCtrlMapPhysical(Directory);
-    if (Pml4 == NULL)
-    {
-        return FALSE;
-    }
-
-    for (Pml4Index = 0; Pml4Index < 256; Pml4Index++)
-    {
-        if ((Pml4[Pml4Index] & PROCESS_CTRL_PTE_PRESENT) == 0 ||
-            (Pml4[Pml4Index] & PROCESS_CTRL_PTE_LARGE) != 0)
-        {
-            continue;
-        }
-
-        Pdpt = (UINT64*)ProcessCtrlMapPhysical(Pml4[Pml4Index]);
-        if (Pdpt == NULL)
-        {
-            continue;
-        }
-
-        for (PdptIndex = 0; PdptIndex < 512; PdptIndex++)
-        {
-            if ((Pdpt[PdptIndex] & PROCESS_CTRL_PTE_PRESENT) == 0 ||
-                (Pdpt[PdptIndex] & PROCESS_CTRL_PTE_LARGE) != 0)
-            {
-                continue;
-            }
-
-            Pd = (UINT64*)ProcessCtrlMapPhysical(Pdpt[PdptIndex]);
-            if (Pd == NULL)
-            {
-                continue;
-            }
-
-            for (PdIndex = 0; PdIndex < 512; PdIndex++)
-            {
-                if ((Pd[PdIndex] & PROCESS_CTRL_PTE_PRESENT) == 0 ||
-                    (Pd[PdIndex] & PROCESS_CTRL_PTE_LARGE) != 0)
-                {
-                    continue;
-                }
-
-                Pt = (UINT64*)ProcessCtrlMapPhysical(Pd[PdIndex]);
-                if (Pt == NULL)
-                {
-                    continue;
-                }
-
-                Run = 0;
-                for (PtIndex = 0; PtIndex < 512; PtIndex++)
-                {
-                    if ((Pt[PtIndex] & PROCESS_CTRL_PTE_PRESENT) == 0)
-                    {
-                        Run++;
-                        if (Run == Pages)
-                        {
-                            *VirtualAddress = ((UINT64)Pml4Index << 39) | ((UINT64)PdptIndex << 30) |
-                                              ((UINT64)PdIndex << 21) |
-                                              ((UINT64)(PtIndex + 1 - Pages) << 12);
-                            *PtePhysical = (Pd[PdIndex] & PROCESS_CTRL_PTE_FRAME) +
-                                           ((UINT64)(PtIndex + 1 - Pages) * 8);
-                            MmUnmapIoSpace(Pt, PAGE_SIZE);
-                            MmUnmapIoSpace(Pd, PAGE_SIZE);
-                            MmUnmapIoSpace(Pdpt, PAGE_SIZE);
-                            MmUnmapIoSpace(Pml4, PAGE_SIZE);
-                            return TRUE;
-                        }
-                    }
-                    else
-                    {
-                        Run = 0;
-                    }
-                }
-
-                MmUnmapIoSpace(Pt, PAGE_SIZE);
-            }
-
-            if (Pd != NULL)
-            {
-                MmUnmapIoSpace(Pd, PAGE_SIZE);
-            }
-        }
-
-        MmUnmapIoSpace(Pdpt, PAGE_SIZE);
-    }
-
-    MmUnmapIoSpace(Pml4, PAGE_SIZE);
-    return FALSE;
-}
-
-static VOID
-ProcessCtrlWritePte(UINT64 PtePhysical, UINT64 DataPhysical, BOOLEAN Execute)
-{
-    UINT64* Pte;
-    UINT64 Value;
-
-    Pte = (UINT64*)ProcessCtrlMapPhysical(PtePhysical);
-    if (Pte == NULL)
-    {
-        return;
-    }
-
-    Value = (DataPhysical & PROCESS_CTRL_PTE_FRAME) | PROCESS_CTRL_PTE_PRESENT | PROCESS_CTRL_PTE_WRITE |
-            PROCESS_CTRL_PTE_USER | PROCESS_CTRL_PTE_ACCESSED | PROCESS_CTRL_PTE_DIRTY;
-    if (Execute == FALSE)
-    {
-        Value |= PROCESS_CTRL_PTE_NX;
-    }
-
-    *Pte = Value;
-    MmUnmapIoSpace(Pte, PAGE_SIZE);
-}
-
-static VOID
-ProcessCtrlApcRoutine(
-    _In_ PKAPC Apc,
-    _Inout_ PROCESS_CTRL_NORMAL_ROUTINE* NormalRoutine,
-    _Inout_ PVOID* NormalContext,
-    _Inout_ PVOID* SystemArgument1,
-    _Inout_ PVOID* SystemArgument2
-    )
-{
-    UNREFERENCED_PARAMETER(NormalRoutine);
-    UNREFERENCED_PARAMETER(NormalContext);
-    UNREFERENCED_PARAMETER(SystemArgument1);
-    UNREFERENCED_PARAMETER(SystemArgument2);
-    ExFreePool(Apc);
-}
-
-static NTSTATUS
-ProcessCtrlQueueApc(HANDLE ThreadHandle, PVOID Routine, PVOID Context)
-{
-    PETHREAD Thread;
-    PKAPC Apc;
-    NTSTATUS Status;
-
-    Status = ObReferenceObjectByHandle(ThreadHandle, THREAD_ALL_ACCESS, *PsThreadType, KernelMode, (PVOID*)&Thread,
-                                       NULL);
-    if (!NT_SUCCESS(Status))
-    {
-        return Status;
-    }
-
-    Apc = (PKAPC)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(KAPC), PROCESS_CTRL_TAG);
-    if (Apc == NULL)
-    {
-        ObDereferenceObject(Thread);
-        return STATUS_INSUFFICIENT_RESOURCES;
-    }
-
-    KeInitializeApc(Apc, (PKTHREAD)Thread, ProcessCtrlOriginalApc, ProcessCtrlApcRoutine, NULL,
-                    (PROCESS_CTRL_NORMAL_ROUTINE)Routine, UserMode, Context);
-    if (KeInsertQueueApc(Apc, NULL, NULL, 0) == FALSE)
-    {
-        ExFreePool(Apc);
-        ObDereferenceObject(Thread);
-        return STATUS_UNSUCCESSFUL;
-    }
-
-    ObDereferenceObject(Thread);
-    return STATUS_SUCCESS;
-}
-
-static NTSTATUS
-ProcessCtrlFirstThread(HANDLE* ThreadHandle)
-{
-    UNICODE_STRING Name;
-    PROCESS_GET_NEXT_THREAD Routine;
-
-    RtlInitUnicodeString(&Name, L"ZwGetNextThread");
-    Routine = (PROCESS_GET_NEXT_THREAD)MmGetSystemRoutineAddress(&Name);
-    if (Routine == NULL)
-    {
-        return STATUS_NOT_SUPPORTED;
-    }
-
-    return Routine(ZwCurrentProcess(), NULL, THREAD_ALL_ACCESS, OBJ_KERNEL_HANDLE, 0, ThreadHandle);
-}
-
-static UINT64
-ProcessCtrlModuleBase(PEPROCESS Process, const CHAR* AnsiName)
-{
-    KAPC_STATE State;
-    UCHAR* Peb;
-    UCHAR* Ldr;
-    LIST_ENTRY* Head;
-    LIST_ENTRY* Link;
-    UINT64 Base;
-    ULONG Guard;
-
-    Base = 0;
-    KeStackAttachProcess(Process, &State);
-    Peb = (UCHAR*)PsGetProcessPeb(Process);
-    if (Peb == NULL || MmIsAddressValid(Peb + 0x18) == FALSE)
-    {
-        KeUnstackDetachProcess(&State);
-        return 0;
-    }
-
-    Ldr = *(UCHAR**)(Peb + 0x18);
-    if (Ldr == NULL || MmIsAddressValid(Ldr + 0x20) == FALSE)
-    {
-        KeUnstackDetachProcess(&State);
-        return 0;
-    }
-
-    Head = (LIST_ENTRY*)(Ldr + 0x20);
-    Link = Head->Flink;
-    for (Guard = 0; Guard < 256 && Link != NULL && Link != Head; Guard++)
-    {
-        UCHAR* Entry = (UCHAR*)Link - 0x10;
-        UNICODE_STRING* ModuleName;
-        CHAR Narrow[64];
-        ULONG Index;
-
-        if (MmIsAddressValid(Entry + 0x58) == FALSE || MmIsAddressValid(Entry + 0x30) == FALSE)
-        {
-            break;
-        }
-
-        ModuleName = (UNICODE_STRING*)(Entry + 0x58);
-        if (ModuleName->Buffer != NULL && ModuleName->Length < sizeof(Narrow) &&
-            MmIsAddressValid(ModuleName->Buffer) != FALSE)
-        {
-            for (Index = 0; Index < ModuleName->Length / sizeof(WCHAR) && Index < 63; Index++)
-            {
-                WCHAR Character = ModuleName->Buffer[Index];
-                if (Character >= L'A' && Character <= L'Z')
-                {
-                    Character = (WCHAR)(Character - L'A' + L'a');
-                }
-                Narrow[Index] = (CHAR)Character;
-            }
-            Narrow[Index] = 0;
-            if (_stricmp(Narrow, AnsiName) == 0)
-            {
-                Base = *(UINT64*)(Entry + 0x30);
-                break;
-            }
-        }
-
-        Link = Link->Flink;
-    }
-
-    KeUnstackDetachProcess(&State);
-    return Base;
-}
-
-static UINT64
-ProcessCtrlExport(PEPROCESS Process, UINT64 ModuleBase, const CHAR* ExportName)
-{
-    KAPC_STATE State;
-    UCHAR* Base;
-    IMAGE_DOS_HEADER* Dos;
-    IMAGE_NT_HEADERS64* Nt;
-    IMAGE_EXPORT_DIRECTORY* Export;
-    ULONG* Names;
-    USHORT* Ordinals;
-    ULONG* Functions;
-    ULONG Index;
-    UINT64 Address;
-
-    Address = 0;
-    KeStackAttachProcess(Process, &State);
-    Base = (UCHAR*)ModuleBase;
-    if (MmIsAddressValid(Base) == FALSE)
-    {
-        KeUnstackDetachProcess(&State);
-        return 0;
-    }
-
-    Dos = (IMAGE_DOS_HEADER*)Base;
-    if (Dos->e_magic != IMAGE_DOS_SIGNATURE)
-    {
-        KeUnstackDetachProcess(&State);
-        return 0;
-    }
-
-    Nt = (IMAGE_NT_HEADERS64*)(Base + Dos->e_lfanew);
-    if (MmIsAddressValid(Nt) == FALSE || Nt->Signature != IMAGE_NT_SIGNATURE)
-    {
-        KeUnstackDetachProcess(&State);
-        return 0;
-    }
-
-    if (Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress == 0)
-    {
-        KeUnstackDetachProcess(&State);
-        return 0;
-    }
-
-    Export = (IMAGE_EXPORT_DIRECTORY*)(Base + Nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress);
-    Names = (ULONG*)(Base + Export->AddressOfNames);
-    Ordinals = (USHORT*)(Base + Export->AddressOfNameOrdinals);
-    Functions = (ULONG*)(Base + Export->AddressOfFunctions);
-    for (Index = 0; Index < Export->NumberOfNames; Index++)
-    {
-        if (strcmp((CHAR*)(Base + Names[Index]), ExportName) == 0)
-        {
-            Address = ModuleBase + Functions[Ordinals[Index]];
-            break;
-        }
-    }
-
-    KeUnstackDetachProcess(&State);
-    return Address;
-}
-
 static NTSTATUS
 ProcessCtrlReadFile(const WCHAR* Path, UCHAR** Buffer, ULONG* Length)
 {
@@ -1904,80 +1529,6 @@ ProcessCtrlReadFile(const WCHAR* Path, UCHAR** Buffer, ULONG* Length)
         *Buffer = NULL;
     }
 
-    return Status;
-}
-
-static NTSTATUS
-ProcessCtrlInjectApc(PEPROCESS Process, const WCHAR* Path, BOOLEAN Poison)
-{
-    KAPC_STATE State;
-    PVOID Remote;
-    SIZE_T Bytes;
-    HANDLE Thread;
-    UINT64 LoadLibrary;
-    UINT64 Kernel32;
-    NTSTATUS Status;
-    UINT64 PageVa;
-    UINT64 PtePhysical;
-    PVOID Page;
-
-    Kernel32 = ProcessCtrlModuleBase(Process, "kernel32.dll");
-    LoadLibrary = ProcessCtrlExport(Process, Kernel32, "LoadLibraryW");
-    if (LoadLibrary == 0)
-    {
-        return STATUS_NOT_FOUND;
-    }
-
-    Remote = NULL;
-    Bytes = (wcslen(Path) + 1) * sizeof(WCHAR);
-    if (Poison == FALSE)
-    {
-        KeStackAttachProcess(Process, &State);
-        Status = ZwAllocateVirtualMemory(ZwCurrentProcess(), &Remote, 0, &Bytes, MEM_COMMIT | MEM_RESERVE,
-                                          PAGE_READWRITE);
-        if (NT_SUCCESS(Status))
-        {
-            RtlCopyMemory(Remote, Path, Bytes);
-        }
-        KeUnstackDetachProcess(&State);
-        if (!NT_SUCCESS(Status))
-        {
-            return Status;
-        }
-    }
-    else
-    {
-        if (ProcessCtrlFindFreeRun(ProcessCtrlDirectory(Process), 1, &PageVa, &PtePhysical) == FALSE)
-        {
-            return STATUS_NOT_FOUND;
-        }
-
-        {
-            PHYSICAL_ADDRESS High;
-
-            High.QuadPart = -1;
-            Page = MmAllocateContiguousMemory(PAGE_SIZE, High);
-        }
-        if (Page == NULL)
-        {
-            return STATUS_INSUFFICIENT_RESOURCES;
-        }
-
-        RtlZeroMemory(Page, PAGE_SIZE);
-        RtlCopyMemory(Page, Path, Bytes);
-        ProcessCtrlWritePte(PtePhysical, MmGetPhysicalAddress(Page).QuadPart, FALSE);
-        Remote = (PVOID)PageVa;
-    }
-
-    KeStackAttachProcess(Process, &State);
-    __writecr3(__readcr3());
-    Status = ProcessCtrlFirstThread(&Thread);
-    if (NT_SUCCESS(Status))
-    {
-        Status = ProcessCtrlQueueApc(Thread, (PVOID)LoadLibrary, Remote);
-        ZwClose(Thread);
-    }
-    KeUnstackDetachProcess(&State);
     return Status;
 }
 
@@ -2368,8 +1919,7 @@ ProcessCtrlExecute(
             Status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)Request->Pid, &Process);
             if (NT_SUCCESS(Status))
             {
-                Status = ProcessCtrlInjectApc(Process, Request->Path,
-                                              (Request->Flags & HACDBG_PROCESS_FLAG_POISON) != 0);
+                Status = InjectApc(Process, (const WCHAR*)Request->Path);
                 ObDereferenceObject(Process);
             }
         }
@@ -2380,7 +1930,7 @@ ProcessCtrlExecute(
             Status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)Request->Pid, &Process);
             if (NT_SUCCESS(Status))
             {
-                Status = ProcessCtrlInjectApc(Process, Request->Path, TRUE);
+                Status = InjectPte(Process, (const WCHAR*)Request->Path);
                 ObDereferenceObject(Process);
             }
         }
