@@ -186,7 +186,7 @@ void injectDll(QWidget* parent, const ProcessRecord& record)
     }
 
     std::int32_t status = 0;
-    const bool poison = dialog.poisonPage() || dialog.pteMethod();
+    const bool poison = dialog.pteMethod() && dialog.poisonPage();
     const bool ok = processDriverCall(dialog.pteMethod() ? HACDBG_PROCESS_INJECT_PTE : HACDBG_PROCESS_INJECT_APC,
                                       static_cast<std::uint32_t>(record.pid), 0,
                                       poison ? HACDBG_PROCESS_FLAG_POISON : 0,

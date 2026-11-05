@@ -130,6 +130,21 @@ NptHidePage(
 
 BOOLEAN
 /**
+ * @brief Restores a page hidden by NptHidePage to its identity translation.
+ *
+ * @param TargetPage Guest physical page previously passed to NptHidePage.
+ *
+ * @return TRUE on success; otherwise FALSE.
+ *
+ * @details A page that is also an execute-hook target keeps the hook map.
+ * Only the main-root leaf is restored, still with the no-execute bit.
+ */
+NptUnhidePage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    );
+
+BOOLEAN
+/**
  * @brief Handles an execute-only nested page fault by selecting an NPT root.
  *
  * @details An instruction that crosses into a guest page which is not

@@ -1386,6 +1386,67 @@ EptHidePage(
 }
 
 BOOLEAN
+EptUnhidePage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    )
+{
+    UINT64 target = TargetPage.Value & EPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    if (g_Initialized == FALSE || (TargetPage.Value & (PAGE_SIZE - 1)) != 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+
+    for (index = 0; index < HACDBG_EPT_MAX_HIDDEN; index++)
+    {
+        if (g_HiddenPages[index].Active != FALSE && g_HiddenPages[index].Page == target)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_EPT_MAX_HIDDEN)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    mainPte = EptPte(g_MainEptp, target, FALSE);
+    hookPte = EptPte(g_HookEptp, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: target is a 4 KiB-aligned guest physical page recorded by
+    // EptHidePage. Both EPT roots belong to the host. This restores the
+    // identity leaf and does not install the page in a guest page table.
+    //
+    g_HiddenPages[index].Active = FALSE;
+    g_HiddenPages[index].Page = 0;
+    if (EptFindHook(target, NULL) != FALSE)
+    {
+        *mainPte = target | EptAccessFlags(target, FALSE);
+    }
+    else
+    {
+        *mainPte = target | EptAccessFlags(target, TRUE);
+        *hookPte = target | EptAccessFlags(target, FALSE);
+    }
+
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_EptLock);
+    return TRUE;
+}
+
+BOOLEAN
 EptHandleViolation(
     _In_ UINT64 Qualification,
     _In_ UINT64 GuestPhysical,

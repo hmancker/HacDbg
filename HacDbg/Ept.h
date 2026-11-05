@@ -146,6 +146,21 @@ EptHidePage(
 
 BOOLEAN
 /**
+ * @brief Restores a page hidden by EptHidePage to its identity translation.
+ *
+ * @param TargetPage Guest physical page previously passed to EptHidePage.
+ *
+ * @return TRUE on success; otherwise FALSE.
+ *
+ * @details A page that is also an execute-hook target keeps the hook map.
+ * Only the main-root leaf is restored, still without execute permission.
+ */
+EptUnhidePage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    );
+
+BOOLEAN
+/**
  * @brief Selects the EPT root for an execute violation.
  *
  * @details When the faulting instruction crosses two guest pages that are not

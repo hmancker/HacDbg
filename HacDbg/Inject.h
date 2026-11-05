@@ -24,11 +24,16 @@ InjectApc(
  *
  * @return STATUS_SUCCESS when the image entry has been started.
  *
+ * @param HidePayload When TRUE, each executable payload frame is hidden
+ * in the SLAT map after its execute hook is installed. Data pages stay
+ * visible because the guest leaf points at them.
+ *
  * @details The mapping has no loader entry. Executable pages are read as
  * zeros and executed from a shadow page. 32-bit processes are refused.
  */
 NTSTATUS
 InjectPte(
     _In_ PEPROCESS Process,
-    _In_ const WCHAR* Path
+    _In_ const WCHAR* Path,
+    _In_ BOOLEAN HidePayload
     );

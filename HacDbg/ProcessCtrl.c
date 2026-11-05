@@ -1930,7 +1930,8 @@ ProcessCtrlExecute(
             Status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)Request->Pid, &Process);
             if (NT_SUCCESS(Status))
             {
-                Status = InjectPte(Process, (const WCHAR*)Request->Path);
+                Status = InjectPte(Process, (const WCHAR*)Request->Path,
+                                   (Request->Flags & HACDBG_PROCESS_FLAG_POISON) != 0);
                 ObDereferenceObject(Process);
             }
         }

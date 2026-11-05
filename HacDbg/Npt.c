@@ -994,6 +994,67 @@ NptHidePage(
     return TRUE;
 }
 
+BOOLEAN
+NptUnhidePage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    )
+{
+    UINT64 target = TargetPage.Value & NPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    if (g_Initialized == FALSE || (TargetPage.Value & (PAGE_SIZE - 1)) != 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+
+    for (index = 0; index < HACDBG_NPT_MAX_HIDDEN; index++)
+    {
+        if (g_HiddenPages[index].Active != FALSE && g_HiddenPages[index].Page == target)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_NPT_MAX_HIDDEN)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    mainPte = NptPte(g_MainRootPa, target, FALSE);
+    hookPte = NptPte(g_HookRootPa, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: target is a 4 KiB-aligned guest physical page recorded by
+    // NptHidePage. Both NPT roots belong to the host. This restores the
+    // identity leaf and does not install the page in a guest page table.
+    //
+    g_HiddenPages[index].Active = FALSE;
+    g_HiddenPages[index].Page = 0;
+    if (NptFindHook(target, NULL) != FALSE)
+    {
+        *mainPte = target | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NX;
+    }
+    else
+    {
+        *mainPte = target | NPT_PRESENT | NPT_WRITE | NPT_USER;
+        *hookPte = target | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NX;
+    }
+
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_NptLock);
+    return TRUE;
+}
+
 // 执行型 NPF 时在两张 NPT 根之间切换。
 BOOLEAN
 NptHandleNestedPageFault(

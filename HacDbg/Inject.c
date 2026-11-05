@@ -23,10 +23,14 @@
 #include "Ept.h"
 #define INJECT_ADD_HOOK    EptAddHook
 #define INJECT_REMOVE_HOOK EptRemoveHook
+#define INJECT_HIDE_PAGE   EptHidePage
+#define INJECT_UNHIDE_PAGE EptUnhidePage
 #else
 #include "Npt.h"
 #define INJECT_ADD_HOOK    NptAddHook
 #define INJECT_REMOVE_HOOK NptRemoveHook
+#define INJECT_HIDE_PAGE   NptHidePage
+#define INJECT_UNHIDE_PAGE NptUnhidePage
 #endif
 
 #define INJECT_TAG 'jIaH'
@@ -158,6 +162,7 @@ typedef struct _INJECT_OWNED
     PVOID Virtual;
     UINT64 Physical;
     BOOLEAN Hooked;
+    BOOLEAN Hidden;
 } INJECT_OWNED;
 
 typedef struct _INJECT_EDIT
@@ -409,6 +414,7 @@ InjectTrack(
     Owned[*Count].Virtual = Virtual;
     Owned[*Count].Physical = Physical;
     Owned[*Count].Hooked = FALSE;
+    Owned[*Count].Hidden = FALSE;
     *Count += 1;
     return TRUE;
 }
@@ -444,6 +450,22 @@ InjectFreeOwned(
 
     for (Index = 0; Index < Count; Index++)
     {
+        if (Owned[Index].Hidden == FALSE)
+        {
+            continue;
+        }
+
+        if (INJECT_UNHIDE_PAGE(HacDbgGuestPhysicalAddress(Owned[Index].Physical)) == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject unhide failed pa=0x%I64x.\n", Owned[Index].Physical);
+            continue;
+        }
+
+        Owned[Index].Hidden = FALSE;
+    }
+
+    for (Index = 0; Index < Count; Index++)
+    {
         if (Owned[Index].Hooked != FALSE)
         {
             INJECT_REMOVE_HOOK(HacDbgGuestPhysicalAddress(Owned[Index].Physical));
@@ -453,11 +475,13 @@ InjectFreeOwned(
 
     for (Index = 0; Index < Count; Index++)
     {
-        if (Owned[Index].Virtual != NULL)
+        if (Owned[Index].Virtual == NULL || Owned[Index].Hidden != FALSE)
         {
-            MmFreeContiguousMemory(Owned[Index].Virtual);
-            Owned[Index].Virtual = NULL;
+            continue;
         }
+
+        MmFreeContiguousMemory(Owned[Index].Virtual);
+        Owned[Index].Virtual = NULL;
     }
 }
 
@@ -2783,7 +2807,9 @@ InjectMapImage(
     _In_ UINT64 Base,
     _In_ const UCHAR* ExecuteBits,
     _In_reads_bytes_(64) const UCHAR* Stub,
-    _Out_ ULONG* HookCount
+    _In_ BOOLEAN HidePayload,
+    _Out_ ULONG* HookCount,
+    _Out_ ULONG* HiddenCount
     )
 {
     INJECT_OWNED* Owned;
@@ -2798,6 +2824,7 @@ InjectMapImage(
     BOOLEAN Failed;
 
     *HookCount = 0;
+    *HiddenCount = 0;
     Directory = InjectDirectory(Process, INJECT_DIR_TABLE);
     UserDirectory = InjectUsableUserDirectory(Process, Directory);
     if (Directory == 0)
@@ -2835,6 +2862,7 @@ InjectMapImage(
         UINT64 Real;
         UINT64 Decoy;
         UINT64 Virtual;
+        ULONG RealIndex;
         BOOLEAN Execute;
         const UCHAR* Source;
 
@@ -2847,6 +2875,7 @@ InjectMapImage(
             break;
         }
 
+        RealIndex = Count - 1;
         Source = NULL;
         Execute = FALSE;
         if (Index < Pages)
@@ -2897,8 +2926,32 @@ InjectMapImage(
 
                 Owned[DecoyIndex].Hooked = TRUE;
                 *HookCount += 1;
+                if (HidePayload != FALSE)
+                {
+                    //
+                    // INVARIANT: Real is the 4 KiB frame copied into the
+                    // execute shadow. The guest leaf points at Decoy, so
+                    // hiding Real does not change the fetch. A guest read
+                    // of this GPA translates to the zero page.
+                    //
+                    if (INJECT_HIDE_PAGE(HacDbgGuestPhysicalAddress(Real)) == FALSE)
+                    {
+                        HACDBG_LOG("HacDbg: Err, DLL inject hide failed pa=0x%I64x.\n", Real);
+                        Failed = TRUE;
+                        Status = STATUS_UNSUCCESSFUL;
+                        break;
+                    }
+
+                    Owned[RealIndex].Hidden = TRUE;
+                    *HiddenCount += 1;
+                    HACDBG_LOG("HacDbg: DLL inject hide pa=0x%I64x.\n", Real);
+                }
             }
         }
+        //
+        // Data leaves point at Real. Hiding that GPA would zero the bytes
+        // the entry reads. That waits for a private SLAT root.
+        //
         else if (InjectMapLeaf(Directory, Virtual, Real, FALSE, Owned, &Count, Edits, &EditCount) == FALSE ||
                  (UserDirectory != 0 &&
                   InjectMapLeaf(UserDirectory, Virtual, Real, FALSE, Owned, &Count, Edits, &EditCount) == FALSE))
@@ -3315,7 +3368,8 @@ InjectChooseBase(
 NTSTATUS
 InjectPte(
     _In_ PEPROCESS Process,
-    _In_ const WCHAR* Path
+    _In_ const WCHAR* Path,
+    _In_ BOOLEAN HidePayload
     )
 {
     UCHAR* File;
@@ -3336,6 +3390,7 @@ InjectPte(
     UINT64 Ntdll;
     UINT64 ExitThread;
     ULONG Hooks;
+    ULONG Hidden;
     NTSTATUS Status;
     LONGLONG Delta;
 
@@ -3486,7 +3541,8 @@ InjectPte(
     InjectWriteStub(Stub, Base, Base + ((IMAGE_NT_HEADERS64*)(Image + ((IMAGE_DOS_HEADER*)Image)->e_lfanew))->OptionalHeader.AddressOfEntryPoint,
                     ExitThread);
     Hooks = 0;
-    Status = InjectMapImage(Process, Image, Pages * PAGE_SIZE, Base, ExecuteBits, Stub, &Hooks);
+    Hidden = 0;
+    Status = InjectMapImage(Process, Image, Pages * PAGE_SIZE, Base, ExecuteBits, Stub, HidePayload, &Hooks, &Hidden);
     ExFreePool(Image);
     if (!NT_SUCCESS(Status))
     {
@@ -3500,8 +3556,8 @@ InjectPte(
         return Status;
     }
 
-    HACDBG_LOG("HacDbg: DLL inject PTE pid=%llu va=0x%I64x place=%lu hooks=%lu.\n",
-               (UINT64)(ULONG_PTR)PsGetProcessId(Process), Base, Place, Hooks);
+    HACDBG_LOG("HacDbg: DLL inject PTE pid=%llu va=0x%I64x place=%lu hooks=%lu hidden=%lu.\n",
+               (UINT64)(ULONG_PTR)PsGetProcessId(Process), Base, Place, Hooks, Hidden);
     return STATUS_SUCCESS;
 }
 
@@ -3521,11 +3577,13 @@ InjectApc(
 NTSTATUS
 InjectPte(
     _In_ PEPROCESS Process,
-    _In_ const WCHAR* Path
+    _In_ const WCHAR* Path,
+    _In_ BOOLEAN HidePayload
     )
 {
     UNREFERENCED_PARAMETER(Process);
     UNREFERENCED_PARAMETER(Path);
+    UNREFERENCED_PARAMETER(HidePayload);
     return STATUS_NOT_SUPPORTED;
 }
 
