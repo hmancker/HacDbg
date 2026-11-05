@@ -45,6 +45,7 @@
 //
 #define SVM_NP_ENABLE                          (1ull << 0)
 
+#define SVM_EXIT_WRITE_CR3                    0x0013ull
 #define SVM_EXIT_CPUID                        0x0072ull
 #define SVM_EXIT_MSR                          0x007cull
 #define SVM_EXIT_VMRUN                        0x0080ull

@@ -59,6 +59,7 @@ static UINT64 g_MainRootPa;
 static UINT64 g_HookRootPa;
 static UINT64 g_PrivateRootPa;
 static volatile BOOLEAN g_PrivateActive;
+static volatile BOOLEAN g_CpuPrivate[256];
 static UINT64 g_DummyPagePa;
 static PVOID g_HookCopyAllocation;
 static PVOID g_HookCopyVa[HACDBG_NPT_MAX_HOOKS];
@@ -1277,12 +1278,28 @@ NptDropPrivate(
     g_PrivateRootPa = 0;
 }
 
+VOID
+NptNoteCpuPrivate(
+    _In_ UINT32 Cpu,
+    _In_ BOOLEAN UsePrivate
+    )
+{
+    if (Cpu >= 256)
+    {
+        return;
+    }
+
+    g_CpuPrivate[Cpu] = (UsePrivate != FALSE && g_PrivateActive != FALSE && g_PrivateRootPa != 0) ? TRUE : FALSE;
+}
+
 UINT64
 NptDataRootPa(
     VOID
     )
 {
-    if (g_PrivateActive != FALSE && g_PrivateRootPa != 0)
+    UINT32 cpu = KeGetCurrentProcessorNumber();
+
+    if (cpu < 256 && g_CpuPrivate[cpu] != FALSE && g_PrivateActive != FALSE && g_PrivateRootPa != 0)
     {
         return g_PrivateRootPa;
     }
@@ -1295,7 +1312,9 @@ NptDataAsid(
     VOID
     )
 {
-    if (g_PrivateActive != FALSE && g_PrivateRootPa != 0)
+    UINT32 cpu = KeGetCurrentProcessorNumber();
+
+    if (cpu < 256 && g_CpuPrivate[cpu] != FALSE && g_PrivateActive != FALSE && g_PrivateRootPa != 0)
     {
         return SVM_ASID_PRIVATE;
     }

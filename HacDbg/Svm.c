@@ -11,6 +11,9 @@
 #include "Npt.h"
 #include "PhysicalMemory.h"
 
+BOOLEAN InjectSlatArmed(VOID);
+BOOLEAN InjectSlatCr3Private(UINT64 GuestCr3);
+
 #include <intrin.h>
 
 #define HACDBG_SVM_TAG              'VcaH'
@@ -1240,6 +1243,67 @@ SvmHandleMsrAccess(
     SvmAdvanceRip(vmcb);
 }
 
+static VOID
+SvmNoteThreadRoot(
+    _In_ VMCB* Vmcb
+    )
+{
+    if (Vmcb->StateSaveArea.Cpl != 0)
+    {
+        return;
+    }
+
+    //
+    // Do not translate GS here. This exit can run above DISPATCH_LEVEL, and
+    // the temporary physical map rejects that IRQL. The directory compare
+    // does not read guest memory.
+    //
+    NptNoteCpuPrivate(KeGetCurrentProcessorNumber(), InjectSlatCr3Private(Vmcb->StateSaveArea.Cr3));
+}
+
+static VOID
+SvmPublishThreadRoot(
+    _In_ VMCB* Vmcb,
+    _In_ BOOLEAN NestedFault,
+    _In_ BOOLEAN KeepNote
+    )
+{
+    UINT64 dataRoot;
+    UINT32 dataAsid;
+    UINT16 writes;
+    BOOLEAN armed;
+
+    if (KeepNote == FALSE)
+    {
+        SvmNoteThreadRoot(Vmcb);
+    }
+    if (NestedFault == FALSE && Vmcb->StateSaveArea.Cpl == 0 &&
+        NptInstallDataRoot(Vmcb->ControlArea.NCr3, &dataRoot, &dataAsid) != FALSE)
+    {
+        //
+        // INVARIANT: dataRoot is a host nested-page-table root. The guest CR3
+        // in the VMCB stays the value the guest loaded.
+        //
+        Vmcb->ControlArea.NCr3 = dataRoot;
+        Vmcb->ControlArea.GuestAsid = dataAsid;
+        Vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_CURRENT_ASID;
+        Vmcb->ControlArea.VmcbClean &= ~(1ull << 4);
+    }
+
+    armed = InjectSlatArmed();
+    writes = Vmcb->ControlArea.InterceptCrWrite;
+    if (armed != FALSE && (writes & (1u << 3)) == 0)
+    {
+        Vmcb->ControlArea.InterceptCrWrite = (UINT16)(writes | (1u << 3));
+        Vmcb->ControlArea.VmcbClean &= ~1ull;
+    }
+    else if (armed == FALSE && (writes & (1u << 3)) != 0)
+    {
+        Vmcb->ControlArea.InterceptCrWrite = (UINT16)(writes & ~(1u << 3));
+        Vmcb->ControlArea.VmcbClean &= ~1ull;
+    }
+}
+
 // VMEXIT 总入口：恢复宿主状态，按退出码分派，返回 TRUE 表示离开 VMRUN。
 BOOLEAN
 SvmHandleVmExit(
@@ -1265,6 +1329,7 @@ SvmHandleVmExit(
     if (vmcb->StateSaveArea.Cpl == 0)
     {
         HypercallNoteKernelCr3(vmcb->StateSaveArea.Cr3);
+        SvmNoteThreadRoot(vmcb);
     }
     vmcb->ControlArea.TlbControl =
         InterlockedExchange(&processor->TlbFlushRequested, 0) != 0 ? SVM_TLB_CONTROL_FLUSH_CURRENT_ASID : 0;
@@ -1306,6 +1371,7 @@ SvmHandleVmExit(
         SvmAdvanceRip(vmcb);
         vmcb->StateSaveArea.Rax = GuestContext->Registers->Rax;
         SvmAccountExit(GuestContext);
+        SvmPublishThreadRoot(vmcb, FALSE, FALSE);
         return FALSE;
     }
 
@@ -1347,6 +1413,29 @@ SvmHandleVmExit(
         SvmHandleMsrAccess(GuestContext);
         break;
 
+    case SVM_EXIT_WRITE_CR3:
+        {
+            UINT32 reg = (UINT32)(vmcb->ControlArea.ExitInfo1 & 0xF);
+
+            if (reg > 15 || vmcb->ControlArea.NRip == 0)
+            {
+                HACDBG_LOG("HacDbg: Err, CR3 write has no next RIP reg=%u nrip=0x%I64x.\n", reg,
+                           vmcb->ControlArea.NRip);
+                SvmStopCurrentProcessor(GuestContext);
+                return TRUE;
+            }
+
+            //
+            // A CR write intercept happens before MOV to CR3 updates CR3.
+            // EXITINFO1's low nibble is the source GPR. NRip is the following
+            // instruction.
+            //
+            vmcb->StateSaveArea.Cr3 = ((UINT64*)GuestContext->Registers)[reg];
+            vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
+            vmcb->ControlArea.VmcbClean &= ~(1ull << 9);
+        }
+        break;
+
 #if HACDBG_HIDE_VIRTUALIZATION
     case SVM_EXIT_VMRUN:
     case SVM_EXIT_VMLOAD:
@@ -1386,6 +1475,7 @@ SvmHandleVmExit(
     }
 
     SvmAccountExit(GuestContext);
+    SvmPublishThreadRoot(vmcb, vmcb->ControlArea.ExitCode == SVM_EXIT_NPF, FALSE);
     vmcb->StateSaveArea.Rax = GuestContext->Registers->Rax;
     return FALSE;
 }

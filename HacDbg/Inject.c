@@ -299,7 +299,7 @@ InjectUsableUserDirectory(
 
     if (InjectReadEntry(User, 0, &Entry) == FALSE)
     {
-        return 0;
+        HACDBG_LOG("HacDbg: DLL inject user directory kept without a probe cr3=0x%I64x.\n", User);
     }
 
     return User;
@@ -2701,6 +2701,154 @@ InjectMarkCallTarget(
     return SetVm(ZwCurrentProcess(), 2, 1, &Range, &Information, sizeof(Information));
 }
 
+#define INJECT_SLAT_SLOTS 8u
+#define INJECT_SLAT_CR3_MASK 0x000FFFFFFFFFFFF000ull
+
+typedef struct _INJECT_SLAT_SLOT
+{
+    volatile UINT64 Thread;
+    PEPROCESS Process;
+    UINT64 KernelCr3;
+    UINT64 UserCr3;
+} INJECT_SLAT_SLOT;
+
+static INJECT_SLAT_SLOT g_SlatSlots[INJECT_SLAT_SLOTS];
+static volatile LONG g_SlatArmed;
+
+static VOID
+InjectSlatRefreshArmed(
+    VOID
+    )
+{
+    ULONG index;
+    LONG armed;
+
+    armed = 0;
+    for (index = 0; index < INJECT_SLAT_SLOTS; index++)
+    {
+        PETHREAD thread = (PETHREAD)g_SlatSlots[index].Thread;
+
+        if (thread == NULL)
+        {
+            continue;
+        }
+
+        if (PsIsThreadTerminating(thread) != FALSE)
+        {
+            if (InterlockedCompareExchange64((LONG64*)&g_SlatSlots[index].Thread, 0, (LONG64)thread) == (LONG64)thread)
+            {
+                ObDereferenceObject(thread);
+            }
+
+            continue;
+        }
+
+        armed = 1;
+    }
+
+    g_SlatArmed = armed;
+    KeMemoryBarrier();
+}
+
+BOOLEAN
+InjectSlatAllow(
+    _In_ PETHREAD Thread,
+    _In_ UINT64 KernelCr3,
+    _In_ UINT64 UserCr3,
+    _Out_ BOOLEAN* KeptReference
+    )
+{
+    ULONG index;
+    ULONG freeSlot;
+
+    *KeptReference = FALSE;
+    if (Thread == NULL || KernelCr3 == 0)
+    {
+        return FALSE;
+    }
+
+    InjectSlatRefreshArmed();
+    freeSlot = INJECT_SLAT_SLOTS;
+    for (index = 0; index < INJECT_SLAT_SLOTS; index++)
+    {
+        if ((PETHREAD)g_SlatSlots[index].Thread == Thread)
+        {
+            g_SlatSlots[index].KernelCr3 = KernelCr3;
+            g_SlatSlots[index].UserCr3 = UserCr3;
+            g_SlatArmed = 1;
+            KeMemoryBarrier();
+            return TRUE;
+        }
+
+        if (g_SlatSlots[index].Thread == 0 && freeSlot == INJECT_SLAT_SLOTS)
+        {
+            freeSlot = index;
+        }
+    }
+
+    if (freeSlot == INJECT_SLAT_SLOTS)
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject slat allow list is full.\n");
+        return FALSE;
+    }
+
+    g_SlatSlots[freeSlot].Process = PsGetThreadProcess(Thread);
+    g_SlatSlots[freeSlot].KernelCr3 = KernelCr3;
+    g_SlatSlots[freeSlot].UserCr3 = UserCr3;
+    KeMemoryBarrier();
+    g_SlatSlots[freeSlot].Thread = (UINT64)Thread;
+    g_SlatArmed = 1;
+    KeMemoryBarrier();
+    *KeptReference = TRUE;
+    HACDBG_LOG("HacDbg: DLL inject slat thread=%p tid=%llu kernel=0x%I64x user=0x%I64x.\n", Thread,
+               (UINT64)(ULONG_PTR)PsGetThreadId(Thread), KernelCr3 & INJECT_SLAT_CR3_MASK,
+               UserCr3 & INJECT_SLAT_CR3_MASK);
+    return TRUE;
+}
+
+BOOLEAN
+InjectSlatArmed(
+    VOID
+    )
+{
+    return g_SlatArmed != 0;
+}
+
+BOOLEAN
+InjectSlatCr3Private(
+    _In_ UINT64 GuestCr3
+    )
+{
+    UINT64 page;
+    ULONG index;
+
+    page = GuestCr3 & INJECT_SLAT_CR3_MASK;
+    if (page == 0 || g_SlatArmed == 0)
+    {
+        return FALSE;
+    }
+
+    for (index = 0; index < INJECT_SLAT_SLOTS; index++)
+    {
+        UINT64 kernel;
+        UINT64 user;
+
+        if (g_SlatSlots[index].Thread == 0)
+        {
+            continue;
+        }
+
+        kernel = g_SlatSlots[index].KernelCr3 & INJECT_SLAT_CR3_MASK;
+        user = g_SlatSlots[index].UserCr3 & INJECT_SLAT_CR3_MASK;
+        if (page == kernel || (user != 0 && page == user))
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
 static NTSTATUS
 InjectStartEntry(
     _In_ PEPROCESS Process,
@@ -2782,7 +2930,7 @@ InjectStartEntry(
         }
         else
         {
-            Status = Create(ZwCurrentProcess(), NULL, FALSE, 0, INJECT_STACK_BYTES, PAGE_SIZE, Gate, NULL,
+            Status = Create(ZwCurrentProcess(), NULL, TRUE, 0, INJECT_STACK_BYTES, PAGE_SIZE, Gate, NULL,
                             &ThreadHandle, &ClientId);
         }
     }
@@ -2804,6 +2952,56 @@ InjectStartEntry(
 
         HACDBG_LOG("HacDbg: Err, DLL inject start thread status=0x%08x gate=0x%p stub=0x%I64x.\n", Status, Gate, Rip);
         return Status;
+    }
+
+    if (ThreadHandle != NULL)
+    {
+        PETHREAD threadObject = NULL;
+        BOOLEAN kept = FALSE;
+        ULONG previous = 0;
+
+        if (NT_SUCCESS(ObReferenceObjectByHandle(ThreadHandle, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
+                                                 (PVOID*)&threadObject, NULL)))
+        {
+            UINT64 kernelCr3 = InjectDirectory(Process, INJECT_DIR_TABLE);
+            UINT64 userCr3 = InjectUsableUserDirectory(Process, kernelCr3);
+
+            if (InjectSlatAllow(threadObject, kernelCr3, userCr3, &kept) == FALSE || kept == FALSE)
+            {
+                ObDereferenceObject(threadObject);
+                kept = FALSE;
+            }
+        }
+
+        if (kept == FALSE)
+        {
+            ZwClose(ThreadHandle);
+            KeUnstackDetachProcess(&State);
+            HACDBG_LOG("HacDbg: Err, DLL inject slat allow failed stub=0x%I64x.\n", Rip);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        //
+        // The thread is still suspended. Arm CR3 exiting on every processor
+        // before it runs, or it executes on the main root and reads a zero
+        // import table.
+        //
+        if (InjectFlush() == FALSE)
+        {
+            ZwClose(ThreadHandle);
+            KeUnstackDetachProcess(&State);
+            HACDBG_LOG("HacDbg: Err, DLL inject slat flush failed stub=0x%I64x.\n", Rip);
+            return STATUS_UNSUCCESSFUL;
+        }
+
+        Status = ZwResumeThread(ThreadHandle, &previous);
+        if (!NT_SUCCESS(Status))
+        {
+            ZwClose(ThreadHandle);
+            KeUnstackDetachProcess(&State);
+            HACDBG_LOG("HacDbg: Err, DLL inject resume status=0x%08x stub=0x%I64x.\n", Status, Rip);
+            return Status;
+        }
     }
 
     Delay.QuadPart = -3000000;
@@ -3327,7 +3525,6 @@ InjectChooseBase(
                     for (SectionIndex = 0; SectionIndex < Nt.FileHeader.NumberOfSections && Chosen == 0; SectionIndex++)
                     {
                         IMAGE_SECTION_HEADER Section;
-                        UINT64 Bytes;
 
                         RtlZeroMemory(&Section, sizeof(Section));
                         __try
@@ -3347,9 +3544,13 @@ InjectChooseBase(
                             continue;
                         }
 
-                        Bytes = Section.Misc.VirtualSize == 0 ? Section.SizeOfRawData : Section.Misc.VirtualSize;
-                        Chosen = InjectHoleInSection(Directory, UserDirectory, Module + Section.VirtualAddress, Bytes,
-                                                     Pages);
+                        //
+                        // An empty PTE inside an image section still belongs to
+                        // that VAD's page table. Filling it changes the use
+                        // count. Notepad's exit then bugchecks 0x1A (41790) in
+                        // MiReducePteUseCount. Leave those slots alone.
+                        //
+                        Chosen = 0;
                     }
 
                     if (Chosen != 0)

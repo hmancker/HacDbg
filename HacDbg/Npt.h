@@ -181,6 +181,18 @@ NptDropPrivate(
     VOID
     );
 
+VOID
+/**
+ * @brief Remembers whether this logical processor's current thread uses the private root.
+ *
+ * @param Cpu KeGetCurrentProcessorNumber value.
+ * @param UsePrivate TRUE selects the private root for later data-root reads.
+ */
+NptNoteCpuPrivate(
+    _In_ UINT32 Cpu,
+    _In_ BOOLEAN UsePrivate
+    );
+
 UINT64
 /**
  * @brief Returns the nCR3 a processor should use for data access.

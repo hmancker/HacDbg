@@ -11,6 +11,9 @@
 #include "Debug.h"
 #include "Ept.h"
 #include "Hypercall.h"
+
+BOOLEAN InjectSlatArmed(VOID);
+BOOLEAN InjectSlatCr3Private(UINT64 GuestCr3);
 #include "PhysicalMemory.h"
 #include "Svm.h"
 
@@ -1275,6 +1278,22 @@ VmxHandleCrAccess(
     access = (UINT32)((qualification >> 4) & 3u);
     reg = (UINT32)((qualification >> 8) & 0xF);
 
+    if (cr == 3 && access == 0 && reg <= 15)
+    {
+        //
+        // CR3-load exiting occurs before MOV to CR3 updates CR3. The source
+        // register is the value the guest asked to load. RIP stays on the MOV
+        // until it is advanced.
+        //
+        if (VmxWrite(VMCS_GUEST_CR3, ((UINT64*)&ProcessorContext->Registers)[reg]) == FALSE)
+        {
+            return FALSE;
+        }
+
+        ProcessorContext->GuestCr3 = ((UINT64*)&ProcessorContext->Registers)[reg];
+        return VmxAdvanceRip();
+    }
+
     if (cr != 4 || access != 0 || reg > 15)
     {
         HACDBG_LOG("HacDbg: Err, unhandled CR access qual=0x%I64x.\n", qualification);
@@ -2351,6 +2370,72 @@ VmxAccountExit(
 #endif
 }
 
+static VOID
+VmxNoteThreadRoot(
+    VOID
+    )
+{
+    UINT64 cr3;
+
+    if (VmxGuestCpl() != 0)
+    {
+        return;
+    }
+
+    cr3 = 0;
+    if (VmxRead(VMCS_GUEST_CR3, &cr3) == FALSE)
+    {
+        cr3 = 0;
+    }
+
+    //
+    // Do not translate GS here. This exit can run above DISPATCH_LEVEL, and
+    // the temporary physical map rejects that IRQL.
+    //
+    EptNoteCpuPrivate(KeGetCurrentProcessorNumber(), InjectSlatCr3Private(cr3));
+}
+
+static VOID
+VmxPublishThreadRoot(
+    _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext,
+    _In_ UINT32 Reason
+    )
+{
+    UINT64 currentEptp;
+    UINT64 dataEptp;
+    UINT64 controls;
+    UINT32 wanted;
+
+    VmxNoteThreadRoot();
+    if (Reason != VMX_EXIT_EPT_VIOLATION && VmxGuestCpl() == 0)
+    {
+        currentEptp = 0;
+        dataEptp = 0;
+        if (VmxRead(VMCS_CTRL_EPT_POINTER, &currentEptp) != FALSE &&
+            EptInstallDataRoot(currentEptp, &dataEptp) != FALSE)
+        {
+            //
+            // INVARIANT: dataEptp is a host EPT root. Switching it does not
+            // change the guest CR3 value saved for MOV from CR3.
+            //
+            VmxWrite(VMCS_CTRL_EPT_POINTER, dataEptp);
+            VmxInvalidateEpt(ProcessorContext);
+        }
+    }
+
+    wanted = g_ProcControls;
+    if (InjectSlatArmed() != FALSE)
+    {
+        wanted |= VMX_PROC_CR3_LOAD_EXITING;
+    }
+
+    controls = 0;
+    if (VmxRead(VMCS_CTRL_PROCESSOR_BASED, &controls) != FALSE && controls != wanted)
+    {
+        VmxWrite(VMCS_CTRL_PROCESSOR_BASED, wanted);
+    }
+}
+
 BOOLEAN
 VmxHandleVmExit(
     _Inout_ VMX_PROCESSOR_CONTEXT* ProcessorContext
@@ -2400,6 +2485,8 @@ VmxHandleVmExit(
         {
             HypercallNoteKernelCr3(ProcessorContext->GuestCr3);
         }
+
+        VmxNoteThreadRoot();
     }
 
     if (entryFailure != FALSE)
@@ -2447,6 +2534,11 @@ VmxHandleVmExit(
 
     if (stopGuest == FALSE)
     {
+        if (entryFailure == FALSE)
+        {
+            VmxPublishThreadRoot(ProcessorContext, reason);
+        }
+
         if (InterlockedExchange(&ProcessorContext->InveptRequested, 0) != 0)
         {
             VmxInvalidateEpt(ProcessorContext);

@@ -37,3 +37,44 @@ InjectPte(
     _In_ const WCHAR* Path,
     _In_ BOOLEAN HidePayload
     );
+
+BOOLEAN
+/**
+ * @brief Records one thread that may use the private SLAT root.
+ *
+ * @param Thread System thread object. The caller holds one reference.
+ * @param KernelCr3 Kernel directory of the thread's process.
+ * @param UserCr3 User directory, or zero when KVA shadow is not in use.
+ * @param KeptReference Receives TRUE when this function keeps the caller's reference.
+ *
+ * @return TRUE when the thread is in the allow list.
+ */
+InjectSlatAllow(
+    _In_ PETHREAD Thread,
+    _In_ UINT64 KernelCr3,
+    _In_ UINT64 UserCr3,
+    _Out_ BOOLEAN* KeptReference
+    );
+
+BOOLEAN
+/**
+ * @brief Reports whether any private-root thread is still recorded.
+ */
+InjectSlatArmed(
+    VOID
+    );
+
+BOOLEAN
+/**
+ * @brief Reports whether this guest CR3 should use the private root.
+ *
+ * @param GuestCr3 Guest CR3, including PCID bits.
+ *
+ * @return TRUE when the private root applies.
+ *
+ * @details Compares the page-aligned CR3 with the directories recorded for
+ * an injected process. It does not read guest memory.
+ */
+InjectSlatCr3Private(
+    _In_ UINT64 GuestCr3
+    );
