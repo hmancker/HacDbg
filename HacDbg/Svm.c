@@ -1286,6 +1286,21 @@ SvmHandleVmExit(
         (UINT32)GuestContext->Registers->Rcx == HACDBG_FLUSH_CPUID_SUBLEAF)
     {
         GuestContext->Registers->Rax = 1;
+        {
+            UINT64 dataRoot = 0;
+            UINT32 dataAsid = 0;
+
+            if (NptInstallDataRoot(vmcb->ControlArea.NCr3, &dataRoot, &dataAsid) != FALSE)
+            {
+                //
+                // INVARIANT: dataRoot is a host nested-page-table root. The
+                // private tables are host pages. Guest page tables still name
+                // the decoy GPA, not the payload frame.
+                //
+                vmcb->ControlArea.NCr3 = dataRoot;
+                vmcb->ControlArea.GuestAsid = dataAsid;
+            }
+        }
         vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_CURRENT_ASID;
         vmcb->ControlArea.VmcbClean &= ~(1ull << 4);
         SvmAdvanceRip(vmcb);

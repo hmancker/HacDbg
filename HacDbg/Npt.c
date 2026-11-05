@@ -57,6 +57,8 @@ static UINT64 g_SplitPagesUsed;
 static UINT64 g_SplitPagesCarved;
 static UINT64 g_MainRootPa;
 static UINT64 g_HookRootPa;
+static UINT64 g_PrivateRootPa;
+static volatile BOOLEAN g_PrivateActive;
 static UINT64 g_DummyPagePa;
 static PVOID g_HookCopyAllocation;
 static PVOID g_HookCopyVa[HACDBG_NPT_MAX_HOOKS];
@@ -627,6 +629,8 @@ NptCleanup(
     g_SplitPagesCarved = 0;
     g_MainRootPa = 0;
     g_HookRootPa = 0;
+    g_PrivateRootPa = 0;
+    g_PrivateActive = FALSE;
     g_DummyPagePa = 0;
     if (g_HookCopyAllocation != NULL)
     {
@@ -1055,6 +1059,270 @@ NptUnhidePage(
     return TRUE;
 }
 
+static BOOLEAN
+NptUnshare(
+    _Inout_ UINT64* PrivateEntry,
+    _In_ UINT64 MainEntry,
+    _Out_ UINT64** Table
+    )
+{
+    UINT64* source;
+    UINT64* copy;
+    UINT64 copyPa;
+
+    if ((*PrivateEntry & NPT_ADDRESS_MASK) != (MainEntry & NPT_ADDRESS_MASK))
+    {
+        *Table = NptPageFromEntry(*PrivateEntry);
+        return *Table != NULL;
+    }
+
+    source = NptPageFromEntry(*PrivateEntry);
+    copy = (UINT64*)NptAllocateSplitPage(&copyPa);
+    if (source == NULL || copy == NULL)
+    {
+        return FALSE;
+    }
+
+    RtlCopyMemory(copy, source, PAGE_SIZE);
+    *PrivateEntry = (copyPa & NPT_ADDRESS_MASK) | (*PrivateEntry & ~NPT_ADDRESS_MASK);
+    KeMemoryBarrier();
+    *Table = copy;
+    return TRUE;
+}
+
+static BOOLEAN
+NptSplitPrivatePde(
+    _Inout_ UINT64* PrivatePde
+    )
+{
+    UINT64* pt;
+    UINT64 splitPa;
+    UINT64 base;
+    UINT64 index;
+    BOOLEAN noExecute;
+
+    pt = (UINT64*)NptAllocateSplitPage(&splitPa);
+    if (pt == NULL)
+    {
+        return FALSE;
+    }
+
+    base = *PrivatePde & NPT_LARGE_2MB_MASK;
+    noExecute = (*PrivatePde & NPT_NX) != 0;
+    for (index = 0; index < 512; index++)
+    {
+        UINT64 page = base + (index * PAGE_SIZE);
+        UINT64 flags = NPT_PRESENT | NPT_WRITE | NPT_USER;
+
+        if (noExecute != FALSE || NptFindHidden(page) != FALSE)
+        {
+            flags |= NPT_NX;
+        }
+
+        if (NptFindHidden(page) != FALSE)
+        {
+            page = g_DummyPagePa;
+        }
+
+        pt[index] = page | flags;
+    }
+
+    *PrivatePde = (splitPa & NPT_ADDRESS_MASK) | NPT_PRESENT | NPT_WRITE | NPT_USER;
+    KeMemoryBarrier();
+    return TRUE;
+}
+
+static BOOLEAN
+NptEnsurePrivate(
+    VOID
+    )
+{
+    UINT64* main;
+    UINT64* copy;
+    UINT64 copyPa;
+
+    if (g_PrivateRootPa != 0)
+    {
+        return TRUE;
+    }
+
+    main = NptVirtualFromPhysical(g_MainRootPa & NPT_ADDRESS_MASK);
+    copy = (UINT64*)NptAllocateSplitPage(&copyPa);
+    if (main == NULL || copy == NULL)
+    {
+        return FALSE;
+    }
+
+    RtlCopyMemory(copy, main, PAGE_SIZE);
+    g_PrivateRootPa = copyPa & NPT_ADDRESS_MASK;
+    KeMemoryBarrier();
+    return TRUE;
+}
+
+BOOLEAN
+NptMapPrivate(
+    _In_ GUEST_PHYSICAL_ADDRESS DecoyPage,
+    _In_ GUEST_PHYSICAL_ADDRESS PayloadPage,
+    _In_ BOOLEAN Executable
+    )
+{
+    UINT64 decoy = DecoyPage.Value & NPT_ADDRESS_MASK;
+    UINT64 payload = PayloadPage.Value & NPT_ADDRESS_MASK;
+    UINT64 pml4Index;
+    UINT64 pdptIndex;
+    UINT64 pdIndex;
+    UINT64 ptIndex;
+    UINT64* mainPml4;
+    UINT64* privatePml4;
+    UINT64* mainPdpt;
+    UINT64* privatePdpt;
+    UINT64* mainPd;
+    UINT64* privatePd;
+    UINT64* pt;
+    UINT64 flags;
+    BOOLEAN ok;
+
+    if (g_Initialized == FALSE || decoy == 0 || payload == 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    ok = NptEnsurePrivate();
+    mainPml4 = NptVirtualFromPhysical(g_MainRootPa & NPT_ADDRESS_MASK);
+    privatePml4 = NptVirtualFromPhysical(g_PrivateRootPa & NPT_ADDRESS_MASK);
+    if (ok == FALSE || mainPml4 == NULL || privatePml4 == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        HACDBG_LOG("HacDbg: Err, NPT private root was not built.\n");
+        return FALSE;
+    }
+
+    pml4Index = (decoy >> 39) & 0x1ffull;
+    pdptIndex = (decoy >> 30) & 0x1ffull;
+    pdIndex = (decoy >> 21) & 0x1ffull;
+    ptIndex = (decoy >> PAGE_SHIFT) & 0x1ffull;
+    ok = NptUnshare(&privatePml4[pml4Index], mainPml4[pml4Index], &privatePdpt);
+    mainPdpt = NptPageFromEntry(mainPml4[pml4Index]);
+    if (ok == FALSE || mainPdpt == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    ok = NptUnshare(&privatePdpt[pdptIndex], mainPdpt[pdptIndex], &privatePd);
+    mainPd = NptPageFromEntry(mainPdpt[pdptIndex]);
+    if (ok == FALSE || mainPd == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    if ((privatePd[pdIndex] & NPT_LARGE) != 0)
+    {
+        ok = NptSplitPrivatePde(&privatePd[pdIndex]);
+    }
+    else if ((mainPd[pdIndex] & NPT_LARGE) == 0)
+    {
+        ok = NptUnshare(&privatePd[pdIndex], mainPd[pdIndex], &pt);
+    }
+
+    pt = NptPageFromEntry(privatePd[pdIndex]);
+    if (ok == FALSE || pt == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        HACDBG_LOG("HacDbg: Err, NPT private split failed decoy=0x%I64x.\n", decoy);
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: decoy is a 4 KiB guest page whose main-root leaf stays the
+    // identity zero page. This leaf belongs only to the private root. payload
+    // is a host frame that is not installed in the guest page tables.
+    //
+    flags = NPT_PRESENT | NPT_WRITE | NPT_USER;
+    if (Executable == FALSE)
+    {
+        flags |= NPT_NX;
+    }
+
+    pt[ptIndex] = payload | flags;
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_NptLock);
+    return TRUE;
+}
+
+BOOLEAN
+NptUsePrivateRoot(
+    _In_ BOOLEAN Enable
+    )
+{
+    if (Enable != FALSE && g_PrivateRootPa == 0)
+    {
+        return FALSE;
+    }
+
+    g_PrivateActive = Enable;
+    KeMemoryBarrier();
+    return TRUE;
+}
+
+VOID
+NptDropPrivate(
+    VOID
+    )
+{
+    g_PrivateActive = FALSE;
+    KeMemoryBarrier();
+    g_PrivateRootPa = 0;
+}
+
+UINT64
+NptDataRootPa(
+    VOID
+    )
+{
+    if (g_PrivateActive != FALSE && g_PrivateRootPa != 0)
+    {
+        return g_PrivateRootPa;
+    }
+
+    return g_MainRootPa;
+}
+
+UINT32
+NptDataAsid(
+    VOID
+    )
+{
+    if (g_PrivateActive != FALSE && g_PrivateRootPa != 0)
+    {
+        return SVM_ASID_PRIVATE;
+    }
+
+    return SVM_ASID_MAIN;
+}
+
+BOOLEAN
+NptInstallDataRoot(
+    _In_ UINT64 CurrentRoot,
+    _Out_ UINT64* NextRoot,
+    _Out_ UINT32* NextAsid
+    )
+{
+    UINT64 current = CurrentRoot & NPT_ADDRESS_MASK;
+    UINT64 data = NptDataRootPa();
+
+    *NextRoot = data;
+    *NextAsid = NptDataAsid();
+    if (current == (g_HookRootPa & NPT_ADDRESS_MASK) || current == (data & NPT_ADDRESS_MASK))
+    {
+        return FALSE;
+    }
+
+    return data != 0;
+}
+
 // 执行型 NPF 时在两张 NPT 根之间切换。
 BOOLEAN
 NptHandleNestedPageFault(
@@ -1143,8 +1411,8 @@ NptHandleNestedPageFault(
             return TRUE;
         }
 
-        Vmcb->ControlArea.GuestAsid = SVM_ASID_MAIN;
-        Vmcb->ControlArea.NCr3 = g_MainRootPa;
+        Vmcb->ControlArea.GuestAsid = (UINT32)NptDataAsid();
+        Vmcb->ControlArea.NCr3 = NptDataRootPa();
         Vmcb->ControlArea.VmcbClean &= ~(1ull << 4);
         return TRUE;
     }

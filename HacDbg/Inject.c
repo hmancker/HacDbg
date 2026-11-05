@@ -25,12 +25,20 @@
 #define INJECT_REMOVE_HOOK EptRemoveHook
 #define INJECT_HIDE_PAGE   EptHidePage
 #define INJECT_UNHIDE_PAGE EptUnhidePage
+#define INJECT_MAP_PRIVATE EptMapPrivate
+#define INJECT_USE_PRIVATE EptUsePrivateRoot
+#define INJECT_DROP_PRIVATE EptDropPrivate
+#define INJECT_PRIVATE_ON (EptDataEptp() != EptMainEptp())
 #else
 #include "Npt.h"
 #define INJECT_ADD_HOOK    NptAddHook
 #define INJECT_REMOVE_HOOK NptRemoveHook
 #define INJECT_HIDE_PAGE   NptHidePage
 #define INJECT_UNHIDE_PAGE NptUnhidePage
+#define INJECT_MAP_PRIVATE NptMapPrivate
+#define INJECT_USE_PRIVATE NptUsePrivateRoot
+#define INJECT_DROP_PRIVATE NptDropPrivate
+#define INJECT_PRIVATE_ON (NptDataRootPa() != NptMainRootPa())
 #endif
 
 #define INJECT_TAG 'jIaH'
@@ -2836,13 +2844,15 @@ InjectMapImage(
     _In_reads_bytes_(64) const UCHAR* Stub,
     _In_ BOOLEAN HidePayload,
     _Out_ ULONG* HookCount,
-    _Out_ ULONG* HiddenCount
+    _Out_ ULONG* HiddenCount,
+    _Out_ ULONG* DataCount
     )
 {
     INJECT_OWNED* Owned;
     INJECT_EDIT* Edits;
     ULONG Count;
     ULONG EditCount;
+    BOOLEAN PrivateWasOn;
     ULONG Pages;
     ULONG Index;
     UINT64 Directory;
@@ -2852,6 +2862,7 @@ InjectMapImage(
 
     *HookCount = 0;
     *HiddenCount = 0;
+    *DataCount = 0;
     Directory = InjectDirectory(Process, INJECT_DIR_TABLE);
     UserDirectory = InjectUsableUserDirectory(Process, Directory);
     if (Directory == 0)
@@ -2880,6 +2891,7 @@ InjectMapImage(
     RtlZeroMemory(Owned, sizeof(INJECT_OWNED) * INJECT_MAX_PAGES);
     Count = 0;
     EditCount = 0;
+    PrivateWasOn = INJECT_PRIVATE_ON;
     Failed = FALSE;
     Status = STATUS_SUCCESS;
     for (Index = 0; Index < Pages + INJECT_EXTRA_PAGES && Failed == FALSE; Index++)
@@ -2953,6 +2965,16 @@ InjectMapImage(
 
                 Owned[DecoyIndex].Hooked = TRUE;
                 *HookCount += 1;
+                if (INJECT_MAP_PRIVATE(HacDbgGuestPhysicalAddress(Decoy), HacDbgGuestPhysicalAddress(Real), TRUE) ==
+                    FALSE)
+                {
+                    HACDBG_LOG("HacDbg: Err, DLL inject private map failed decoy=0x%I64x real=0x%I64x.\n", Decoy,
+                               Real);
+                    Failed = TRUE;
+                    Status = STATUS_UNSUCCESSFUL;
+                    break;
+                }
+
                 if (HidePayload != FALSE)
                 {
                     //
@@ -2976,28 +2998,63 @@ InjectMapImage(
             }
         }
         //
-        // Data leaves point at Real. Hiding that GPA would zero the bytes
-        // the entry reads. That waits for a private SLAT root.
+        // The guest leaf names a zero decoy. The main root translates that
+        // GPA to zeros. The private root translates it to Real, so the inject
+        // thread can read the import table and the string after the flush
+        // installs that root.
         //
-        else if (InjectMapLeaf(Directory, Virtual, Real, FALSE, Owned, &Count, Edits, &EditCount) == FALSE ||
-                 (UserDirectory != 0 &&
-                  InjectMapLeaf(UserDirectory, Virtual, Real, FALSE, Owned, &Count, Edits, &EditCount) == FALSE))
+        else
         {
-            Failed = TRUE;
-            Status = STATUS_UNSUCCESSFUL;
-            break;
+            DecoyVirtual = NULL;
+            Decoy = InjectAllocFrame(&DecoyVirtual);
+
+            if (Decoy == 0 || InjectTrack(Owned, &Count, DecoyVirtual, Decoy) == FALSE)
+            {
+                if (DecoyVirtual != NULL)
+                {
+                    MmFreeContiguousMemory(DecoyVirtual);
+                }
+
+                Failed = TRUE;
+                Status = STATUS_INSUFFICIENT_RESOURCES;
+            }
+            else if (InjectMapLeaf(Directory, Virtual, Decoy, FALSE, Owned, &Count, Edits, &EditCount) == FALSE ||
+                     (UserDirectory != 0 &&
+                      InjectMapLeaf(UserDirectory, Virtual, Decoy, FALSE, Owned, &Count, Edits, &EditCount) == FALSE) ||
+                     INJECT_MAP_PRIVATE(HacDbgGuestPhysicalAddress(Decoy), HacDbgGuestPhysicalAddress(Real), FALSE) ==
+                         FALSE)
+            {
+                HACDBG_LOG("HacDbg: Err, DLL inject private data failed va=0x%I64x decoy=0x%I64x.\n", Virtual, Decoy);
+                Failed = TRUE;
+                Status = STATUS_UNSUCCESSFUL;
+            }
+            else
+            {
+                *DataCount += 1;
+            }
         }
     }
 
-    if (Failed == FALSE && InjectFlush() == FALSE)
+    if (Failed == FALSE && (INJECT_USE_PRIVATE(TRUE) == FALSE || InjectFlush() == FALSE))
     {
-        HACDBG_LOG("HacDbg: Err, DLL inject SLAT flush failed.\n");
+        HACDBG_LOG("HacDbg: Err, DLL inject private root flush failed.\n");
+        if (PrivateWasOn == FALSE)
+        {
+            INJECT_DROP_PRIVATE();
+        }
+
         Failed = TRUE;
         Status = STATUS_UNSUCCESSFUL;
     }
 
     if (Failed != FALSE)
     {
+        if (PrivateWasOn == FALSE)
+        {
+            INJECT_DROP_PRIVATE();
+            InjectFlush();
+        }
+
         InjectRestoreEdits(Edits, EditCount);
         InjectFreeOwned(Owned, Count);
     }
@@ -3418,6 +3475,7 @@ InjectPte(
     UINT64 ExitThread;
     ULONG Hooks;
     ULONG Hidden;
+    ULONG Data;
     NTSTATUS Status;
     LONGLONG Delta;
 
@@ -3574,7 +3632,9 @@ InjectPte(
                     ExitThread);
     Hooks = 0;
     Hidden = 0;
-    Status = InjectMapImage(Process, Image, Pages * PAGE_SIZE, Base, ExecuteBits, Stub, HidePayload, &Hooks, &Hidden);
+    Data = 0;
+    Status = InjectMapImage(Process, Image, Pages * PAGE_SIZE, Base, ExecuteBits, Stub, HidePayload, &Hooks, &Hidden,
+                            &Data);
     ExFreePool(Image);
     if (!NT_SUCCESS(Status))
     {
@@ -3588,8 +3648,8 @@ InjectPte(
         return Status;
     }
 
-    HACDBG_LOG("HacDbg: DLL inject PTE pid=%llu va=0x%I64x place=%lu hooks=%lu hidden=%lu.\n",
-               (UINT64)(ULONG_PTR)PsGetProcessId(Process), Base, Place, Hooks, Hidden);
+    HACDBG_LOG("HacDbg: DLL inject PTE pid=%llu va=0x%I64x place=%lu hooks=%lu hidden=%lu data=%lu private=1.\n",
+               (UINT64)(ULONG_PTR)PsGetProcessId(Process), Base, Place, Hooks, Hidden, Data);
     return STATUS_SUCCESS;
 }
 

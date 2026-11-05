@@ -145,6 +145,76 @@ NptUnhidePage(
 
 BOOLEAN
 /**
+ * @brief Points one guest page at a payload frame in the private NPT root.
+ *
+ * @param DecoyPage Guest physical page installed in the guest page tables.
+ * @param PayloadPage Host frame that contains the bytes the inject thread reads.
+ * @param Executable TRUE when the private leaf must allow instruction fetch.
+ *
+ * @return TRUE when the private root has its own leaf for DecoyPage.
+ *
+ * @details The main root keeps the identity translation of DecoyPage.
+ */
+NptMapPrivate(
+    _In_ GUEST_PHYSICAL_ADDRESS DecoyPage,
+    _In_ GUEST_PHYSICAL_ADDRESS PayloadPage,
+    _In_ BOOLEAN Executable
+    );
+
+BOOLEAN
+/**
+ * @brief Makes subsequent VM-exits install the private root as the data root.
+ *
+ * @param Enable TRUE publishes the private root. FALSE returns to the main root.
+ *
+ * @return FALSE when Enable is TRUE and no private root has been built.
+ */
+NptUsePrivateRoot(
+    _In_ BOOLEAN Enable
+    );
+
+VOID
+/**
+ * @brief Forgets a private root that was never installed.
+ */
+NptDropPrivate(
+    VOID
+    );
+
+UINT64
+/**
+ * @brief Returns the nCR3 a processor should use for data access.
+ */
+NptDataRootPa(
+    VOID
+    );
+
+UINT32
+/**
+ * @brief Returns the ASID that belongs to NptDataRootPa.
+ */
+NptDataAsid(
+    VOID
+    );
+
+BOOLEAN
+/**
+ * @brief Reports the data nCR3 to install when the processor is not on the hook root.
+ *
+ * @param CurrentRoot nCR3 currently in the VMCB.
+ * @param NextRoot Receives the data nCR3 when this function returns TRUE.
+ * @param NextAsid Receives the ASID for NextRoot.
+ *
+ * @return TRUE when CurrentRoot should be replaced.
+ */
+NptInstallDataRoot(
+    _In_ UINT64 CurrentRoot,
+    _Out_ UINT64* NextRoot,
+    _Out_ UINT32* NextAsid
+    );
+
+BOOLEAN
+/**
  * @brief Handles an execute-only nested page fault by selecting an NPT root.
  *
  * @details An instruction that crosses into a guest page which is not

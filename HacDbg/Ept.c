@@ -103,6 +103,8 @@ static UINT64 g_SplitPagesUsed;
 static UINT64 g_SplitPagesCarved;
 static UINT64 g_MainEptp;
 static UINT64 g_HookEptp;
+static UINT64 g_PrivateEptp;
+static volatile BOOLEAN g_PrivateActive;
 static UINT64 g_DummyPagePa;
 static PVOID g_HookCopyAllocation;
 static PVOID g_HookCopyVa[HACDBG_EPT_MAX_HOOKS];
@@ -1012,6 +1014,8 @@ EptCleanup(
     g_SplitPagesCarved = 0;
     g_MainEptp = 0;
     g_HookEptp = 0;
+    g_PrivateEptp = 0;
+    g_PrivateActive = FALSE;
     g_DummyPagePa = 0;
     if (g_HookCopyAllocation != NULL)
     {
@@ -1446,6 +1450,251 @@ EptUnhidePage(
     return TRUE;
 }
 
+static BOOLEAN
+EptUnshare(
+    _Inout_ UINT64* PrivateEntry,
+    _In_ UINT64 MainEntry,
+    _Out_ UINT64** Table
+    )
+{
+    UINT64* source;
+    UINT64* copy;
+    UINT64 copyPa;
+
+    if ((*PrivateEntry & EPT_ADDRESS_MASK) != (MainEntry & EPT_ADDRESS_MASK))
+    {
+        *Table = EptPageFromEntry(*PrivateEntry);
+        return *Table != NULL;
+    }
+
+    source = EptPageFromEntry(*PrivateEntry);
+    copy = (UINT64*)EptAllocateSplitPage(&copyPa);
+    if (source == NULL || copy == NULL)
+    {
+        return FALSE;
+    }
+
+    RtlCopyMemory(copy, source, PAGE_SIZE);
+    *PrivateEntry = (copyPa & EPT_ADDRESS_MASK) | (*PrivateEntry & ~EPT_ADDRESS_MASK);
+    KeMemoryBarrier();
+    *Table = copy;
+    return TRUE;
+}
+
+static BOOLEAN
+EptSplitPrivatePde(
+    _Inout_ UINT64* PrivatePde
+    )
+{
+    UINT64* pt;
+    UINT64 splitPa;
+    UINT64 base;
+    UINT64 index;
+    BOOLEAN executable;
+
+    pt = (UINT64*)EptAllocateSplitPage(&splitPa);
+    if (pt == NULL)
+    {
+        return FALSE;
+    }
+
+    base = *PrivatePde & EPT_LARGE_2MB_MASK;
+    executable = (*PrivatePde & EPT_EXECUTE) != 0;
+    for (index = 0; index < 512; index++)
+    {
+        UINT64 page = base + (index * PAGE_SIZE);
+        UINT64 mapped = page;
+
+        if (EptFindHidden(page) != FALSE)
+        {
+            mapped = g_DummyPagePa;
+        }
+
+        pt[index] = mapped | EptAccessFlags(mapped, executable);
+    }
+
+    *PrivatePde = (splitPa & EPT_ADDRESS_MASK) | EPT_TABLE_FLAGS;
+    KeMemoryBarrier();
+    return TRUE;
+}
+
+static BOOLEAN
+EptEnsurePrivate(
+    VOID
+    )
+{
+    UINT64* main;
+    UINT64* copy;
+    UINT64 copyPa;
+
+    if (g_PrivateEptp != 0)
+    {
+        return TRUE;
+    }
+
+    main = EptVirtualFromPhysical(g_MainEptp & EPT_ADDRESS_MASK);
+    copy = (UINT64*)EptAllocateSplitPage(&copyPa);
+    if (main == NULL || copy == NULL)
+    {
+        return FALSE;
+    }
+
+    RtlCopyMemory(copy, main, PAGE_SIZE);
+    g_PrivateEptp = (copyPa & EPT_ADDRESS_MASK) | EPT_POINTER_FLAGS;
+    KeMemoryBarrier();
+    return TRUE;
+}
+
+BOOLEAN
+EptMapPrivate(
+    _In_ GUEST_PHYSICAL_ADDRESS DecoyPage,
+    _In_ GUEST_PHYSICAL_ADDRESS PayloadPage,
+    _In_ BOOLEAN Executable
+    )
+{
+    UINT64 decoy = DecoyPage.Value & EPT_ADDRESS_MASK;
+    UINT64 payload = PayloadPage.Value & EPT_ADDRESS_MASK;
+    UINT64 pml4Index;
+    UINT64 pdptIndex;
+    UINT64 pdIndex;
+    UINT64 ptIndex;
+    UINT64* mainPml4;
+    UINT64* privatePml4;
+    UINT64* mainPdpt;
+    UINT64* privatePdpt;
+    UINT64* mainPd;
+    UINT64* privatePd;
+    UINT64* pt;
+    BOOLEAN ok;
+
+    if (g_Initialized == FALSE || decoy == 0 || payload == 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    ok = EptEnsurePrivate();
+    mainPml4 = EptVirtualFromPhysical(g_MainEptp & EPT_ADDRESS_MASK);
+    privatePml4 = EptVirtualFromPhysical(g_PrivateEptp & EPT_ADDRESS_MASK);
+    if (ok == FALSE || mainPml4 == NULL || privatePml4 == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        HACDBG_LOG("HacDbg: Err, EPT private root was not built.\n");
+        return FALSE;
+    }
+
+    pml4Index = (decoy >> 39) & 0x1ffull;
+    pdptIndex = (decoy >> 30) & 0x1ffull;
+    pdIndex = (decoy >> 21) & 0x1ffull;
+    ptIndex = (decoy >> PAGE_SHIFT) & 0x1ffull;
+    ok = EptUnshare(&privatePml4[pml4Index], mainPml4[pml4Index], &privatePdpt);
+    mainPdpt = EptPageFromEntry(mainPml4[pml4Index]);
+    if (ok == FALSE || mainPdpt == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    ok = EptUnshare(&privatePdpt[pdptIndex], mainPdpt[pdptIndex], &privatePd);
+    mainPd = EptPageFromEntry(mainPdpt[pdptIndex]);
+    if (ok == FALSE || mainPd == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    if ((privatePd[pdIndex] & EPT_LARGE) != 0)
+    {
+        ok = EptSplitPrivatePde(&privatePd[pdIndex]);
+    }
+    else if ((mainPd[pdIndex] & EPT_LARGE) == 0)
+    {
+        ok = EptUnshare(&privatePd[pdIndex], mainPd[pdIndex], &pt);
+    }
+
+    pt = EptPageFromEntry(privatePd[pdIndex]);
+    if (ok == FALSE || pt == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        HACDBG_LOG("HacDbg: Err, EPT private split failed decoy=0x%I64x.\n", decoy);
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: decoy is a 4 KiB guest page whose main-root leaf stays the
+    // identity zero page. This leaf belongs only to the private root. payload
+    // is a host frame that is not installed in the guest page tables.
+    //
+    pt[ptIndex] = payload | EptAccessFlags(payload, Executable);
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_EptLock);
+    return TRUE;
+}
+
+BOOLEAN
+EptUsePrivateRoot(
+    _In_ BOOLEAN Enable
+    )
+{
+    if (Enable != FALSE && g_PrivateEptp == 0)
+    {
+        return FALSE;
+    }
+
+    g_PrivateActive = Enable;
+    KeMemoryBarrier();
+    return TRUE;
+}
+
+VOID
+EptDropPrivate(
+    VOID
+    )
+{
+    g_PrivateActive = FALSE;
+    KeMemoryBarrier();
+    g_PrivateEptp = 0;
+}
+
+UINT64
+EptDataEptp(
+    VOID
+    )
+{
+    if (g_PrivateActive != FALSE && g_PrivateEptp != 0)
+    {
+        return g_PrivateEptp;
+    }
+
+    return g_MainEptp;
+}
+
+UINT64
+EptPrivateEptp(
+    VOID
+    )
+{
+    return g_PrivateEptp;
+}
+
+BOOLEAN
+EptInstallDataRoot(
+    _In_ UINT64 CurrentEptp,
+    _Out_ UINT64* NextEptp
+    )
+{
+    UINT64 current = CurrentEptp & EPT_ADDRESS_MASK;
+    UINT64 data = EptDataEptp();
+
+    *NextEptp = data;
+    if (current == (g_HookEptp & EPT_ADDRESS_MASK) || current == (data & EPT_ADDRESS_MASK))
+    {
+        return FALSE;
+    }
+
+    return data != 0;
+}
+
 BOOLEAN
 EptHandleViolation(
     _In_ UINT64 Qualification,
@@ -1536,7 +1785,7 @@ EptHandleViolation(
             return TRUE;
         }
 
-        *NextEptp = g_MainEptp;
+        *NextEptp = EptDataEptp();
         return TRUE;
     }
 

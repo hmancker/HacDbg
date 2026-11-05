@@ -534,6 +534,10 @@ VmxInvalidateEpt(
 
     VmxInvept(VMX_INVEPT_SINGLE_CONTEXT, EptMainEptp());
     VmxInvept(VMX_INVEPT_SINGLE_CONTEXT, EptHookEptp());
+    if (EptPrivateEptp() != 0)
+    {
+        VmxInvept(VMX_INVEPT_SINGLE_CONTEXT, EptPrivateEptp());
+    }
 }
 
 static BOOLEAN
@@ -1203,6 +1207,21 @@ VmxHandleCpuid(
         (UINT32)ProcessorContext->Registers.Rcx == HACDBG_FLUSH_CPUID_SUBLEAF)
     {
         ProcessorContext->Registers.Rax = 1;
+        {
+            UINT64 currentEptp = 0;
+            UINT64 dataEptp = 0;
+
+            if (VmxRead(VMCS_CTRL_EPT_POINTER, &currentEptp) != FALSE &&
+                EptInstallDataRoot(currentEptp, &dataEptp) != FALSE)
+            {
+                //
+                // INVARIANT: dataEptp is a host EPT root. The private root's
+                // lower tables are host pages. Guest page tables still name
+                // the decoy GPA, not the payload frame.
+                //
+                VmxWrite(VMCS_CTRL_EPT_POINTER, dataEptp);
+            }
+        }
         VmxInvalidateEpt(ProcessorContext);
         InterlockedExchange(&ProcessorContext->InveptRequested, 0);
         return VmxAdvanceRip();

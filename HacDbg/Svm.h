@@ -73,6 +73,7 @@
 #define SVM_TLB_CONTROL_FLUSH_CURRENT_ASID    1ull
 #define SVM_ASID_MAIN                         1u
 #define SVM_ASID_HOOK                         2u
+#define SVM_ASID_PRIVATE                      3u
 
 #define HACDBG_STOP_CPUID_LEAF                0x48444300u
 #define HACDBG_STOP_CPUID_SUBLEAF             0x44424748u

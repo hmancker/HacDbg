@@ -161,6 +161,80 @@ EptUnhidePage(
 
 BOOLEAN
 /**
+ * @brief Points one guest page at a payload frame in the private EPT root.
+ *
+ * @param DecoyPage Guest physical page installed in the guest page tables.
+ * @param PayloadPage Host frame that contains the bytes the inject thread reads.
+ * @param Executable TRUE when the private leaf must allow instruction fetch.
+ *
+ * @return TRUE when the private root has its own leaf for DecoyPage.
+ *
+ * @details The main root keeps the identity translation of DecoyPage. The
+ * private root is not installed until EptUsePrivateRoot.
+ */
+EptMapPrivate(
+    _In_ GUEST_PHYSICAL_ADDRESS DecoyPage,
+    _In_ GUEST_PHYSICAL_ADDRESS PayloadPage,
+    _In_ BOOLEAN Executable
+    );
+
+BOOLEAN
+/**
+ * @brief Makes subsequent VM-exits install the private root as the data root.
+ *
+ * @param Enable TRUE publishes the private root. FALSE returns to the main root.
+ *
+ * @return FALSE when Enable is TRUE and no private root has been built.
+ */
+EptUsePrivateRoot(
+    _In_ BOOLEAN Enable
+    );
+
+VOID
+/**
+ * @brief Forgets a private root that was never installed.
+ *
+ * @details Split pages already carved for it stay in the pool until unload.
+ */
+EptDropPrivate(
+    VOID
+    );
+
+UINT64
+/**
+ * @brief Returns the EPTP a processor should use for data access.
+ *
+ * @details This is the private root while that root is published, otherwise
+ * the main root. The hook root is not a data root.
+ */
+EptDataEptp(
+    VOID
+    );
+
+UINT64
+/**
+ * @brief Returns the private EPTP, or zero when it has not been built.
+ */
+EptPrivateEptp(
+    VOID
+    );
+
+BOOLEAN
+/**
+ * @brief Reports the data EPTP to install when the processor is not on the hook root.
+ *
+ * @param CurrentEptp EPTP currently in the VMCS.
+ * @param NextEptp Receives the data EPTP when this function returns TRUE.
+ *
+ * @return TRUE when CurrentEptp should be replaced.
+ */
+EptInstallDataRoot(
+    _In_ UINT64 CurrentEptp,
+    _Out_ UINT64* NextEptp
+    );
+
+BOOLEAN
+/**
  * @brief Selects the EPT root for an execute violation.
  *
  * @details When the faulting instruction crosses two guest pages that are not
