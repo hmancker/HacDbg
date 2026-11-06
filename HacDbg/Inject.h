@@ -3,12 +3,18 @@
 #include <ntifs.h>
 
 /**
- * @brief Loads a DLL on a new thread, then by redirecting a user thread.
+ * @brief Queues one user APC that calls LoadLibraryW, then falls back.
  *
  * @param Process Target process. The caller holds one reference.
  * @param Path Null-terminated Win32 path of a 64-bit DLL.
  *
  * @return STATUS_SUCCESS when the loader list contains the DLL.
+ *
+ * @details The APC is queued to one alertable user thread. A thread that is
+ * not alertable is left alone. If the APC is not queued, or it is removed
+ * before delivery, the call creates a thread for LoadLibraryW and may then
+ * redirect an existing user thread. An APC that has started delivery is not
+ * followed by a second load.
  */
 NTSTATUS
 InjectApc(

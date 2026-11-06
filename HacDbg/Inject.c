@@ -125,8 +125,21 @@ C_ASSERT(INJECT_EPILOGUE_RIP + sizeof(UINT64) <= INJECT_STUB_BYTES);
 // The epilogue CPUID must not replace this value before the jump back.
 //
 #define INJECT_STATUS_TIMEOUT 0x102u
+//
+// _KTHREAD.MiscFlags on the 26H2 ntoskrnl. Alertable, SystemThread and
+// ApcQueueable are bits in that ULONG. ThreadFlags stays at 0x78.
+//
+#define INJECT_KTHREAD_MISC_FLAGS 0x74u
+#define INJECT_MISC_ALERTABLE 4u
+#define INJECT_MISC_SYSTEM_THREAD 10u
+#define INJECT_MISC_APC_QUEUEABLE 14u
+#define INJECT_KTHREAD_TEB 0xF0u
+#define INJECT_KTHREAD_PREVIOUS_MODE 0x232u
 #define INJECT_KTHREAD_THREAD_FLAGS 0x78u
 #define INJECT_ALERTED_BY_THREAD_ID 4u
+#define INJECT_APC_KIND_KERNEL 1
+#define INJECT_APC_KIND_RUNDOWN 2
+#define INJECT_APC_WAIT_ATTEMPTS 30u
 #define INJECT_KTHREAD_WAIT_REGISTER 0x70u
 #define INJECT_KTHREAD_STATE 0x184u
 #define INJECT_KTHREAD_WAIT_REASON 0x283u
@@ -225,15 +238,45 @@ typedef struct _INJECT_SPAN
     UINT64 End;
 } INJECT_SPAN;
 
+static BOOLEAN
+InjectAllowUser(
+    VOID
+    );
+
+static VOID
+InjectEndUser(
+    _In_ BOOLEAN Opened
+    );
+
 static PVOID
 InjectRoutine(
     _In_ PCWSTR Name
     )
 {
     UNICODE_STRING Unicode;
+    PVOID Routine;
+    BOOLEAN Opened;
 
     RtlInitUnicodeString(&Unicode, Name);
-    return MmGetSystemRoutineAddress(&Unicode);
+    //
+    // MmGetSystemRoutineAddress converts the name with
+    // RtlUnicodeStringToAnsiString. That calls RtlpIsUtf8Process, which
+    // reads the current process PEB at +0x34C when the server silo code
+    // page is not 0xFDE9. SMAP turns that supervisor read into bugcheck
+    // 0x50, and __try does not catch it.
+    //
+    Routine = NULL;
+    Opened = InjectAllowUser();
+    __try
+    {
+        Routine = MmGetSystemRoutineAddress(&Unicode);
+    }
+    __finally
+    {
+        InjectEndUser(Opened);
+    }
+
+    return Routine;
 }
 
 static BOOLEAN
@@ -4290,12 +4333,372 @@ InjectMapImage(
     return STATUS_SUCCESS;
 }
 
+//
+// These APC routines are exported by ntoskrnl. This WDK's ntddk.h does not
+// declare them. OriginalApcEnvironment is 0. The public KAPC matches the
+// 26H2 ntoskrnl layout, 88 bytes.
+//
+typedef enum _INJECT_APC_ENVIRONMENT
+{
+    InjectOriginalApcEnvironment = 0
+} INJECT_APC_ENVIRONMENT;
+
+typedef VOID (*INJECT_NORMAL_ROUTINE)(_In_opt_ PVOID NormalContext, _In_opt_ PVOID SystemArgument1,
+                                      _In_opt_ PVOID SystemArgument2);
+
+typedef VOID (*INJECT_KERNEL_ROUTINE)(_In_ PKAPC Apc, _Inout_ INJECT_NORMAL_ROUTINE* NormalRoutine,
+                                      _Inout_ PVOID* NormalContext, _Inout_ PVOID* SystemArgument1,
+                                      _Inout_ PVOID* SystemArgument2);
+
+typedef VOID (*INJECT_RUNDOWN_ROUTINE)(_In_ PKAPC Apc);
+
+NTKERNELAPI
+VOID
+KeInitializeApc(_Out_ PRKAPC Apc, _In_ PRKTHREAD Thread, _In_ INJECT_APC_ENVIRONMENT Environment,
+                _In_ INJECT_KERNEL_ROUTINE KernelRoutine, _In_opt_ INJECT_RUNDOWN_ROUTINE RundownRoutine,
+                _In_opt_ INJECT_NORMAL_ROUTINE NormalRoutine, _In_ KPROCESSOR_MODE ProcessorMode,
+                _In_opt_ PVOID NormalContext);
+
+NTKERNELAPI
+BOOLEAN
+KeInsertQueueApc(_Inout_ PRKAPC Apc, _In_opt_ PVOID SystemArgument1, _In_opt_ PVOID SystemArgument2,
+                 _In_ KPRIORITY Increment);
+
+NTKERNELAPI
+BOOLEAN
+KeRemoveQueueApc(_Inout_ PKAPC Apc);
+
+NTKERNELAPI
+BOOLEAN
+KeAlertThread(_Inout_ PKTHREAD Thread, _In_ KPROCESSOR_MODE AlertMode);
+
+C_ASSERT(sizeof(KAPC) == 0x58);
+
+typedef struct _INJECT_APC_PACKET
+{
+    KAPC Apc;
+    KEVENT Done;
+    volatile LONG Kind;
+} INJECT_APC_PACKET;
+
+static VOID
+InjectUserApcKernel(
+    _In_ PKAPC Apc,
+    _Inout_ INJECT_NORMAL_ROUTINE* NormalRoutine,
+    _Inout_ PVOID* NormalContext,
+    _Inout_ PVOID* SystemArgument1,
+    _Inout_ PVOID* SystemArgument2
+    )
+{
+    INJECT_APC_PACKET* Packet;
+
+    UNREFERENCED_PARAMETER(NormalRoutine);
+    UNREFERENCED_PARAMETER(NormalContext);
+    UNREFERENCED_PARAMETER(SystemArgument1);
+    UNREFERENCED_PARAMETER(SystemArgument2);
+    Packet = CONTAINING_RECORD(Apc, INJECT_APC_PACKET, Apc);
+    InterlockedExchange(&Packet->Kind, INJECT_APC_KIND_KERNEL);
+    KeSetEvent(&Packet->Done, 0, FALSE);
+}
+
+static VOID
+InjectUserApcRundown(
+    _In_ PKAPC Apc
+    )
+{
+    INJECT_APC_PACKET* Packet;
+
+    Packet = CONTAINING_RECORD(Apc, INJECT_APC_PACKET, Apc);
+    InterlockedExchange(&Packet->Kind, INJECT_APC_KIND_RUNDOWN);
+    KeSetEvent(&Packet->Done, 0, FALSE);
+}
+
+static VOID
+InjectFreeUser(
+    _In_ PEPROCESS Process,
+    _In_opt_ PVOID Remote
+    )
+{
+    KAPC_STATE State;
+    PVOID Address;
+    SIZE_T Size;
+
+    if (Remote == NULL)
+    {
+        return;
+    }
+
+    Address = Remote;
+    Size = 0;
+    KeStackAttachProcess(Process, &State);
+    ZwFreeVirtualMemory(ZwCurrentProcess(), &Address, &Size, MEM_RELEASE);
+    KeUnstackDetachProcess(&State);
+}
+
+static BOOLEAN
+InjectThreadUserAlertable(
+    _In_ PETHREAD Thread
+    )
+{
+    ULONG Misc;
+
+    if (Thread == NULL || Thread == PsGetCurrentThread())
+    {
+        return FALSE;
+    }
+
+    if (InjectThreadState(Thread) != INJECT_KTHREAD_WAITING)
+    {
+        return FALSE;
+    }
+
+    if (*(PVOID*)((PUCHAR)Thread + INJECT_KTHREAD_TEB) == NULL)
+    {
+        return FALSE;
+    }
+
+    if (*((CHAR*)Thread + INJECT_KTHREAD_PREVIOUS_MODE) != UserMode)
+    {
+        return FALSE;
+    }
+
+    Misc = *(volatile ULONG*)((PUCHAR)Thread + INJECT_KTHREAD_MISC_FLAGS);
+    if ((Misc & (1ul << INJECT_MISC_SYSTEM_THREAD)) != 0 || (Misc & (1ul << INJECT_MISC_APC_QUEUEABLE)) == 0 ||
+        (Misc & (1ul << INJECT_MISC_ALERTABLE)) == 0)
+    {
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+static PETHREAD
+InjectFindAlertableThread(
+    _In_ PEPROCESS Process
+    )
+{
+    INJECT_GET_NEXT_THREAD NextThread;
+    INJECT_WIN32_THREAD Win32;
+    HANDLE ProcessHandle;
+    HANDLE Previous;
+    HANDLE Chosen;
+    PETHREAD Thread;
+    PETHREAD Found;
+    NTSTATUS Status;
+    BOOLEAN WantWin32;
+    ULONG Seen;
+
+    NextThread = (INJECT_GET_NEXT_THREAD)InjectRoutine(L"ZwGetNextThread");
+    Win32 = (INJECT_WIN32_THREAD)InjectRoutine(L"PsGetThreadWin32Thread");
+    if (NextThread == NULL)
+    {
+        return NULL;
+    }
+
+    Status = ObOpenObjectByPointer(Process, OBJ_KERNEL_HANDLE, NULL, PROCESS_ALL_ACCESS, *PsProcessType, KernelMode,
+                                   &ProcessHandle);
+    if (!NT_SUCCESS(Status))
+    {
+        return NULL;
+    }
+
+    Found = NULL;
+    for (WantWin32 = TRUE; Found == NULL; WantWin32 = FALSE)
+    {
+        Seen = 0;
+        Previous = NULL;
+        Chosen = NULL;
+        while (Seen < 256 &&
+               NT_SUCCESS(NextThread(ProcessHandle, Previous, THREAD_ALL_ACCESS, OBJ_KERNEL_HANDLE, 0, &Chosen)))
+        {
+            if (Previous != NULL)
+            {
+                ZwClose(Previous);
+            }
+
+            Previous = Chosen;
+            Seen++;
+            if (!NT_SUCCESS(ObReferenceObjectByHandle(Chosen, THREAD_ALL_ACCESS, *PsThreadType, KernelMode,
+                                                      (PVOID*)&Thread, NULL)))
+            {
+                Chosen = NULL;
+                continue;
+            }
+
+            if (WantWin32 != FALSE && (Win32 == NULL || Win32(Thread) == NULL))
+            {
+                ObDereferenceObject(Thread);
+                Chosen = NULL;
+                continue;
+            }
+
+            if (InjectThreadUserAlertable(Thread) == FALSE)
+            {
+                ObDereferenceObject(Thread);
+                Chosen = NULL;
+                continue;
+            }
+
+            Found = Thread;
+            break;
+        }
+
+        if (Previous != NULL)
+        {
+            ZwClose(Previous);
+        }
+
+        if (WantWin32 == FALSE)
+        {
+            break;
+        }
+    }
+
+    ZwClose(ProcessHandle);
+    return Found;
+}
+
+static NTSTATUS
+InjectTryUserApc(
+    _In_ PEPROCESS Process,
+    _In_ const WCHAR* Path,
+    _Out_ BOOLEAN* Fallback
+    )
+{
+    INJECT_APC_PACKET* Packet;
+    PETHREAD Thread;
+    INJECT_NORMAL_ROUTINE Normal;
+    UINT64 Kernel32;
+    UINT64 LoadLibrary;
+    PVOID Remote;
+    SIZE_T Bytes;
+    CHAR Narrow[INJECT_NAME_CHARS];
+    WCHAR Dos[INJECT_PATH_CHARS];
+    const WCHAR* Used;
+    UINT64 ThreadId;
+
+    *Fallback = FALSE;
+    Remote = NULL;
+    Packet = NULL;
+    Thread = NULL;
+    InjectNormalizePath(Path, Dos);
+    Used = Dos[0] != 0 ? Dos : Path;
+    InjectFileName(Used, Narrow);
+    Kernel32 = InjectModuleBase(Process, "kernel32.dll");
+    LoadLibrary = InjectResolve(Process, Kernel32, "LoadLibraryW", 0);
+    if (LoadLibrary == 0)
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject found no LoadLibraryW.\n");
+        return STATUS_NOT_FOUND;
+    }
+
+    HACDBG_LOG("HacDbg: DLL inject apc LoadLibraryW=0x%I64x pid=%llu.\n", LoadLibrary,
+               (UINT64)(ULONG_PTR)PsGetProcessId(Process));
+    Bytes = (wcslen(Used) + 1) * sizeof(WCHAR);
+    if (!NT_SUCCESS(InjectAllocUser(Process, Bytes, PAGE_READWRITE, &Remote)) ||
+        !NT_SUCCESS(InjectCopyUser(Process, Remote, Used, Bytes)))
+    {
+        InjectFreeUser(Process, Remote);
+        HACDBG_LOG("HacDbg: Err, DLL inject apc path copy failed.\n");
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    Thread = InjectFindAlertableThread(Process);
+    if (Thread == NULL)
+    {
+        InjectFreeUser(Process, Remote);
+        HACDBG_LOG("HacDbg: DLL inject apc found no alertable thread.\n");
+        *Fallback = TRUE;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    ThreadId = (UINT64)(ULONG_PTR)PsGetThreadId(Thread);
+    Packet = (INJECT_APC_PACKET*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(INJECT_APC_PACKET), INJECT_TAG);
+    if (Packet == NULL)
+    {
+        ObDereferenceObject(Thread);
+        InjectFreeUser(Process, Remote);
+        *Fallback = TRUE;
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    RtlZeroMemory(Packet, sizeof(*Packet));
+    KeInitializeEvent(&Packet->Done, NotificationEvent, FALSE);
+    Normal = (INJECT_NORMAL_ROUTINE)(ULONG_PTR)LoadLibrary;
+    KeInitializeApc(&Packet->Apc, (PRKTHREAD)Thread, InjectOriginalApcEnvironment, InjectUserApcKernel,
+                    InjectUserApcRundown, Normal, UserMode, Remote);
+    if (KeInsertQueueApc(&Packet->Apc, NULL, NULL, 0) == FALSE)
+    {
+        HACDBG_LOG("HacDbg: DLL inject apc queue failed tid=%llu.\n", ThreadId);
+        ExFreePool(Packet);
+        ObDereferenceObject(Thread);
+        InjectFreeUser(Process, Remote);
+        *Fallback = TRUE;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    KeAlertThread((PKTHREAD)Thread, UserMode);
+    HACDBG_LOG("HacDbg: DLL inject apc queued tid=%llu.\n", ThreadId);
+    if (InjectWaitModule(Process, Narrow, INJECT_APC_WAIT_ATTEMPTS) != FALSE)
+    {
+        if (KeRemoveQueueApc(&Packet->Apc) != FALSE)
+        {
+            InjectFreeUser(Process, Remote);
+        }
+        else
+        {
+            KeWaitForSingleObject(&Packet->Done, Executive, KernelMode, FALSE, NULL);
+        }
+
+        ExFreePool(Packet);
+        ObDereferenceObject(Thread);
+        return STATUS_SUCCESS;
+    }
+
+    if (KeRemoveQueueApc(&Packet->Apc) != FALSE)
+    {
+        HACDBG_LOG("HacDbg: DLL inject apc removed before delivery tid=%llu.\n", ThreadId);
+        ExFreePool(Packet);
+        ObDereferenceObject(Thread);
+        InjectFreeUser(Process, Remote);
+        *Fallback = TRUE;
+        return STATUS_UNSUCCESSFUL;
+    }
+
+    KeWaitForSingleObject(&Packet->Done, Executive, KernelMode, FALSE, NULL);
+    {
+        LONG Kind;
+
+        Kind = Packet->Kind;
+        ExFreePool(Packet);
+        ObDereferenceObject(Thread);
+        if (Kind == INJECT_APC_KIND_RUNDOWN)
+        {
+            InjectFreeUser(Process, Remote);
+            HACDBG_LOG("HacDbg: DLL inject apc rundown tid=%llu.\n", ThreadId);
+            *Fallback = TRUE;
+            return STATUS_UNSUCCESSFUL;
+        }
+    }
+
+    if (InjectWaitModule(Process, Narrow, 15) != FALSE)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    HACDBG_LOG("HacDbg: Err, DLL inject apc delivered without module tid=%llu.\n", ThreadId);
+    return STATUS_DLL_NOT_FOUND;
+}
+
 NTSTATUS
 InjectApc(
     _In_ PEPROCESS Process,
     _In_ const WCHAR* Path
     )
 {
+    BOOLEAN Fallback;
+    NTSTATUS Status;
+
     if (Process == NULL || Path == NULL || Path[0] == L'\0')
     {
         return STATUS_INVALID_PARAMETER;
@@ -4312,6 +4715,14 @@ InjectApc(
         return STATUS_NOT_SUPPORTED;
     }
 
+    Fallback = FALSE;
+    Status = InjectTryUserApc(Process, Path, &Fallback);
+    if (Fallback == FALSE)
+    {
+        return Status;
+    }
+
+    HACDBG_LOG("HacDbg: DLL inject apc fallback.\n");
     return InjectCallLoadLibrary(Process, Path, TRUE);
 }
 
