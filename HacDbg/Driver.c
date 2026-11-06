@@ -16,6 +16,9 @@
 #include "ProcessCtrl.h"
 #include "Inject.h"
 #include "WindowProtect.h"
+#if HACDBG_COMM_WOB
+#include "WobComm.h"
+#endif
 #include "Debug.h"
 #include "../shared/hypercall/control.h"
 #if HACDBG_BACKEND_INTEL
@@ -48,6 +51,14 @@
 #define HACDBG_VENDOR_NAME       "AMD SVM"
 #endif
 
+#if HACDBG_COMM_WOB
+#define HACDBG_CREATE_DEVICE(Object) STATUS_SUCCESS
+#define HACDBG_DELETE_DEVICE()       ((void)0)
+#else
+#define HACDBG_CREATE_DEVICE(Object) HacDbgCreateDevice(Object)
+#define HACDBG_DELETE_DEVICE()       HacDbgDeleteDevice()
+#endif
+
 #define HACDBG_MAX_PROCESSORS 256
 
 C_ASSERT(sizeof(HACDBG_VERSION_INFO) == 0x30);
@@ -70,7 +81,9 @@ C_ASSERT(sizeof(HACDBG_VERSION_STRING) <= HACDBG_VERSION_STRING_SIZE);
 
 static PVOID g_PowerCallbackRegistration;
 static BOOLEAN g_VirtualizationSuspended;
+#if !HACDBG_COMM_WOB
 static PDEVICE_OBJECT g_DeviceObject;
+#endif
 
 NTKERNELAPI
 NTSTATUS
@@ -530,6 +543,7 @@ SvmPowerCallback(
 }
 #endif
 
+#if !HACDBG_COMM_WOB
 // 完成一个成功返回的 IRP。
 static NTSTATUS
 HacDbgCompleteSuccess(
@@ -620,6 +634,9 @@ HacDbgDeviceControl(
              inputLength >= sizeof(HACDBG_PROCESS_REQUEST) &&
              outputLength >= sizeof(HACDBG_PROCESS_REQUEST))
     {
+        HACDBG_LOG("HacDbg: IOCTL process op=%u pid=%u.\n",
+                   ((HACDBG_PROCESS_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Operation,
+                   ((HACDBG_PROCESS_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Pid);
         ProcessCtrlExecute((HACDBG_PROCESS_REQUEST*)Irp->AssociatedIrp.SystemBuffer);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = sizeof(HACDBG_PROCESS_REQUEST);
@@ -628,6 +645,8 @@ HacDbgDeviceControl(
              inputLength >= sizeof(HACDBG_WINDOW_REQUEST) &&
              outputLength >= sizeof(HACDBG_WINDOW_REQUEST))
     {
+        HACDBG_LOG("HacDbg: IOCTL window op=%u.\n",
+                   ((HACDBG_WINDOW_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Operation);
         WindowProtectExecute((HACDBG_WINDOW_REQUEST*)Irp->AssociatedIrp.SystemBuffer);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = sizeof(HACDBG_WINDOW_REQUEST);
@@ -717,6 +736,7 @@ HacDbgDeleteDevice(
     IoDeleteDevice(g_DeviceObject);
     g_DeviceObject = NULL;
 }
+#endif
 
 // 卸载：停止所有处理器，再释放全局资源。
 static VOID
@@ -737,7 +757,11 @@ DriverUnload(
         g_PowerCallbackRegistration = NULL;
     }
 
-    HacDbgDeleteDevice();
+#if HACDBG_COMM_WOB
+    WobCommCleanup();
+#else
+    HACDBG_DELETE_DEVICE();
+#endif
     TraceDisable();
     HACDBG_STOP_ALL();
     InjectReleaseLeaked();
@@ -764,6 +788,11 @@ DriverEntry(
 
     HACDBG_LOG("HacDbg: DriverEntry start: driver version %s (%s).\n",
              HACDBG_VERSION_STRING, HACDBG_VENDOR_NAME);
+#if HACDBG_COMM_WOB
+    HACDBG_LOG("HacDbg: request channel is WOB.\n");
+#else
+    HACDBG_LOG("HacDbg: request channel is IOCTL.\n");
+#endif
 
     if (DriverObject == NULL)
     {
@@ -841,7 +870,7 @@ DriverEntry(
         return HacDbgRecordFailure(RegistryPath, HACDBG_LOAD_STAGE_MSRPM, status);
     }
 
-    status = HacDbgCreateDevice(DriverObject);
+    status = HACDBG_CREATE_DEVICE(DriverObject);
     if (!NT_SUCCESS(status))
     {
         HACDBG_LOG("HacDbg: Err, control device creation failed: 0x%08x.\n", status);
@@ -870,7 +899,7 @@ DriverEntry(
         if (!NT_SUCCESS(status))
         {
             HACDBG_LOG("HacDbg: Err, power callback open failed: 0x%08x.\n", status);
-            HacDbgDeleteDevice();
+            HACDBG_DELETE_DEVICE();
             HACDBG_SHARED_CLEANUP();
             LogsCleanup();
             HACDBG_PAGING_CLEANUP();
@@ -886,7 +915,7 @@ DriverEntry(
     if (!NT_SUCCESS(status))
     {
         HACDBG_LOG("HacDbg: Err, trace initialization failed: 0x%08x.\n", status);
-        HacDbgDeleteDevice();
+        HACDBG_DELETE_DEVICE();
         HACDBG_SHARED_CLEANUP();
         LogsCleanup();
         HACDBG_PAGING_CLEANUP();
@@ -901,7 +930,7 @@ DriverEntry(
         HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_PROCESSORS, status);
         TraceDisable();
         HACDBG_STOP_ALL();
-        HacDbgDeleteDevice();
+        HACDBG_DELETE_DEVICE();
         HACDBG_FREE_ALL();
         TraceCleanup();
 
@@ -921,7 +950,7 @@ DriverEntry(
         TraceDisable();
         HACDBG_STOP_ALL();
         PatchGuardCleanup();
-        HacDbgDeleteDevice();
+        HACDBG_DELETE_DEVICE();
         HACDBG_FREE_ALL();
         TraceCleanup();
         LogsCleanup();
@@ -943,7 +972,7 @@ DriverEntry(
         HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_POWER, STATUS_UNSUCCESSFUL);
         TraceDisable();
         HACDBG_STOP_ALL();
-        HacDbgDeleteDevice();
+        HACDBG_DELETE_DEVICE();
         HACDBG_FREE_ALL();
         TraceCleanup();
         LogsCleanup();
@@ -964,7 +993,7 @@ DriverEntry(
         HACDBG_STOP_ALL();
         InjectReleaseLeaked();
         PatchGuardCleanup();
-        HacDbgDeleteDevice();
+        HACDBG_DELETE_DEVICE();
         HACDBG_FREE_ALL();
         TraceCleanup();
         LogsCleanup();
@@ -973,6 +1002,14 @@ DriverEntry(
         PhysicalMemoryCleanup();
         return status;
     }
+
+#if HACDBG_COMM_WOB
+    status = WobCommInitialize();
+    if (!NT_SUCCESS(status))
+    {
+        HACDBG_LOG("HacDbg: Err, WOB channel unavailable: 0x%08x.\n", status);
+    }
+#endif
 
     g_VirtualizationSuspended = FALSE;
     HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_COMPLETE, STATUS_SUCCESS);

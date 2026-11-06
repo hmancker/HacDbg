@@ -182,6 +182,8 @@
   <PropertyGroup>
     <HacDbgBackendIntel Condition="$([System.Text.RegularExpressions.Regex]::IsMatch($([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\Config.h')), '#define[ \t]+HACDBG_BACKEND_INTEL[ \t]+1'))">1</HacDbgBackendIntel>
     <HacDbgBackendIntel Condition="'$(HacDbgBackendIntel)'==''">0</HacDbgBackendIntel>
+    <HacDbgCommWob Condition="$([System.Text.RegularExpressions.Regex]::IsMatch($([System.IO.File]::ReadAllText('$(MSBuildProjectDirectory)\Config.h')), '#define[ \t]+HACDBG_COMM_WOB[ \t]+1'))">1</HacDbgCommWob>
+    <HacDbgCommWob Condition="'$(HacDbgCommWob)'==''">0</HacDbgCommWob>
   </PropertyGroup>
   <ItemGroup>
     <ClCompile Include="Driver.c" />
@@ -199,6 +201,12 @@
     <ClCompile Include="ProcessCtrl.c" />
     <ClCompile Include="Inject.c" />
     <ClCompile Include="WindowProtect.c" />
+    <ClCompile Include="Search.c">
+      <ExcludedFromBuild Condition="'$(HacDbgCommWob)'!='1'">true</ExcludedFromBuild>
+    </ClCompile>
+    <ClCompile Include="WobComm.c">
+      <ExcludedFromBuild Condition="'$(HacDbgCommWob)'!='1'">true</ExcludedFromBuild>
+    </ClCompile>
     <ClCompile Include="Svm.c">
       <ExcludedFromBuild Condition="'$(Configuration)'=='DebugIntel'">true</ExcludedFromBuild>
       <ExcludedFromBuild Condition="'$(Configuration)'=='ReleaseIntel'">true</ExcludedFromBuild>

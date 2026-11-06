@@ -54,6 +54,12 @@
     <ClCompile Include="WindowProtect.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Search.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="WobComm.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Svm.c">
       <Filter>Source Files</Filter>
     </ClCompile>

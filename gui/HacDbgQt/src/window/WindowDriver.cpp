@@ -1,5 +1,10 @@
 #include "WindowDriver.h"
 
+#include "../Config.h"
+#if HACDBG_COMM_WOB
+#include "../WobChannel.h"
+#endif
+
 #include <Windows.h>
 #include <winioctl.h>
 
@@ -8,16 +13,22 @@
 
 bool windowDriverExecute(HACDBG_WINDOW_REQUEST* request)
 {
-    HANDLE device;
-    DWORD returned = 0;
-    BOOL ok;
-
     if (request == nullptr)
     {
         return false;
     }
 
-    device = CreateFileW(HACDBG_WINDOW_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+#if HACDBG_COMM_WOB
+    if (!wobExchange(HACDBG_WOB_KIND_WINDOW, request, sizeof(*request)))
+    {
+        request->Status = static_cast<int>(0xC0000225);
+        return false;
+    }
+
+    return request->Status >= 0;
+#else
+    DWORD returned = 0;
+    HANDLE device = CreateFileW(HACDBG_WINDOW_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
                          nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (device == INVALID_HANDLE_VALUE)
     {
@@ -25,7 +36,7 @@ bool windowDriverExecute(HACDBG_WINDOW_REQUEST* request)
         return false;
     }
 
-    ok = DeviceIoControl(device, HACDBG_WINDOW_IOCTL, request, sizeof(*request), request, sizeof(*request), &returned,
+    const BOOL ok = DeviceIoControl(device, HACDBG_WINDOW_IOCTL, request, sizeof(*request), request, sizeof(*request), &returned,
                          nullptr);
     CloseHandle(device);
     if (ok == FALSE)
@@ -35,4 +46,5 @@ bool windowDriverExecute(HACDBG_WINDOW_REQUEST* request)
     }
 
     return request->Status >= 0;
+#endif
 }

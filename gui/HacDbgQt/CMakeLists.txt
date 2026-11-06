@@ -36,6 +36,9 @@ set(HACDBG_QT_SOURCES
     src/WindowProtectView.h
     src/window/WindowAffinity.cpp
     src/window/WindowAffinity.h
+    src/Config.h
+    src/WobChannel.cpp
+    src/WobChannel.h
     src/window/WindowDriver.cpp
     src/window/WindowDriver.h
     src/process/ProcessRecord.h

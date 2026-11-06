@@ -1,5 +1,9 @@
 #include "ProcessDriver.h"
 
+#include "../Config.h"
+#if HACDBG_COMM_WOB
+#include "../WobChannel.h"
+#endif
 #include "process_control.h"
 
 #include <Windows.h>
@@ -12,8 +16,6 @@ bool processDriverCall(std::uint32_t operation, std::uint32_t pid, std::uint32_t
                        const wchar_t* path, std::int32_t* status)
 {
     HACDBG_PROCESS_REQUEST request = {};
-    DWORD returned = 0;
-    HANDLE device;
 
     request.Operation = operation;
     request.Pid = pid;
@@ -24,8 +26,25 @@ bool processDriverCall(std::uint32_t operation, std::uint32_t pid, std::uint32_t
         wcsncpy_s(reinterpret_cast<wchar_t*>(request.Path), HACDBG_PROCESS_PATH_CHARS, path, _TRUNCATE);
     }
 
-    device = CreateFileW(HACDBG_PROCESS_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+#if HACDBG_COMM_WOB
+    if (!wobExchange(HACDBG_WOB_KIND_PROCESS, &request, sizeof(request)))
+    {
+        if (status != nullptr)
+        {
+            *status = static_cast<std::int32_t>(0xC0000225);
+        }
+        return false;
+    }
+
+    if (status != nullptr)
+    {
+        *status = request.Status;
+    }
+    return request.Status >= 0;
+#else
+    DWORD returned = 0;
+    HANDLE device = CreateFileW(HACDBG_PROCESS_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (device == INVALID_HANDLE_VALUE)
     {
         if (status != nullptr)
@@ -52,13 +71,12 @@ bool processDriverCall(std::uint32_t operation, std::uint32_t pid, std::uint32_t
         *status = request.Status;
     }
     return request.Status >= 0;
+#endif
 }
 
 bool processDriverImagePath(std::uint32_t pid, wchar_t* path, std::uint32_t pathChars, std::int32_t* status)
 {
     HACDBG_PROCESS_REQUEST request = {};
-    DWORD returned = 0;
-    HANDLE device;
 
     if (path == nullptr || pathChars == 0)
     {
@@ -68,8 +86,31 @@ bool processDriverImagePath(std::uint32_t pid, wchar_t* path, std::uint32_t path
     path[0] = L'\0';
     request.Operation = HACDBG_PROCESS_QUERY_IMAGE;
     request.Pid = pid;
-    device = CreateFileW(HACDBG_PROCESS_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+#if HACDBG_COMM_WOB
+    if (!wobExchange(HACDBG_WOB_KIND_PROCESS, &request, sizeof(request)))
+    {
+        if (status != nullptr)
+        {
+            *status = static_cast<std::int32_t>(0xC0000225);
+        }
+        return false;
+    }
+
+    if (status != nullptr)
+    {
+        *status = request.Status;
+    }
+    if (request.Status < 0)
+    {
+        return false;
+    }
+
+    wcsncpy_s(path, pathChars, reinterpret_cast<const wchar_t*>(request.Path), _TRUNCATE);
+    return path[0] != L'\0';
+#else
+    DWORD returned = 0;
+    HANDLE device = CreateFileW(HACDBG_PROCESS_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (device == INVALID_HANDLE_VALUE)
     {
         if (status != nullptr)
@@ -102,14 +143,13 @@ bool processDriverImagePath(std::uint32_t pid, wchar_t* path, std::uint32_t path
 
     wcsncpy_s(path, pathChars, reinterpret_cast<const wchar_t*>(request.Path), _TRUNCATE);
     return path[0] != L'\0';
+#endif
 }
 
 bool processDriverHandleCall(std::uint32_t parameter, std::uint32_t pid, const wchar_t* actor, const wchar_t* victim,
                              std::int32_t* status)
 {
     HACDBG_PROCESS_REQUEST request = {};
-    DWORD returned = 0;
-    HANDLE device;
     auto* path = reinterpret_cast<wchar_t*>(request.Path);
 
     request.Operation = HACDBG_PROCESS_HANDLE_PROTECT;
@@ -124,8 +164,25 @@ bool processDriverHandleCall(std::uint32_t parameter, std::uint32_t pid, const w
         wcsncpy_s(path + HACDBG_HANDLE_NAME_CHARS, HACDBG_HANDLE_NAME_CHARS, victim, _TRUNCATE);
     }
 
-    device = CreateFileW(HACDBG_PROCESS_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+#if HACDBG_COMM_WOB
+    if (!wobExchange(HACDBG_WOB_KIND_PROCESS, &request, sizeof(request)))
+    {
+        if (status != nullptr)
+        {
+            *status = static_cast<std::int32_t>(0xC0000225);
+        }
+        return false;
+    }
+
+    if (status != nullptr)
+    {
+        *status = request.Status;
+    }
+    return request.Status >= 0;
+#else
+    DWORD returned = 0;
+    HANDLE device = CreateFileW(HACDBG_PROCESS_DEVICE, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (device == INVALID_HANDLE_VALUE)
     {
         if (status != nullptr)
@@ -152,4 +209,5 @@ bool processDriverHandleCall(std::uint32_t parameter, std::uint32_t pid, const w
         *status = request.Status;
     }
     return request.Status >= 0;
+#endif
 }

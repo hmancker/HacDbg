@@ -66,6 +66,9 @@
     <None Include="src\ProcessThreadView.cpp" />
     <None Include="src\ProcessThreadView.h" />
     <None Include="src\process\ProcessRecord.h" />
+    <None Include="src\Config.h" />
+    <None Include="src\WobChannel.cpp" />
+    <None Include="src\WobChannel.h" />
     <None Include="src\process\ProcessDriver.cpp" />
     <None Include="src\process\ProcessDriver.h" />
     <None Include="src\process\ProcessActions.cpp" />

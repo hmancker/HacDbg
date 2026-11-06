@@ -66,3 +66,14 @@
 #ifndef HACDBG_HIDE_VIRTUALIZATION
 #define HACDBG_HIDE_VIRTUALIZATION 0
 #endif
+
+//
+// 三环和内核驱动之间的请求通道。一次只编译一种。
+//   1 - NtManageWobTicket。不创建 \Device\HacDbg，进程和窗口请求走魔数包。
+//   0 - IOCTL。创建 \Device\HacDbg，不安装 WOB 钩子。
+// 三环 gui/HacDbgQt/src/Config.h 里的 HACDBG_COMM_WOB 必须取同一个值。
+// CPUID hypercall 不受这个开关影响。
+//
+#ifndef HACDBG_COMM_WOB
+#define HACDBG_COMM_WOB 1
+#endif
