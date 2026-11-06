@@ -1,4 +1,5 @@
 #include "commands.h"
+#include "../kernel/kernel_commands.h"
 #include <CLI/CLI.hpp>
 #include <hypercall/hypercall_def.h>
 #include "../hook/breakpoint.h"
@@ -10099,6 +10100,8 @@ static void process_help(const CLI::App* const)
 	output::print("Register:   r .thread\n");
 	output::print("Symbol:     .sympath .sympath+ .symfix .symfix+ .reload .symopt lm lmi ld x ln dt\n");
 	output::print("Process:    !process .process .detach !thread\n");
+	output::print("Target:     kill killk killf suspend resume hide ppl handle inject image window\n");
+	output::print("Trace:      .trace\n");
 	output::print("Misc:       .cls .echo .printf .formats ? .time version .help q\n");
 	output::print("Guest:      rgpm wgpm cgpm gvat rgvm wgvm cgvm gva\n");
 	output::print("Hook:       akh rkh hgpp fl hfpc lkm kme dkm\n");
@@ -10673,7 +10676,7 @@ void commands::process(const std::string& command)
 	const std::string parsed_command = normalize_symbol_command(command);
 	windbg_command_line = parsed_command;
 
-	if (dispatch_control_command(parsed_command) == 1)
+	if (dispatch_gui_command(parsed_command) == 1 || dispatch_control_command(parsed_command) == 1)
 	{
 		return;
 	}

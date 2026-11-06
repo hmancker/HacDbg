@@ -24,6 +24,12 @@
     <ClCompile Include="src\commands\commands.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\kernel\kernel_channel.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\kernel\kernel_commands.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\system\system.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -89,6 +95,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\commands\commands.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Config.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\kernel\kernel_channel.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\kernel\kernel_commands.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\system\system.h">

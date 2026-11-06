@@ -157,9 +157,12 @@ MathPower(int Base, int Exp)
 |进程|`!process` `.process`|
 |线程|`!thread` `.thread`|
 |客户机内存和钩子|`rgpm` `wgpm` `cgpm` `gvat` `rgvm` `wgvm` `cgvm` `akh` `rkh` `hgpp` `fl` `hfpc` `lkm` `kme` `dkm` `gva`|
+|GUI 进程、窗口和 trace|`kill` `killk` `killf` `suspend` `resume` `hide` `ppl` `handle` `inject` `image` `window` `.trace`|
 |杂项|`.cls` `cls` `.echo` `.printf` `.formats` `?` `.time` `version` `.help` `q` `.quit` `exit`|
 
 那份表「还没有的常见 WinDbg 系列」里的命令不要自行补上，除非用户要求。这包括 `ba`、`bu`、`bm`、`.frame`、`gu`、`wt`、`ub`、线程调用栈回溯、`dt -r`，以及用 `.symopt` 改选项。
+
+`usermode.exe` 的命令行必须覆盖 `HacDbgQt.exe` 里每一项会作用于驱动或被调试目标的功能。两边用同一套驱动请求，不另做一套语义。只存在于窗口里的操作不用做命令，包括资源管理器里选中文件、驱动映射窗口和进程转储窗口。GUI 增加这类功能时，同时给 `usermode.exe` 加对应命令，并更新 `doc/命令支持表.md`。
 
 驱动侧必须回答上表里会进入客户的每一条命令所依赖的 hypercall。
 
