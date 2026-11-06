@@ -73,6 +73,10 @@
 #define INJECT_SHARED_DATA 0xFFFFF78000000000ull
 #define INJECT_BUILD_OFFSET 0x260u
 #define INJECT_NAME_CHARS 64u
+#define INJECT_PEB_API_SET 0x68u
+#define INJECT_API_SET_VERSION 6u
+#define INJECT_API_SET_ENTRY 24u
+#define INJECT_API_SET_VALUE 20u
 #define INJECT_PATH_CHARS 260u
 #define INJECT_NT_CHARS 520u
 #define INJECT_TEB_LAST_ERROR 0x68u
@@ -897,6 +901,84 @@ InjectModuleBase(
     return Base;
 }
 
+static UINT64
+InjectModuleFromLow(
+    _In_ PEPROCESS Process,
+    _In_ ULONG Low
+    )
+{
+    KAPC_STATE State;
+    UINT64 Found;
+    ULONG Matches;
+    ULONG Guard;
+    BOOLEAN Opened;
+
+    if (Low == 0)
+    {
+        return 0;
+    }
+
+    Found = 0;
+    Matches = 0;
+    KeStackAttachProcess(Process, &State);
+    Opened = InjectAllowUser();
+    __try
+    {
+        UCHAR* Peb;
+        UCHAR* Ldr;
+        LIST_ENTRY* Head;
+        LIST_ENTRY* Link;
+
+        Peb = (UCHAR*)PsGetProcessPeb(Process);
+        if (Peb == NULL)
+        {
+            __leave;
+        }
+
+        Ldr = *(UCHAR**)(Peb + 0x18);
+        if (Ldr == NULL)
+        {
+            __leave;
+        }
+
+        Head = (LIST_ENTRY*)(Ldr + 0x20);
+        Link = Head->Flink;
+        for (Guard = 0; Guard < 512 && Link != NULL && Link != Head; Guard++)
+        {
+            UCHAR* Entry = (UCHAR*)Link - 0x10;
+            UINT64 Base;
+
+            Base = *(UINT64*)(Entry + 0x30);
+            if (Base >= 0x10000ull && (ULONG)Base == Low)
+            {
+                Found = Base;
+                Matches++;
+            }
+
+            Link = Link->Flink;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Found = 0;
+        Matches = 0;
+    }
+
+    InjectEndUser(Opened);
+    KeUnstackDetachProcess(&State);
+    if (Matches != 1)
+    {
+        if (Matches > 1)
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject exit 0x%08x matched %lu modules.\n", Low, Matches);
+        }
+
+        return 0;
+    }
+
+    return Found;
+}
+
 static BOOLEAN
 InjectWaitModule(
     _In_ PEPROCESS Process,
@@ -928,6 +1010,252 @@ InjectResolve(
     _In_ const CHAR* ExportName,
     _In_ ULONG Depth
     );
+
+static NTSTATUS
+InjectCallLoadLibrary(
+    _In_ PEPROCESS Process,
+    _In_ const WCHAR* PathOrName,
+    _In_ BOOLEAN WaitForLoad,
+    _Out_opt_ UINT64* LoadedBase
+    );
+
+static BOOLEAN
+InjectApiSetHost(
+    _In_ PEPROCESS Process,
+    _In_ const CHAR* DllName,
+    _Out_writes_(INJECT_NAME_CHARS) CHAR* Host
+    )
+{
+    KAPC_STATE State;
+    BOOLEAN Opened;
+    BOOLEAN Found;
+    ULONG BareChars;
+    ULONG Index;
+
+    Host[0] = 0;
+    if (DllName == NULL)
+    {
+        return FALSE;
+    }
+
+    BareChars = 0;
+    while (DllName[BareChars] != 0 && BareChars < 96)
+    {
+        BareChars++;
+    }
+
+    if (BareChars > 4 && DllName[BareChars - 4] == '.' && (DllName[BareChars - 3] == 'd' || DllName[BareChars - 3] == 'D') &&
+        (DllName[BareChars - 2] == 'l' || DllName[BareChars - 2] == 'L') &&
+        (DllName[BareChars - 1] == 'l' || DllName[BareChars - 1] == 'L'))
+    {
+        BareChars -= 4;
+    }
+
+    if (BareChars < 4 ||
+        ((DllName[0] != 'a' && DllName[0] != 'A') || (DllName[1] != 'p' && DllName[1] != 'P') ||
+         (DllName[2] != 'i' && DllName[2] != 'I') || DllName[3] != '-') &&
+            ((DllName[0] != 'e' && DllName[0] != 'E') || (DllName[1] != 'x' && DllName[1] != 'X') ||
+             (DllName[2] != 't' && DllName[2] != 'T') || DllName[3] != '-'))
+    {
+        return FALSE;
+    }
+
+    Found = FALSE;
+    KeStackAttachProcess(Process, &State);
+    Opened = InjectAllowUser();
+    __try
+    {
+        UCHAR* Peb;
+        UCHAR* Map;
+        ULONG Version;
+        ULONG Size;
+        ULONG Count;
+        ULONG EntryOffset;
+
+        Peb = (UCHAR*)PsGetProcessPeb(Process);
+        if (Peb == NULL)
+        {
+            __leave;
+        }
+
+        //
+        // _PEB.ApiSetMap on this 26100 build. Version 6 entries are 24 bytes.
+        // The contract name has no ".dll". The first value is the host DLL.
+        //
+        Map = *(UCHAR**)(Peb + INJECT_PEB_API_SET);
+        if (Map == NULL)
+        {
+            __leave;
+        }
+
+        Version = *(ULONG*)Map;
+        Size = *(ULONG*)(Map + 4);
+        Count = *(ULONG*)(Map + 12);
+        EntryOffset = *(ULONG*)(Map + 16);
+        if (Version != INJECT_API_SET_VERSION || Size < INJECT_API_SET_ENTRY || EntryOffset > Size || Count > 4096)
+        {
+            __leave;
+        }
+
+        for (Index = 0; Index < Count; Index++)
+        {
+            ULONG At;
+            ULONG NameOffset;
+            ULONG NameLength;
+            ULONG ValueOffset;
+            ULONG ValueCount;
+            ULONG HostOffset;
+            ULONG HostLength;
+            ULONG CharIndex;
+            BOOLEAN Same;
+
+            At = EntryOffset + (Index * INJECT_API_SET_ENTRY);
+            if (At < EntryOffset || At + INJECT_API_SET_ENTRY > Size)
+            {
+                break;
+            }
+
+            NameOffset = *(ULONG*)(Map + At + 4);
+            NameLength = *(ULONG*)(Map + At + 8);
+            ValueOffset = *(ULONG*)(Map + At + 16);
+            ValueCount = *(ULONG*)(Map + At + 20);
+            if (NameLength != BareChars * sizeof(WCHAR) || NameOffset > Size || NameLength > Size - NameOffset)
+            {
+                continue;
+            }
+
+            Same = TRUE;
+            for (CharIndex = 0; CharIndex < BareChars; CharIndex++)
+            {
+                WCHAR Left;
+                CHAR Right;
+
+                Left = *(WCHAR*)(Map + NameOffset + (CharIndex * sizeof(WCHAR)));
+                Right = DllName[CharIndex];
+                if (Left >= L'A' && Left <= L'Z')
+                {
+                    Left = (WCHAR)(Left - L'A' + L'a');
+                }
+
+                if (Right >= 'A' && Right <= 'Z')
+                {
+                    Right = (CHAR)(Right - 'A' + 'a');
+                }
+
+                if (Left != (WCHAR)Right)
+                {
+                    Same = FALSE;
+                    break;
+                }
+            }
+
+            if (Same == FALSE || ValueCount == 0 || ValueOffset > Size ||
+                INJECT_API_SET_VALUE > Size - ValueOffset)
+            {
+                continue;
+            }
+
+            HostOffset = *(ULONG*)(Map + ValueOffset + 12);
+            HostLength = *(ULONG*)(Map + ValueOffset + 16);
+            if (HostLength == 0 || (HostLength & 1u) != 0 || HostLength / sizeof(WCHAR) >= INJECT_NAME_CHARS ||
+                HostOffset > Size || HostLength > Size - HostOffset)
+            {
+                continue;
+            }
+
+            for (CharIndex = 0; CharIndex < HostLength / sizeof(WCHAR); CharIndex++)
+            {
+                WCHAR Character;
+
+                Character = *(WCHAR*)(Map + HostOffset + (CharIndex * sizeof(WCHAR)));
+                if (Character >= 0x80)
+                {
+                    Same = FALSE;
+                    break;
+                }
+
+                if (Character >= L'A' && Character <= L'Z')
+                {
+                    Character = (WCHAR)(Character - L'A' + L'a');
+                }
+
+                Host[CharIndex] = (CHAR)Character;
+            }
+
+            if (Same == FALSE)
+            {
+                Host[0] = 0;
+                continue;
+            }
+
+            Host[CharIndex] = 0;
+            Found = TRUE;
+            break;
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        Found = FALSE;
+        Host[0] = 0;
+    }
+
+    InjectEndUser(Opened);
+    KeUnstackDetachProcess(&State);
+    return Found != FALSE && Host[0] != 0;
+}
+
+static UINT64
+InjectLoadNamed(
+    _In_ PEPROCESS Process,
+    _In_ const CHAR* DllName
+    )
+{
+    WCHAR Wide[96];
+    CHAR Host[INJECT_NAME_CHARS];
+    ULONG Index;
+    UINT64 Base;
+
+    if (DllName == NULL || DllName[0] == 0)
+    {
+        return 0;
+    }
+
+    Base = InjectModuleBase(Process, DllName);
+    if (Base != 0)
+    {
+        return Base;
+    }
+
+    if (InjectApiSetHost(Process, DllName, Host) != FALSE)
+    {
+        Base = InjectModuleBase(Process, Host);
+        if (Base != 0)
+        {
+            HACDBG_LOG("HacDbg: DLL inject api set %s host %s base=0x%I64x.\n", DllName, Host, Base);
+            return Base;
+        }
+    }
+
+    for (Index = 0; DllName[Index] != 0 && Index < 90; Index++)
+    {
+        Wide[Index] = (WCHAR)(UCHAR)DllName[Index];
+    }
+
+    if (DllName[Index] != 0)
+    {
+        return 0;
+    }
+
+    Wide[Index] = 0;
+    Base = 0;
+    InjectCallLoadLibrary(Process, Wide, TRUE, &Base);
+    if (Base == 0)
+    {
+        Base = InjectModuleBase(Process, DllName);
+    }
+
+    return Base;
+}
 
 static UINT64
 InjectResolveForward(
@@ -977,6 +1305,20 @@ InjectResolveForward(
     {
         Module[Index] = 0;
         ModuleBase = InjectModuleBase(Process, Module);
+        Module[Index] = '.';
+        Module[Index + 1] = 'd';
+        Module[Index + 2] = 'l';
+        Module[Index + 3] = 'l';
+        Module[Index + 4] = 0;
+    }
+
+    if (ModuleBase == 0)
+    {
+        //
+        // API set imports are not stored under the import name. LoadLibraryW
+        // returns the host module, the same value GetProcAddress would use.
+        //
+        ModuleBase = InjectLoadNamed(Process, Module);
     }
 
     if (ModuleBase == 0)
@@ -1105,13 +1447,10 @@ InjectCopyUser(
 {
     KAPC_STATE State;
     NTSTATUS Status;
+    BOOLEAN Opened;
 
     KeStackAttachProcess(Process, &State);
-    if ((__readcr4() & (1ull << 21)) != 0)
-    {
-        _stac();
-    }
-
+    Opened = InjectAllowUser();
     __try
     {
         RtlCopyMemory(Remote, Buffer, Bytes);
@@ -1122,11 +1461,7 @@ InjectCopyUser(
         Status = GetExceptionCode();
     }
 
-    if ((__readcr4() & (1ull << 21)) != 0)
-    {
-        _clac();
-    }
-
+    InjectEndUser(Opened);
     KeUnstackDetachProcess(&State);
     return Status;
 }
@@ -1164,9 +1499,10 @@ InjectLogWide(
     _In_ const WCHAR* Text
     )
 {
-    WCHAR Copy[100];
+    CHAR Narrow[100];
     SIZE_T Length;
     SIZE_T Start;
+    SIZE_T Index;
 
     Length = 0;
     if (Text != NULL)
@@ -1181,13 +1517,23 @@ InjectLogWide(
         Length = 96;
     }
 
-    if (Length != 0)
+    //
+    // DbgPrint "%ws" goes through RtlUnicodeToMultiByteN and then
+    // RtlpIsUtf8Process. Unless the server silo code page is 0xFDE9, that
+    // compares the current process PEB at +0x34C with 0xFDE9. SMAP with
+    // EFLAGS.AC clear turns the supervisor read into bugcheck 0x50, and
+    // __try does not catch it. Print a narrowed copy with "%s" instead.
+    //
+    for (Index = 0; Index < Length; Index++)
     {
-        RtlCopyMemory(Copy, Text + Start, Length * sizeof(WCHAR));
+        WCHAR Character;
+
+        Character = Text[Start + Index];
+        Narrow[Index] = Character < 0x80 ? (CHAR)Character : '?';
     }
 
-    Copy[Length] = 0;
-    HACDBG_LOG("HacDbg: DLL inject %s \"%ws\"\n", Label, Copy);
+    Narrow[Index] = 0;
+    HACDBG_LOG("HacDbg: DLL inject %s \"%s\"\n", Label, Narrow);
 }
 
 static NTSTATUS
@@ -1613,6 +1959,7 @@ InjectCreateLoadThread(
     KAPC_STATE State;
     NTSTATUS Status;
     NTSTATUS DupStatus;
+    BOOLEAN Opened;
 
     *ThreadHandle = NULL;
     RtlZeroMemory(ClientId, sizeof(*ClientId));
@@ -1637,14 +1984,11 @@ InjectCreateLoadThread(
     LocalThread = NULL;
     KeStackAttachProcess(Process, &State);
     //
-    // The service reads the user PEB with the caller's AC flag. SMAP turns a
-    // clear AC flag into a protection fault and bugcheck 0x50.
+    // RtlCreateUserThread reads the user PEB. SMAP bugchecks 0x50 when AC
+    // is clear. InjectAllowUser leaves an already-set AC flag alone so the
+    // rest of this IOCTL can still touch the caller's user buffer.
     //
-    if ((__readcr4() & (1ull << 21)) != 0)
-    {
-        _stac();
-    }
-
+    Opened = InjectAllowUser();
     __try
     {
         Status = Create(ZwCurrentProcess(), NULL, FALSE, 0, INJECT_STACK_BYTES, PAGE_SIZE, LoadLibrary, RemotePath,
@@ -1652,10 +1996,7 @@ InjectCreateLoadThread(
     }
     __finally
     {
-        if ((__readcr4() & (1ull << 21)) != 0)
-        {
-            _clac();
-        }
+        InjectEndUser(Opened);
     }
 
     if (NT_SUCCESS(Status) && LocalThread != NULL && Duplicate != NULL)
@@ -2041,9 +2382,9 @@ InjectHijackLoad(
     Delay.QuadPart = -1000000;
     for (Index = 0; Index < 30; Index++)
     {
-        if (InjectModuleBase(Process, Narrow) != 0)
+        *Loaded = InjectModuleBase(Process, Narrow);
+        if (*Loaded != 0)
         {
-            *Loaded = 1;
             return STATUS_SUCCESS;
         }
 
@@ -2101,11 +2442,49 @@ InjectWin32Status(
     return STATUS_UNSUCCESSFUL;
 }
 
+static VOID
+InjectPublishBase(
+    _In_ PEPROCESS Process,
+    _In_ const CHAR* Narrow,
+    _In_ UINT64 Captured,
+    _Out_opt_ UINT64* LoadedBase
+    )
+{
+    UINT64 Named;
+
+    if (LoadedBase == NULL)
+    {
+        return;
+    }
+
+    Named = 0;
+    if (Narrow != NULL && Narrow[0] != 0)
+    {
+        Named = InjectModuleBase(Process, Narrow);
+    }
+
+    if (Named != 0)
+    {
+        *LoadedBase = Named;
+    }
+    else if (Captured > 1)
+    {
+        *LoadedBase = Captured;
+    }
+
+    if (*LoadedBase != 0)
+    {
+        HACDBG_LOG("HacDbg: DLL inject library base=0x%I64x name=%s.\n", *LoadedBase,
+                   Narrow != NULL ? Narrow : "");
+    }
+}
+
 static NTSTATUS
 InjectCallLoadLibrary(
     _In_ PEPROCESS Process,
     _In_ const WCHAR* PathOrName,
-    _In_ BOOLEAN WaitForLoad
+    _In_ BOOLEAN WaitForLoad,
+    _Out_opt_ UINT64* LoadedBase
     )
 {
     UINT64 Kernel32;
@@ -2120,10 +2499,21 @@ InjectCallLoadLibrary(
     INJECT_THREAD_BASIC Info;
     NTSTATUS Status;
     NTSTATUS CreateStatus;
+    NTSTATUS ThreadStatus;
     ULONG Win32Error;
     UINT64 Loaded;
     const WCHAR* Used;
+    ULONG ExitCode;
+    BOOLEAN Exited;
 
+    if (LoadedBase != NULL)
+    {
+        *LoadedBase = 0;
+    }
+
+    ThreadStatus = STATUS_SUCCESS;
+    ExitCode = 0;
+    Exited = FALSE;
     InjectLogWide("path", PathOrName);
     InjectNormalizePath(PathOrName, Dos);
     Used = Dos[0] != 0 ? Dos : PathOrName;
@@ -2178,6 +2568,7 @@ InjectCallLoadLibrary(
             ZwClose(ThreadHandle);
         }
 
+        InjectPublishBase(Process, Narrow, 0, LoadedBase);
         return STATUS_SUCCESS;
     }
 
@@ -2198,6 +2589,7 @@ InjectCallLoadLibrary(
                 if (InjectWaitModule(Process, Narrow, 15) != FALSE)
                 {
                     ZwClose(ThreadHandle);
+                    InjectPublishBase(Process, Narrow, 0, LoadedBase);
                     return STATUS_SUCCESS;
                 }
 
@@ -2207,22 +2599,57 @@ InjectCallLoadLibrary(
                 return STATUS_UNSUCCESSFUL;
             }
 
-            if ((ULONG)Info.ExitStatus >= 0xC0000000)
+            //
+            // LoadLibraryW's thread exit code is the low 32 bits of the
+            // HMODULE. An API set stays under the host DLL's loader name, so
+            // the import name never appears. A value above 0xC0000000 can
+            // still be that low half.
+            //
+            Exited = TRUE;
+            ExitCode = (ULONG)Info.ExitStatus;
+            if (ExitCode >= 0xC0000000u)
             {
-                HACDBG_LOG("HacDbg: Err, DLL inject load thread failed: 0x%08x.\n", Info.ExitStatus);
-                ZwClose(ThreadHandle);
-                return Info.ExitStatus;
+                ThreadStatus = (NTSTATUS)ExitCode;
             }
+
+            HACDBG_LOG("HacDbg: DLL inject load thread exit=0x%08x.\n", ExitCode);
         }
 
         ZwClose(ThreadHandle);
     }
 
+    if (Exited != FALSE && ExitCode == 0)
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject LoadLibrary returned null name=%s.\n", Narrow);
+        return STATUS_DLL_NOT_FOUND;
+    }
+
+    if (Exited != FALSE)
+    {
+        Loaded = InjectModuleFromLow(Process, ExitCode);
+        if (Loaded != 0)
+        {
+            HACDBG_LOG("HacDbg: DLL inject library from exit low=0x%08x base=0x%I64x.\n", ExitCode, Loaded);
+            InjectPublishBase(Process, Narrow, Loaded, LoadedBase);
+            if (LoadedBase == NULL || *LoadedBase != 0)
+            {
+                return STATUS_SUCCESS;
+            }
+        }
+    }
+
     Win32Error = 0;
     Loaded = 0;
     Status = InjectHijackLoad(Process, (PVOID)LoadLibrary, Remote, Narrow, &Win32Error, &Loaded);
-    if (Loaded != 0 || InjectModuleBase(Process, Narrow) != 0)
+    InjectPublishBase(Process, Narrow, Loaded, LoadedBase);
+    if (LoadedBase != NULL && *LoadedBase != 0)
     {
+        return STATUS_SUCCESS;
+    }
+
+    if (InjectModuleBase(Process, Narrow) != 0)
+    {
+        InjectPublishBase(Process, Narrow, 0, LoadedBase);
         return STATUS_SUCCESS;
     }
 
@@ -2230,6 +2657,11 @@ InjectCallLoadLibrary(
     if (Win32Error != 0)
     {
         return InjectWin32Status(Win32Error);
+    }
+
+    if (!NT_SUCCESS(ThreadStatus))
+    {
+        return ThreadStatus;
     }
 
     if (!NT_SUCCESS(Status))
@@ -2512,25 +2944,11 @@ InjectEnsureModule(
     _Out_ UINT64* ModuleBase
     )
 {
-    WCHAR Wide[96];
     WCHAR Combined[520];
-    ULONG Index;
+    UINT64 Loaded;
     NTSTATUS Status;
 
-    *ModuleBase = InjectModuleBase(Process, DllName);
-    if (*ModuleBase != 0)
-    {
-        return STATUS_SUCCESS;
-    }
-
-    for (Index = 0; DllName[Index] != 0 && Index < 90; Index++)
-    {
-        Wide[Index] = (WCHAR)DllName[Index];
-    }
-
-    Wide[Index] = L'\0';
-    Status = InjectCallLoadLibrary(Process, Wide, TRUE);
-    *ModuleBase = InjectModuleBase(Process, DllName);
+    *ModuleBase = InjectLoadNamed(Process, DllName);
     if (*ModuleBase != 0)
     {
         return STATUS_SUCCESS;
@@ -2538,12 +2956,18 @@ InjectEnsureModule(
 
     if (InjectJoinPath(PayloadPath, DllName, Combined) == FALSE)
     {
-        return NT_SUCCESS(Status) ? STATUS_DLL_NOT_FOUND : Status;
+        return STATUS_DLL_NOT_FOUND;
     }
 
-    Status = InjectCallLoadLibrary(Process, Combined, TRUE);
-    *ModuleBase = InjectModuleBase(Process, DllName);
-    return *ModuleBase != 0 ? STATUS_SUCCESS : (NT_SUCCESS(Status) ? STATUS_DLL_NOT_FOUND : Status);
+    Loaded = 0;
+    Status = InjectCallLoadLibrary(Process, Combined, TRUE, &Loaded);
+    if (Loaded == 0)
+    {
+        Loaded = InjectModuleBase(Process, DllName);
+    }
+
+    *ModuleBase = Loaded;
+    return Loaded != 0 ? STATUS_SUCCESS : (NT_SUCCESS(Status) ? STATUS_DLL_NOT_FOUND : Status);
 }
 
 static UINT64
@@ -4723,7 +5147,7 @@ InjectApc(
     }
 
     HACDBG_LOG("HacDbg: DLL inject apc fallback.\n");
-    return InjectCallLoadLibrary(Process, Path, TRUE);
+    return InjectCallLoadLibrary(Process, Path, TRUE, NULL);
 }
 
 static BOOLEAN
@@ -4898,6 +5322,7 @@ InjectChooseBase(
     ULONG Index;
     UINT64 Needed;
     UINT64 Chosen;
+    BOOLEAN Opened;
     UCHAR* Peb;
     UCHAR* Ldr;
     LIST_ENTRY* Head;
@@ -4919,11 +5344,12 @@ InjectChooseBase(
     SpanCount = 0;
     Chosen = 0;
     KeStackAttachProcess(Process, &State);
-    if ((__readcr4() & (1ull << 21)) != 0)
-    {
-        _stac();
-    }
-
+    //
+    // An unconditional CLAC here drops AC for the rest of the IOCTL. The
+    // next DbgPrint of a wide string then reads the caller's PEB at +0x34C
+    // with SMAP enabled and bugchecks 0x50.
+    //
+    Opened = InjectAllowUser();
     __try
     {
         Peb = (UCHAR*)PsGetProcessPeb(Process);
@@ -5024,11 +5450,7 @@ InjectChooseBase(
         *Place = 0;
     }
 
-    if ((__readcr4() & (1ull << 21)) != 0)
-    {
-        _clac();
-    }
-
+    InjectEndUser(Opened);
     KeUnstackDetachProcess(&State);
     if (Chosen != 0)
     {
@@ -5125,6 +5547,12 @@ InjectPteBody(
     if (Process == NULL || Path == NULL || Path[0] == L'\0')
     {
         return STATUS_INVALID_PARAMETER;
+    }
+
+    if (HidePayload != FALSE)
+    {
+        HACDBG_LOG("HacDbg: DLL inject poison requested pid=%llu.\n",
+                   (UINT64)(ULONG_PTR)PsGetProcessId(Process));
     }
 
     if (InjectWow64(Process) != FALSE || (__readcr4() & (1ull << 12)) != 0)

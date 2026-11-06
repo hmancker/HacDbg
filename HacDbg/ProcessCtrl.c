@@ -1917,7 +1917,11 @@ ProcessCtrlExecute(
         {
             PEPROCESS Process;
             Status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)Request->Pid, &Process);
-            if (NT_SUCCESS(Status))
+            if (!NT_SUCCESS(Status))
+            {
+                HACDBG_LOG("HacDbg: Err, DLL inject pid %lu is not running: 0x%08x.\n", Request->Pid, Status);
+            }
+            else
             {
                 Status = InjectApc(Process, (const WCHAR*)Request->Path);
                 ObDereferenceObject(Process);
@@ -1928,7 +1932,11 @@ ProcessCtrlExecute(
         {
             PEPROCESS Process;
             Status = PsLookupProcessByProcessId((HANDLE)(ULONG_PTR)Request->Pid, &Process);
-            if (NT_SUCCESS(Status))
+            if (!NT_SUCCESS(Status))
+            {
+                HACDBG_LOG("HacDbg: Err, DLL inject pid %lu is not running: 0x%08x.\n", Request->Pid, Status);
+            }
+            else
             {
                 Status = InjectPte(Process, (const WCHAR*)Request->Path,
                                    (Request->Flags & HACDBG_PROCESS_FLAG_POISON) != 0);
