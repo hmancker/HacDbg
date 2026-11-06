@@ -160,6 +160,43 @@ EptUnhidePage(
     );
 
 BOOLEAN
+EptAddInjectHook(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage,
+    _In_ GUEST_PHYSICAL_ADDRESS ShadowPage
+    );
+
+BOOLEAN
+EptRemoveInjectHook(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    );
+
+BOOLEAN
+EptHideInjectPage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    );
+
+BOOLEAN
+EptUnhideInjectPage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    );
+
+BOOLEAN
+EptPatchHookCopy(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage,
+    _In_ ULONG Offset,
+    _In_reads_bytes_(Length) const VOID* Bytes,
+    _In_ ULONG Length
+    );
+
+VOID
+EptInjectSlotUsage(
+    _Out_ ULONG* HookUsed,
+    _Out_ ULONG* HookMax,
+    _Out_ ULONG* HiddenUsed,
+    _Out_ ULONG* HiddenMax
+    );
+
+BOOLEAN
 /**
  * @brief Points one guest page at a payload frame in the private EPT root.
  *

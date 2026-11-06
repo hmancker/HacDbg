@@ -14,6 +14,10 @@
 
 BOOLEAN InjectSlatArmed(VOID);
 BOOLEAN InjectSlatThreadPrivate(PETHREAD Thread);
+VOID InjectDisarmCurrentThread(VOID);
+BOOLEAN InjectQuiesceCurrentProcess(UINT64 GuestRip);
+BOOLEAN InjectMatchCleanCpuid(UINT64 GuestRip);
+BOOLEAN InjectEmulateCleanEntry(UINT64 GuestCr3, UINT64 GuestRsp, UINT64 GuestRbx, UINT64 GuestRbp, UINT64 GuestRsi);
 #include "PhysicalMemory.h"
 #include "Svm.h"
 
@@ -1208,6 +1212,59 @@ VmxHandleCpuid(
     view.InGuest = TRUE;
     ProcessorContext->GuestCr3 = view.Cr3;
 
+    if (ProcessorContext->Registers.Rax == HACDBG_INJECT_DISARM_LEAF &&
+        (UINT32)ProcessorContext->Registers.Rcx == HACDBG_INJECT_DISARM_SUBLEAF)
+    {
+        InjectDisarmCurrentThread();
+        ProcessorContext->Registers.Rax = 1;
+        return VmxAdvanceRip();
+    }
+
+    if (ProcessorContext->Registers.Rax == HACDBG_INJECT_QUIESCE_LEAF &&
+        (UINT32)ProcessorContext->Registers.Rcx == HACDBG_INJECT_QUIESCE_SUBLEAF &&
+        InjectMatchCleanCpuid(rip) != FALSE)
+    {
+        UINT64 rsp = 0;
+        UINT64 cr3 = 0;
+        UINT64 savedRcx;
+        BOOLEAN changed;
+
+        //
+        // The shadow patch saved the process argument in R11, then executed
+        // CPUID as its last instruction. VM-exit instruction length is 2, so
+        // advancing RIP resumes at the original byte after the 15-byte patch.
+        // Adding 15 here lands inside sub rsp and zero-extends RSP.
+        // A failed home-slot write still resumes: leaving VMX would execute
+        // the live page at this torn RIP.
+        //
+        savedRcx = ProcessorContext->Registers.R11;
+        changed = InjectQuiesceCurrentProcess(rip);
+        if (VmxRead(VMCS_GUEST_RSP, &rsp) == FALSE || VmxRead(VMCS_GUEST_CR3, &cr3) == FALSE)
+        {
+            if (changed != FALSE)
+            {
+                VmxFlushAllProcessors();
+            }
+
+            return FALSE;
+        }
+
+        InjectEmulateCleanEntry(cr3, rsp, ProcessorContext->Registers.Rbx, ProcessorContext->Registers.Rbp,
+                                ProcessorContext->Registers.Rsi);
+        ProcessorContext->Registers.Rcx = savedRcx;
+        ProcessorContext->Registers.R11 = rsp;
+        if (changed != FALSE)
+        {
+            //
+            // Unhide changed the main and hook roots. The exit epilogue
+            // invalidates EPT when this flag is set, including this CPU.
+            //
+            VmxFlushAllProcessors();
+        }
+
+        return VmxAdvanceRip();
+    }
+
     if (VmxGuestCpl() == 0 &&
         ProcessorContext->Registers.Rax == HACDBG_FLUSH_CPUID_LEAF &&
         (UINT32)ProcessorContext->Registers.Rcx == HACDBG_FLUSH_CPUID_SUBLEAF)
@@ -2114,6 +2171,7 @@ VmxHandleEptViolation(
     UINT64 currentEptp;
     UINT64 nextEptp;
     BOOLEAN invalidateEpt;
+    BOOLEAN changed;
 
     if (VmxRead(VMCS_EXIT_QUALIFICATION, &qualification) == FALSE ||
         VmxRead(VMCS_GUEST_PHYSICAL_ADDRESS, &guestPhysical) == FALSE ||
@@ -2122,21 +2180,32 @@ VmxHandleEptViolation(
         return FALSE;
     }
 
+    changed = InjectQuiesceCurrentProcess(ProcessorContext->GuestRip);
     if (EptHandleViolation(qualification, guestPhysical, ProcessorContext->GuestCr3,
                            ProcessorContext->GuestRip, currentEptp, &nextEptp,
                            &invalidateEpt) == FALSE)
     {
         HACDBG_LOG("HacDbg: Err, unhandled EPT violation qual=0x%I64x gpa=0x%I64x rip=0x%I64x.\n",
                  qualification, guestPhysical, ProcessorContext->GuestRip);
+        if (changed != FALSE)
+        {
+            VmxFlushAllProcessors();
+        }
+
         return FALSE;
     }
 
     if (nextEptp != currentEptp && VmxWrite(VMCS_CTRL_EPT_POINTER, nextEptp) == FALSE)
     {
+        if (changed != FALSE)
+        {
+            VmxFlushAllProcessors();
+        }
+
         return FALSE;
     }
 
-    if (invalidateEpt != FALSE)
+    if (invalidateEpt != FALSE || changed != FALSE)
     {
         VmxFlushAllProcessors();
     }

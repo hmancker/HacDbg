@@ -116,3 +116,76 @@ BOOLEAN
 InjectSlatThreadPrivate(
     _In_ PETHREAD Thread
     );
+
+VOID
+/**
+ * @brief Drops the current thread from the private-root allow list.
+ *
+ * @details The mapping stays until the process exits. Safe on a VM-exit
+ * path: it does not take a lock or drop the thread reference.
+ */
+InjectDisarmCurrentThread(
+    VOID
+    );
+
+//
+// Shadow patch length. CPUID is the last instruction, so the VM-exit RIP
+// plus the 2-byte CPUID length is the first original byte after the patch.
+//
+#define INJECT_CLEAN_PATCH_BYTES          15u
+#define INJECT_CLEAN_CPUID_OFFSET         13u
+
+BOOLEAN
+/**
+ * @brief Restores this process's guest page tables before rundown.
+ *
+ * @param GuestRip Guest instruction that is about to run, or the CPUID
+ * inside the rundown shadow patch.
+ *
+ * @return TRUE when a hidden payload frame was translated back to itself.
+ * The caller must flush SLAT before re-entering the guest.
+ *
+ * @details Called when that instruction is the address-space rundown
+ * routine. Hidden frames are restored before guest page-table edits, so
+ * rundown does not read them through the zero page. It does not free
+ * frames. A failed unhide leaves Hidden set so a later teardown can retry.
+ */
+InjectQuiesceCurrentProcess(
+    _In_ UINT64 GuestRip
+    );
+
+BOOLEAN
+/**
+ * @brief Reports whether GuestRip is the rundown shadow CPUID.
+ *
+ * @param GuestRip Guest RIP at a CPUID exit.
+ *
+ * @return TRUE when the shadow patch is armed and GuestRip is its CPUID.
+ */
+InjectMatchCleanCpuid(
+    _In_ UINT64 GuestRip
+    );
+
+BOOLEAN
+/**
+ * @brief Writes the stolen address-space rundown prologue into the guest.
+ *
+ * @param GuestCr3 Guest CR3 at the CPUID exit.
+ * @param GuestRsp Guest RSP at the CPUID exit.
+ * @param GuestRbx Guest RBX.
+ * @param GuestRbp Guest RBP.
+ * @param GuestRsi Guest RSI.
+ *
+ * @return TRUE when the three home slots were written.
+ *
+ * @details The shadow patch saved the incoming RCX in R11, then executed
+ * CPUID. The caller restores RCX from that R11, sets R11 to RSP, and
+ * advances RIP by the CPUID length only.
+ */
+InjectEmulateCleanEntry(
+    _In_ UINT64 GuestCr3,
+    _In_ UINT64 GuestRsp,
+    _In_ UINT64 GuestRbx,
+    _In_ UINT64 GuestRbp,
+    _In_ UINT64 GuestRsi
+    );

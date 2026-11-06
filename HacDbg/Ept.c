@@ -12,6 +12,8 @@
 #define HACDBG_EPT_TAG               'TcaH'
 #define HACDBG_EPT_MAX_HOOKS         256
 #define HACDBG_EPT_MAX_HIDDEN        1024
+#define HACDBG_EPT_INJECT_HOOKS      256
+#define HACDBG_EPT_INJECT_HIDDEN     1024
 #define HACDBG_EPT_COVERED_BYTES     HACDBG_GUEST_PHYSICAL_LIMIT
 #define HACDBG_EPT_TABLE_PAGES       ((HACDBG_EPT_COVERED_BYTES / (2ull * 1024ull * 1024ull)) / 512ull * 2ull + 6ull)
 //
@@ -20,7 +22,8 @@
 //
 #define HACDBG_EPT_MTRR_SPLIT_PAGES  (256ull * 2ull)
 #define HACDBG_EPT_FIXED_PAGES       (HACDBG_EPT_TABLE_PAGES + 1ull + HACDBG_EPT_MTRR_SPLIT_PAGES)
-#define HACDBG_EPT_SPLIT_PAGES       (HACDBG_EPT_MAX_HOOKS * 2ull + HACDBG_EPT_MAX_HIDDEN * 2ull + 128ull)
+#define HACDBG_EPT_SPLIT_PAGES       ((HACDBG_EPT_MAX_HOOKS + HACDBG_EPT_INJECT_HOOKS) * 2ull + \
+                                      (HACDBG_EPT_MAX_HIDDEN + HACDBG_EPT_INJECT_HIDDEN) * 2ull + 128ull)
 #define HACDBG_EPT_POOL_PAGES        (HACDBG_EPT_FIXED_PAGES + HACDBG_EPT_SPLIT_PAGES)
 #define HACDBG_EPT_FIXED_CHUNK_PAGES 64ull
 #define HACDBG_EPT_SPLIT_CHUNK_PAGES 8ull
@@ -112,6 +115,11 @@ static PVOID g_HookCopyVa[HACDBG_EPT_MAX_HOOKS];
 static UINT64 g_HookCopyPa[HACDBG_EPT_MAX_HOOKS];
 static EPT_HOOK g_Hooks[HACDBG_EPT_MAX_HOOKS];
 static EPT_HIDDEN_PAGE g_HiddenPages[HACDBG_EPT_MAX_HIDDEN];
+static PVOID g_InjectHookCopyAllocation;
+static PVOID g_InjectHookCopyVa[HACDBG_EPT_INJECT_HOOKS];
+static UINT64 g_InjectHookCopyPa[HACDBG_EPT_INJECT_HOOKS];
+static EPT_HOOK g_InjectHooks[HACDBG_EPT_INJECT_HOOKS];
+static EPT_HIDDEN_PAGE g_InjectHidden[HACDBG_EPT_INJECT_HIDDEN];
 static HACDBG_SPIN_LOCK g_EptLock;
 static BOOLEAN g_Initialized;
 static EPT_MTRR_RANGE g_MtrrVariable[EPT_MTRR_VARIABLE_CAPACITY];
@@ -128,6 +136,11 @@ EptFindHidden(
 
 static BOOLEAN
 EptAllocateHookCopies(
+    VOID
+    );
+
+static BOOLEAN
+EptAllocateInjectHookCopies(
     VOID
     );
 
@@ -644,6 +657,19 @@ EptFindHook(
         }
     }
 
+    if (IndexOut != NULL)
+    {
+        return FALSE;
+    }
+
+    for (index = 0; index < HACDBG_EPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active != FALSE && g_InjectHooks[index].TargetPage == TargetPage)
+        {
+            return TRUE;
+        }
+    }
+
     return FALSE;
 }
 
@@ -668,6 +694,19 @@ EptContainsShadowPage(
         }
     }
 
+    if (found == FALSE)
+    {
+        for (index = 0; index < HACDBG_EPT_INJECT_HOOKS; index++)
+        {
+            if (g_InjectHooks[index].Active != FALSE &&
+                (g_InjectHooks[index].UserPage == page || g_InjectHookCopyPa[index] == page))
+            {
+                found = TRUE;
+                break;
+            }
+        }
+    }
+
     HacDbgSpinLockRelease(&g_EptLock);
     return found;
 }
@@ -682,6 +721,14 @@ EptFindHidden(
     for (index = 0; index < HACDBG_EPT_MAX_HIDDEN; index++)
     {
         if (g_HiddenPages[index].Active != FALSE && g_HiddenPages[index].Page == Page)
+        {
+            return TRUE;
+        }
+    }
+
+    for (index = 0; index < HACDBG_EPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active != FALSE && g_InjectHidden[index].Page == Page)
         {
             return TRUE;
         }
@@ -982,7 +1029,7 @@ EptInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    if (EptAllocateHookCopies() == FALSE)
+    if (EptAllocateHookCopies() == FALSE || EptAllocateInjectHookCopies() == FALSE)
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -1024,8 +1071,18 @@ EptCleanup(
         g_HookCopyAllocation = NULL;
     }
 
+    if (g_InjectHookCopyAllocation != NULL)
+    {
+        ExFreePoolWithTag(g_InjectHookCopyAllocation, HACDBG_EPT_TAG);
+        g_InjectHookCopyAllocation = NULL;
+    }
+
     RtlZeroMemory(g_HookCopyVa, sizeof(g_HookCopyVa));
     RtlZeroMemory(g_HookCopyPa, sizeof(g_HookCopyPa));
+    RtlZeroMemory(g_InjectHookCopyVa, sizeof(g_InjectHookCopyVa));
+    RtlZeroMemory(g_InjectHookCopyPa, sizeof(g_InjectHookCopyPa));
+    RtlZeroMemory(g_InjectHooks, sizeof(g_InjectHooks));
+    RtlZeroMemory(g_InjectHidden, sizeof(g_InjectHidden));
     g_Initialized = FALSE;
     g_MtrrEnabled = FALSE;
     g_MtrrFixedEnabled = FALSE;
@@ -1142,6 +1199,38 @@ EptAllocateHookCopies(
         physical = MmGetPhysicalAddress(g_HookCopyVa[index]);
         g_HookCopyPa[index] = (UINT64)physical.QuadPart & EPT_ADDRESS_MASK;
         if (g_HookCopyPa[index] == 0)
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN
+EptAllocateInjectHookCopies(
+    VOID
+    )
+{
+    SIZE_T bytes = ((SIZE_T)HACDBG_EPT_INJECT_HOOKS * PAGE_SIZE) + PAGE_SIZE;
+    PUCHAR aligned;
+    UINT32 index;
+
+    g_InjectHookCopyAllocation = ExAllocatePool2(POOL_FLAG_NON_PAGED, bytes, HACDBG_EPT_TAG);
+    if (g_InjectHookCopyAllocation == NULL)
+    {
+        return FALSE;
+    }
+
+    aligned = (PUCHAR)(((ULONG_PTR)g_InjectHookCopyAllocation + (PAGE_SIZE - 1)) & ~(ULONG_PTR)(PAGE_SIZE - 1));
+    for (index = 0; index < HACDBG_EPT_INJECT_HOOKS; index++)
+    {
+        PHYSICAL_ADDRESS physical;
+
+        g_InjectHookCopyVa[index] = aligned + ((SIZE_T)index * PAGE_SIZE);
+        physical = MmGetPhysicalAddress(g_InjectHookCopyVa[index]);
+        g_InjectHookCopyPa[index] = (UINT64)physical.QuadPart & EPT_ADDRESS_MASK;
+        if (g_InjectHookCopyPa[index] == 0)
         {
             return FALSE;
         }
@@ -1325,6 +1414,23 @@ EptRefreshHookCopies(
         {
             HACDBG_LOG("HacDbg: Err, EPT hook copy refresh failed pa=0x%I64x.\n",
                      g_Hooks[index].UserPage);
+            logged = TRUE;
+        }
+    }
+
+    for (index = 0; index < HACDBG_EPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active == FALSE || g_InjectHooks[index].UserPage == 0 ||
+            g_InjectHookCopyVa[index] == NULL)
+        {
+            continue;
+        }
+
+        if (EptCopyUserPage(g_InjectHooks[index].UserPage, g_InjectHookCopyVa[index], TRUE) == FALSE &&
+            logged == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, EPT inject hook copy refresh failed pa=0x%I64x.\n",
+                     g_InjectHooks[index].UserPage);
             logged = TRUE;
         }
     }
@@ -1829,6 +1935,323 @@ EptUnmapPrivate(
     KeMemoryBarrier();
     HacDbgSpinLockRelease(&g_EptLock);
     return TRUE;
+}
+
+BOOLEAN
+EptAddInjectHook(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage,
+    _In_ GUEST_PHYSICAL_ADDRESS ShadowPage
+    )
+{
+    UINT64 target = TargetPage.Value & EPT_ADDRESS_MASK;
+    UINT64 shadow = ShadowPage.Value & EPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    if (g_Initialized == FALSE || target == 0 || shadow == 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    for (index = 0; index < HACDBG_EPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active != FALSE && g_InjectHooks[index].TargetPage == target)
+        {
+            HacDbgSpinLockRelease(&g_EptLock);
+            return FALSE;
+        }
+    }
+
+    for (index = 0; index < HACDBG_EPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active == FALSE)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_EPT_INJECT_HOOKS)
+    {
+        HACDBG_LOG("HacDbg: Err, EPT inject hook table is full max=%lu.\n", (ULONG)HACDBG_EPT_INJECT_HOOKS);
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    mainPte = EptPte(g_MainEptp, target, FALSE);
+    hookPte = EptPte(g_HookEptp, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL || g_InjectHookCopyVa[index] == NULL ||
+        EptCopyUserPage(shadow, g_InjectHookCopyVa[index], FALSE) == FALSE)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    g_InjectHooks[index].TargetPage = target;
+    g_InjectHooks[index].UserPage = shadow;
+    g_InjectHooks[index].Active = FALSE;
+    *hookPte = g_InjectHookCopyPa[index] | EptAccessFlags(g_InjectHookCopyPa[index], TRUE);
+    EptSetAdjacentExecutable(target);
+    KeMemoryBarrier();
+    g_InjectHooks[index].Active = TRUE;
+    KeMemoryBarrier();
+    *mainPte &= ~EPT_EXECUTE;
+    HacDbgSpinLockRelease(&g_EptLock);
+    return TRUE;
+}
+
+BOOLEAN
+EptRemoveInjectHook(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    )
+{
+    UINT64 target = TargetPage.Value & EPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    for (index = 0; index < HACDBG_EPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active != FALSE && g_InjectHooks[index].TargetPage == target)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_EPT_INJECT_HOOKS)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    mainPte = EptPte(g_MainEptp, target, FALSE);
+    hookPte = EptPte(g_HookEptp, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    {
+        UINT32 other;
+        BOOLEAN keep;
+
+        keep = FALSE;
+        for (other = 0; other < HACDBG_EPT_MAX_HOOKS; other++)
+        {
+            if (g_Hooks[other].Active != FALSE && g_Hooks[other].TargetPage == target)
+            {
+                keep = TRUE;
+            }
+        }
+
+        if (keep == FALSE)
+        {
+            *mainPte |= EPT_EXECUTE;
+        }
+    }
+
+    KeMemoryBarrier();
+    g_InjectHooks[index].Active = FALSE;
+    g_InjectHooks[index].UserPage = 0;
+    g_InjectHooks[index].TargetPage = 0;
+    KeMemoryBarrier();
+    if (EptFindHidden(target) != FALSE)
+    {
+        *hookPte = g_DummyPagePa | EptAccessFlags(g_DummyPagePa, FALSE);
+    }
+    else
+    {
+        *hookPte = target | EptAccessFlags(target, FALSE);
+    }
+
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_EptLock);
+    return TRUE;
+}
+
+BOOLEAN
+EptHideInjectPage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    )
+{
+    UINT64 target = TargetPage.Value & EPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    if (g_Initialized == FALSE || (TargetPage.Value & (PAGE_SIZE - 1)) != 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    for (index = 0; index < HACDBG_EPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active != FALSE && g_InjectHidden[index].Page == target)
+        {
+            HacDbgSpinLockRelease(&g_EptLock);
+            return FALSE;
+        }
+    }
+
+    for (index = 0; index < HACDBG_EPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active == FALSE)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_EPT_INJECT_HIDDEN)
+    {
+        HACDBG_LOG("HacDbg: Err, EPT inject hide table is full max=%lu.\n", (ULONG)HACDBG_EPT_INJECT_HIDDEN);
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    mainPte = EptPte(g_MainEptp, target, FALSE);
+    hookPte = EptPte(g_HookEptp, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    g_InjectHidden[index].Page = target;
+    g_InjectHidden[index].Active = TRUE;
+    if (EptFindHook(target, NULL) != FALSE)
+    {
+        *mainPte = g_DummyPagePa | EptAccessFlags(g_DummyPagePa, FALSE);
+    }
+    else
+    {
+        *mainPte = g_DummyPagePa | EptAccessFlags(g_DummyPagePa, TRUE);
+        *hookPte = g_DummyPagePa | EptAccessFlags(g_DummyPagePa, FALSE);
+    }
+
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_EptLock);
+    return TRUE;
+}
+
+BOOLEAN
+EptUnhideInjectPage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    )
+{
+    UINT64 target = TargetPage.Value & EPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    for (index = 0; index < HACDBG_EPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active != FALSE && g_InjectHidden[index].Page == target)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_EPT_INJECT_HIDDEN)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    mainPte = EptPte(g_MainEptp, target, FALSE);
+    hookPte = EptPte(g_HookEptp, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    g_InjectHidden[index].Active = FALSE;
+    g_InjectHidden[index].Page = 0;
+    if (EptFindHook(target, NULL) != FALSE)
+    {
+        *mainPte = target | EptAccessFlags(target, FALSE);
+    }
+    else
+    {
+        *mainPte = target | EptAccessFlags(target, TRUE);
+        *hookPte = target | EptAccessFlags(target, FALSE);
+    }
+
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_EptLock);
+    return TRUE;
+}
+
+BOOLEAN
+EptPatchHookCopy(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage,
+    _In_ ULONG Offset,
+    _In_reads_bytes_(Length) const VOID* Bytes,
+    _In_ ULONG Length
+    )
+{
+    UINT64 target = TargetPage.Value & EPT_ADDRESS_MASK;
+    UINT32 index;
+
+    if (Offset + Length < Offset || Offset + Length > PAGE_SIZE || Bytes == NULL)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    if (EptFindHook(target, &index) == FALSE || g_HookCopyVa[index] == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    RtlCopyMemory((PUCHAR)g_HookCopyVa[index] + Offset, Bytes, Length);
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_EptLock);
+    return TRUE;
+}
+
+VOID
+EptInjectSlotUsage(
+    _Out_ ULONG* HookUsed,
+    _Out_ ULONG* HookMax,
+    _Out_ ULONG* HiddenUsed,
+    _Out_ ULONG* HiddenMax
+    )
+{
+    UINT32 index;
+    ULONG hooks;
+    ULONG hidden;
+
+    hooks = 0;
+    hidden = 0;
+    HacDbgSpinLockAcquire(&g_EptLock);
+    for (index = 0; index < HACDBG_EPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active != FALSE)
+        {
+            hooks++;
+        }
+    }
+
+    for (index = 0; index < HACDBG_EPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active != FALSE)
+        {
+            hidden++;
+        }
+    }
+
+    HacDbgSpinLockRelease(&g_EptLock);
+    *HookUsed = hooks;
+    *HookMax = HACDBG_EPT_INJECT_HOOKS;
+    *HiddenUsed = hidden;
+    *HiddenMax = HACDBG_EPT_INJECT_HIDDEN;
 }
 
 VOID

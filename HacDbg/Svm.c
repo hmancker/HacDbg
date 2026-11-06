@@ -13,6 +13,10 @@
 
 BOOLEAN InjectSlatArmed(VOID);
 BOOLEAN InjectSlatThreadPrivate(PETHREAD Thread);
+VOID InjectDisarmCurrentThread(VOID);
+BOOLEAN InjectQuiesceCurrentProcess(UINT64 GuestRip);
+BOOLEAN InjectMatchCleanCpuid(UINT64 GuestRip);
+BOOLEAN InjectEmulateCleanEntry(UINT64 GuestCr3, UINT64 GuestRsp, UINT64 GuestRbx, UINT64 GuestRbp, UINT64 GuestRsi);
 
 #include <intrin.h>
 
@@ -1347,6 +1351,19 @@ SvmHandleVmExit(
     }
 
     if (vmcb->ControlArea.ExitCode == SVM_EXIT_CPUID &&
+        vmcb->StateSaveArea.Rax == HACDBG_INJECT_DISARM_LEAF &&
+        (UINT32)GuestContext->Registers->Rcx == HACDBG_INJECT_DISARM_SUBLEAF)
+    {
+        InjectDisarmCurrentThread();
+        GuestContext->Registers->Rax = 1;
+        SvmAdvanceRip(vmcb);
+        vmcb->StateSaveArea.Rax = GuestContext->Registers->Rax;
+        SvmPublishThreadRoot(vmcb, FALSE, FALSE);
+        SvmAccountExit(GuestContext);
+        return FALSE;
+    }
+
+    if (vmcb->ControlArea.ExitCode == SVM_EXIT_CPUID &&
         vmcb->StateSaveArea.Cpl == 0 &&
         vmcb->StateSaveArea.Rax == HACDBG_FLUSH_CPUID_LEAF &&
         (UINT32)GuestContext->Registers->Rcx == HACDBG_FLUSH_CPUID_SUBLEAF)
@@ -1398,6 +1415,40 @@ SvmHandleVmExit(
     switch (vmcb->ControlArea.ExitCode)
     {
     case SVM_EXIT_CPUID:
+        if (vmcb->StateSaveArea.Rax == HACDBG_INJECT_QUIESCE_LEAF &&
+            (UINT32)GuestContext->Registers->Rcx == HACDBG_INJECT_QUIESCE_SUBLEAF &&
+            InjectMatchCleanCpuid(vmcb->StateSaveArea.Rip) != FALSE)
+        {
+            UINT64 savedRcx;
+            BOOLEAN changed;
+
+            //
+            // The shadow patch saved the process argument in R11. CPUID is
+            // the last instruction of that patch. NRIP, or RIP+2, is the
+            // original byte after it. Adding 15 splits sub rsp and
+            // zero-extends the kernel stack pointer. A failed home-slot
+            // write still resumes; stopping SVM would run the live page
+            // at this torn RIP.
+            //
+            savedRcx = GuestContext->Registers->R11;
+            changed = InjectQuiesceCurrentProcess(vmcb->StateSaveArea.Rip);
+            InjectEmulateCleanEntry(vmcb->StateSaveArea.Cr3, vmcb->StateSaveArea.Rsp,
+                                    GuestContext->Registers->Rbx, GuestContext->Registers->Rbp,
+                                    GuestContext->Registers->Rsi);
+            GuestContext->Registers->Rcx = savedRcx;
+            GuestContext->Registers->R11 = vmcb->StateSaveArea.Rsp;
+            SvmAdvanceRip(vmcb);
+            if (changed != FALSE)
+            {
+                //
+                // Unhide changed the main and hook nested page tables.
+                // Encoding 1 flushes every ASID. Publish may set the same
+                // encoding again when it switches roots; it does not clear it.
+                //
+                SvmFlushAllProcessors();
+            }
+            break;
+        }
         {
             HACDBG_GUEST_VIEW view;
 
@@ -1463,15 +1514,25 @@ SvmHandleVmExit(
 #endif
 
     case SVM_EXIT_NPF:
-        if (NptHandleNestedPageFault(vmcb) == FALSE)
         {
-            HACDBG_LOG("HacDbg: Err, unhandled NPF exit=%u info1=0x%I64x info2=0x%I64x "
-                     "ncr3=0x%I64x rip=0x%I64x.\n",
-                     (UINT32)vmcb->ControlArea.ExitCode, vmcb->ControlArea.ExitInfo1,
-                     vmcb->ControlArea.ExitInfo2, vmcb->ControlArea.NCr3,
-                     vmcb->StateSaveArea.Rip);
-            SvmStopCurrentProcessor(GuestContext);
-            return TRUE;
+            BOOLEAN changed;
+
+            changed = InjectQuiesceCurrentProcess(vmcb->StateSaveArea.Rip);
+            if (NptHandleNestedPageFault(vmcb) == FALSE)
+            {
+                HACDBG_LOG("HacDbg: Err, unhandled NPF exit=%u info1=0x%I64x info2=0x%I64x "
+                         "ncr3=0x%I64x rip=0x%I64x.\n",
+                         (UINT32)vmcb->ControlArea.ExitCode, vmcb->ControlArea.ExitInfo1,
+                         vmcb->ControlArea.ExitInfo2, vmcb->ControlArea.NCr3,
+                         vmcb->StateSaveArea.Rip);
+                SvmStopCurrentProcessor(GuestContext);
+                return TRUE;
+            }
+
+            if (changed != FALSE)
+            {
+                SvmFlushAllProcessors();
+            }
         }
         break;
 

@@ -21,26 +21,30 @@
 
 #if HACDBG_BACKEND_INTEL
 #include "Ept.h"
-#define INJECT_ADD_HOOK    EptAddHook
-#define INJECT_REMOVE_HOOK EptRemoveHook
-#define INJECT_HIDE_PAGE   EptHidePage
-#define INJECT_UNHIDE_PAGE EptUnhidePage
+#define INJECT_ADD_HOOK    EptAddInjectHook
+#define INJECT_REMOVE_HOOK EptRemoveInjectHook
+#define INJECT_HIDE_PAGE   EptHideInjectPage
+#define INJECT_UNHIDE_PAGE EptUnhideInjectPage
+#define INJECT_KERNEL_HOOK EptAddHook
+#define INJECT_PATCH_HOOK  EptPatchHookCopy
+#define INJECT_SLOT_USAGE  EptInjectSlotUsage
 #define INJECT_MAP_PRIVATE EptMapPrivate
 #define INJECT_UNMAP_PRIVATE EptUnmapPrivate
 #define INJECT_USE_PRIVATE EptUsePrivateRoot
-#define INJECT_SLOT_USAGE EptSlotUsage
 #define INJECT_PRIVATE_ROOT EptPrivateEptp
 #define INJECT_CPU_PRIVATE EptAnyCpuPrivate
 #else
 #include "Npt.h"
-#define INJECT_ADD_HOOK    NptAddHook
-#define INJECT_REMOVE_HOOK NptRemoveHook
-#define INJECT_HIDE_PAGE   NptHidePage
-#define INJECT_UNHIDE_PAGE NptUnhidePage
+#define INJECT_ADD_HOOK    NptAddInjectHook
+#define INJECT_REMOVE_HOOK NptRemoveInjectHook
+#define INJECT_HIDE_PAGE   NptHideInjectPage
+#define INJECT_UNHIDE_PAGE NptUnhideInjectPage
+#define INJECT_KERNEL_HOOK NptAddHook
+#define INJECT_PATCH_HOOK  NptPatchHookCopy
+#define INJECT_SLOT_USAGE  NptInjectSlotUsage
 #define INJECT_MAP_PRIVATE NptMapPrivate
 #define INJECT_UNMAP_PRIVATE NptUnmapPrivate
 #define INJECT_USE_PRIVATE NptUsePrivateRoot
-#define INJECT_SLOT_USAGE NptSlotUsage
 #define INJECT_PRIVATE_ROOT NptPrivateRootPa
 #define INJECT_CPU_PRIVATE NptAnyCpuPrivate
 #endif
@@ -83,7 +87,17 @@
 #define INJECT_ERROR_BAD_EXE_FORMAT 193u
 #define INJECT_ERROR_DLL_INIT_FAILED 1114u
 #define INJECT_STACK_BYTES 0x100000u
-#define INJECT_STUB_BYTES 192u
+#define INJECT_STUB_BYTES 320u
+#define INJECT_EPILOGUE 256u
+//
+// Immediate of the epilogue's jmp [rip+0]. The four pushes, the two movs,
+// CPUID, and the four pops occupy the 26 bytes before it.
+//
+#define INJECT_EPILOGUE_RIP 282u
+C_ASSERT(INJECT_EPILOGUE_RIP == INJECT_EPILOGUE + 26);
+C_ASSERT(INJECT_EPILOGUE_RIP + sizeof(UINT64) <= INJECT_STUB_BYTES);
+#define INJECT_CONTEXT_MAGIC 0x4861634462675031ull
+#define INJECT_CONTEXT_MARK 0xF00u
 #define INJECT_KTHREAD_TRAP_FRAME 0x90u
 #define INJECT_TRAP_RAX 0x30u
 #define INJECT_TRAP_RCX 0x38u
@@ -108,6 +122,7 @@
 // NtWaitForAlertByThreadId returns STATUS_ALERTED (0x101). The next wait
 // then spins in RtlpOptimizeWaitOnAddressWaitList and the UI thread never
 // drains its queue. TIMEOUT is the status that unlinks the block first.
+// The epilogue CPUID must not replace this value before the jump back.
 //
 #define INJECT_STATUS_TIMEOUT 0x102u
 #define INJECT_KTHREAD_THREAD_FLAGS 0x78u
@@ -189,6 +204,12 @@ typedef struct _INJECT_OWNED
     BOOLEAN Hooked;
     BOOLEAN Hidden;
     BOOLEAN Private;
+    //
+    // Payload frame that must be hidden after the stub return address has
+    // been stored through Virtual. Hidden is set only once the SLAT entry
+    // exists, so a start failure does not unhide a page that was never hidden.
+    //
+    BOOLEAN Poison;
 } INJECT_OWNED;
 
 typedef struct _INJECT_EDIT
@@ -519,6 +540,7 @@ InjectTrack(
     Owned[*Count].Hooked = FALSE;
     Owned[*Count].Hidden = FALSE;
     Owned[*Count].Private = FALSE;
+    Owned[*Count].Poison = FALSE;
     *Count += 1;
     return TRUE;
 }
@@ -1318,9 +1340,109 @@ InjectWriteLoadStub(
     }
 }
 
+static UCHAR
+InjectThreadState(
+    _In_ PETHREAD Thread
+    );
+
+static BOOLEAN
+InjectThreadSuspended(
+    _In_ PETHREAD Thread
+    );
+
+static BOOLEAN
+InjectThreadUsable(
+    _In_ PETHREAD Thread,
+    _In_ UINT64 ReturnRip,
+    _In_ UINT64 Int2eRip
+    )
+{
+    PUCHAR trap;
+    UINT64 rip;
+    USHORT cs;
+    ULONG wait;
+
+    for (wait = 0; wait < INJECT_SUSPEND_WAITS && InjectThreadSuspended(Thread) == FALSE; wait++)
+    {
+        LARGE_INTEGER delay;
+
+        delay.QuadPart = -10000;
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+
+    if (InjectThreadSuspended(Thread) == FALSE)
+    {
+        return FALSE;
+    }
+
+    if (*((UCHAR*)Thread + INJECT_KTHREAD_WAIT_REASON) == INJECT_KTHREAD_WR_ALERT_BY_THREAD_ID &&
+        (*((UCHAR*)Thread + INJECT_KTHREAD_WAIT_REGISTER) & 7u) == INJECT_WAIT_REGISTER_LIGHTWEIGHT &&
+        *((CHAR*)Thread + INJECT_KTHREAD_SUSPEND_COUNT) > 0)
+    {
+        return TRUE;
+    }
+
+    trap = *(PUCHAR*)((PUCHAR)Thread + INJECT_KTHREAD_TRAP_FRAME);
+    if (trap == NULL)
+    {
+        return FALSE;
+    }
+
+    cs = *(USHORT*)(trap + INJECT_TRAP_SEG_CS);
+    rip = *(UINT64*)(trap + INJECT_TRAP_RIP);
+    if (cs != INJECT_USER_CS)
+    {
+        return FALSE;
+    }
+
+    return (ReturnRip != 0 && rip == ReturnRip) || (Int2eRip != 0 && rip == Int2eRip);
+}
+
+static UINT64
+InjectAlertReturn(
+    _In_ PEPROCESS Process,
+    _Out_ UINT64* Int2eRip
+    )
+{
+    UINT64 module;
+    UINT64 function;
+    UCHAR bytes[40];
+    ULONG index;
+
+    *Int2eRip = 0;
+    module = InjectModuleBase(Process, "ntdll.dll");
+    function = InjectResolve(Process, module, "NtWaitForAlertByThreadId", 0);
+    if (function == 0 || !NT_SUCCESS(InjectReadUser(Process, (PVOID)function, bytes, sizeof(bytes))))
+    {
+        return 0;
+    }
+
+    for (index = 0; index + 2 < sizeof(bytes); index++)
+    {
+        if (bytes[index] == 0x0F && bytes[index + 1] == 0x05 && bytes[index + 2] == 0xC3)
+        {
+            return function + index + 2;
+        }
+    }
+
+    for (index = 0; index + 2 < sizeof(bytes); index++)
+    {
+        if (bytes[index] == 0xCD && bytes[index + 1] == 0x2E && bytes[index + 2] == 0xC3)
+        {
+            *Int2eRip = function + index + 2;
+            break;
+        }
+    }
+
+    return 0;
+}
+
 static NTSTATUS
 InjectSuspendOne(
     _In_ PEPROCESS Process,
+    _In_ BOOLEAN RequireAlert,
+    _In_ UINT64 ReturnRip,
+    _In_ UINT64 Int2eRip,
     _Out_ HANDLE* ThreadHandle,
     _Out_ PETHREAD* ThreadObject
     )
@@ -1390,6 +1512,17 @@ InjectSuspendOne(
                     ZwResumeThread(Chosen, &PreviousSuspend);
                 }
 
+                ObDereferenceObject(Thread);
+                Chosen = NULL;
+                continue;
+            }
+
+            if (RequireAlert != FALSE && InjectThreadUsable(Thread, ReturnRip, Int2eRip) == FALSE)
+            {
+                HACDBG_LOG("HacDbg: DLL inject skipped tid=%llu state=%u reason=%u.\n",
+                           (UINT64)(ULONG_PTR)PsGetThreadId(Thread), InjectThreadState(Thread),
+                           *((UCHAR*)Thread + INJECT_KTHREAD_WAIT_REASON));
+                ZwResumeThread(Chosen, &PreviousSuspend);
                 ObDereferenceObject(Thread);
                 Chosen = NULL;
                 continue;
@@ -1797,7 +1930,7 @@ InjectHijackLoad(
         return Status;
     }
 
-    Status = InjectSuspendOne(Process, &ThreadHandle, &Thread);
+    Status = InjectSuspendOne(Process, FALSE, 0, 0, &ThreadHandle, &Thread);
     if (!NT_SUCCESS(Status))
     {
         HACDBG_LOG("HacDbg: Err, DLL inject found no thread to start LoadLibrary: 0x%08x.\n", Status);
@@ -2790,6 +2923,67 @@ InjectWriteStub(
     RtlZeroMemory(Stub, INJECT_STUB_BYTES);
     Cursor = Stub;
     *Cursor++ = 0x48;
+    *Cursor++ = 0xB8;
+    RtlCopyMemory(Cursor, &Context, sizeof(Context));
+    Cursor += sizeof(Context);
+    *Cursor++ = 0x49;
+    *Cursor++ = 0xBA;
+    {
+        UINT64 Magic = INJECT_CONTEXT_MAGIC;
+
+        RtlCopyMemory(Cursor, &Magic, sizeof(Magic));
+        Cursor += sizeof(Magic);
+    }
+    *Cursor++ = 0x41;
+    *Cursor++ = 0xBB;
+    *Cursor++ = 8;
+    *Cursor++ = 0;
+    *Cursor++ = 0;
+    *Cursor++ = 0;
+    {
+        UCHAR* Retry;
+        UCHAR* ReadyFix;
+        UCHAR* FailFix;
+        UCHAR* AgainFix;
+        UCHAR* Fail;
+        UCHAR* Ready;
+
+        Retry = Cursor;
+        *Cursor++ = 0x4C;
+        *Cursor++ = 0x39;
+        *Cursor++ = 0x90;
+        *Cursor++ = 0x00;
+        *Cursor++ = 0x0F;
+        *Cursor++ = 0x00;
+        *Cursor++ = 0x00;
+        *Cursor++ = 0x74;
+        ReadyFix = Cursor;
+        *Cursor++ = 0;
+        *Cursor++ = 0x41;
+        *Cursor++ = 0xFF;
+        *Cursor++ = 0xCB;
+        *Cursor++ = 0x74;
+        FailFix = Cursor;
+        *Cursor++ = 0;
+        *Cursor++ = 0x31;
+        *Cursor++ = 0xC0;
+        *Cursor++ = 0x0F;
+        *Cursor++ = 0xA2;
+        *Cursor++ = 0x48;
+        *Cursor++ = 0xB8;
+        RtlCopyMemory(Cursor, &Context, sizeof(Context));
+        Cursor += sizeof(Context);
+        *Cursor++ = 0xEB;
+        AgainFix = Cursor;
+        *Cursor++ = 0;
+        Fail = Cursor;
+        *Cursor++ = 0xCC;
+        Ready = Cursor;
+        *ReadyFix = (UCHAR)(Ready - (ReadyFix + 1));
+        *FailFix = (UCHAR)(Fail - (FailFix + 1));
+        *AgainFix = (UCHAR)(Retry - (AgainFix + 1));
+    }
+    *Cursor++ = 0x48;
     *Cursor++ = 0x83;
     *Cursor++ = 0xEC;
     *Cursor++ = 0x28;
@@ -2836,6 +3030,50 @@ InjectWriteStub(
     *Cursor++ = 0xFF;
     *Cursor++ = 0xE0;
     *Cursor++ = 0xCC;
+    Cursor = Stub + INJECT_EPILOGUE;
+    //
+    // NtContinue lands here with CONTEXT.Rax already set to STATUS_TIMEOUT.
+    // CPUID replaces RAX/RBX/RCX/RDX, and a following mov rax, oldrip would
+    // deliver the stub address as the wait status. RtlWaitOnAddress then
+    // skips RtlpWaitOnAddressRemoveWaitBlock. Save the four registers around
+    // the disarm CPUID and jump through a memory operand.
+    //
+    *Cursor++ = 0x50;
+    *Cursor++ = 0x53;
+    *Cursor++ = 0x51;
+    *Cursor++ = 0x52;
+    *Cursor++ = 0xB8;
+    {
+        UINT32 Leaf = HACDBG_INJECT_DISARM_LEAF;
+
+        RtlCopyMemory(Cursor, &Leaf, sizeof(Leaf));
+        Cursor += sizeof(Leaf);
+    }
+    *Cursor++ = 0xB9;
+    {
+        UINT32 Subleaf = HACDBG_INJECT_DISARM_SUBLEAF;
+
+        RtlCopyMemory(Cursor, &Subleaf, sizeof(Subleaf));
+        Cursor += sizeof(Subleaf);
+    }
+    *Cursor++ = 0x0F;
+    *Cursor++ = 0xA2;
+    *Cursor++ = 0x5A;
+    *Cursor++ = 0x59;
+    *Cursor++ = 0x5B;
+    *Cursor++ = 0x58;
+    *Cursor++ = 0xFF;
+    *Cursor++ = 0x25;
+    *Cursor++ = 0x00;
+    *Cursor++ = 0x00;
+    *Cursor++ = 0x00;
+    *Cursor++ = 0x00;
+    //
+    // Patched with the saved user RIP after the frame is copied, and before
+    // that frame is hidden. Zero is the defined target until that store.
+    //
+    *(UINT64*)Cursor = 0;
+    Cursor += sizeof(UINT64);
 }
 
 #define INJECT_SLAT_SLOTS 8u
@@ -2846,6 +3084,7 @@ InjectWriteStub(
 typedef struct _INJECT_SLAT_SLOT
 {
     volatile UINT64 Thread;
+    PETHREAD Owner;
     PEPROCESS Process;
     UINT64 KernelCr3;
     UINT64 UserCr3;
@@ -2861,6 +3100,7 @@ typedef struct _INJECT_MAP
     ULONG OwnedCount;
     INJECT_EDIT* Edits;
     ULONG EditCount;
+    volatile LONG Quiesced;
 } INJECT_MAP;
 
 static INJECT_SLAT_SLOT g_SlatSlots[INJECT_SLAT_SLOTS];
@@ -2967,6 +3207,7 @@ InjectSlatAllow(
     g_SlatSlots[freeSlot].Process = PsGetThreadProcess(Thread);
     g_SlatSlots[freeSlot].KernelCr3 = KernelCr3;
     g_SlatSlots[freeSlot].UserCr3 = UserCr3;
+    g_SlatSlots[freeSlot].Owner = Thread;
     KeMemoryBarrier();
     g_SlatSlots[freeSlot].Thread = (UINT64)Thread;
     KeMemoryBarrier();
@@ -3046,11 +3287,14 @@ InjectClearThreadSlot(
 
     for (index = 0; index < INJECT_SLAT_SLOTS; index++)
     {
-        if (InterlockedCompareExchange64((LONG64*)&g_SlatSlots[index].Thread, 0, (LONG64)Thread) == (LONG64)Thread)
+        if (g_SlatSlots[index].Owner == Thread)
         {
+            g_SlatSlots[index].Thread = 0;
+            g_SlatSlots[index].Owner = NULL;
             g_SlatSlots[index].KernelCr3 = 0;
             g_SlatSlots[index].UserCr3 = 0;
             g_SlatSlots[index].Process = NULL;
+            KeMemoryBarrier();
             ExReleaseFastMutex(&g_MapLock);
             ObDereferenceObject(Thread);
             return;
@@ -3058,6 +3302,240 @@ InjectClearThreadSlot(
     }
 
     ExReleaseFastMutex(&g_MapLock);
+}
+
+VOID
+InjectDisarmCurrentThread(
+    VOID
+    )
+{
+    PETHREAD thread;
+    ULONG index;
+
+    thread = (PETHREAD)KeGetCurrentThread();
+    for (index = 0; index < INJECT_SLAT_SLOTS; index++)
+    {
+        if (InterlockedCompareExchange64((LONG64*)&g_SlatSlots[index].Thread, 0, (LONG64)thread) == (LONG64)thread)
+        {
+            g_SlatSlots[index].KernelCr3 = 0;
+            g_SlatSlots[index].UserCr3 = 0;
+            KeMemoryBarrier();
+            HACDBG_LOG("HacDbg: DLL inject disarmed tid=%llu.\n", (UINT64)(ULONG_PTR)PsGetThreadId(thread));
+            return;
+        }
+    }
+}
+
+static UINT64 g_CleanVa;
+
+C_ASSERT(INJECT_CLEAN_CPUID_OFFSET + 2 == INJECT_CLEAN_PATCH_BYTES);
+
+static BOOLEAN
+InjectStoreGuest(
+    _In_ UINT64 Directory,
+    _In_ UINT64 Virtual,
+    _In_ UINT64 Value
+    )
+{
+    UINT64 table;
+    ULONG depth;
+
+    table = Directory & INJECT_FRAME;
+    for (depth = 0; depth < 4; depth++)
+    {
+        UINT64 entry;
+        ULONG index = (ULONG)((Virtual >> (39 - (depth * 9))) & 0x1FFu);
+
+        if (InjectReadEntry(table, index, &entry) == FALSE || (entry & INJECT_PRESENT) == 0 ||
+            (entry & INJECT_LARGE) != 0)
+        {
+            return FALSE;
+        }
+
+        if (depth == 3)
+        {
+            PVOID mapped;
+            SIZE_T mappedSize;
+            UINT64 physical = (entry & INJECT_FRAME) + (Virtual & 0xFFF);
+
+            mapped = PhysicalMemoryMapTemporary(HacDbgGuestPhysicalAddress(physical), sizeof(Value), &mappedSize);
+            if (mapped == NULL || mappedSize < sizeof(Value))
+            {
+                return FALSE;
+            }
+
+            *(UINT64*)mapped = Value;
+            PhysicalMemoryUnmapTemporary(mapped, mappedSize);
+            return TRUE;
+        }
+
+        table = entry & INJECT_FRAME;
+    }
+
+    return FALSE;
+}
+
+BOOLEAN
+InjectEmulateCleanEntry(
+    _In_ UINT64 GuestCr3,
+    _In_ UINT64 GuestRsp,
+    _In_ UINT64 GuestRbx,
+    _In_ UINT64 GuestRbp,
+    _In_ UINT64 GuestRsi
+    )
+{
+    if (InjectStoreGuest(GuestCr3, GuestRsp + 0x10, GuestRbx) == FALSE ||
+        InjectStoreGuest(GuestCr3, GuestRsp + 0x18, GuestRbp) == FALSE ||
+        InjectStoreGuest(GuestCr3, GuestRsp + 0x20, GuestRsi) == FALSE)
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject clean prologue write failed rsp=0x%I64x.\n", GuestRsp);
+        return FALSE;
+    }
+
+    return TRUE;
+}
+
+BOOLEAN
+InjectMatchCleanCpuid(
+    _In_ UINT64 GuestRip
+    )
+{
+    return g_CleanVa != 0 && GuestRip == g_CleanVa + INJECT_CLEAN_CPUID_OFFSET;
+}
+
+static BOOLEAN
+InjectUnhideOwned(
+    _Inout_ INJECT_OWNED* Owned,
+    _In_ ULONG Count
+    )
+{
+    ULONG index;
+    BOOLEAN changed;
+
+    changed = FALSE;
+    if (Owned == NULL)
+    {
+        return FALSE;
+    }
+
+    for (index = 0; index < Count; index++)
+    {
+        if (Owned[index].Hidden == FALSE)
+        {
+            continue;
+        }
+
+        if (INJECT_UNHIDE_PAGE(HacDbgGuestPhysicalAddress(Owned[index].Physical)) == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject unhide failed pa=0x%I64x.\n", Owned[index].Physical);
+            continue;
+        }
+
+        Owned[index].Hidden = FALSE;
+        changed = TRUE;
+    }
+
+    return changed;
+}
+
+static BOOLEAN
+InjectArmHide(
+    _Inout_ INJECT_OWNED* Owned,
+    _In_ ULONG Count
+    )
+{
+    ULONG index;
+    BOOLEAN ok;
+
+    if (Owned == NULL || Count == 0)
+    {
+        return TRUE;
+    }
+
+    ok = TRUE;
+    for (index = 0; index < Count; index++)
+    {
+        if (Owned[index].Poison == FALSE || Owned[index].Hidden != FALSE)
+        {
+            continue;
+        }
+
+        //
+        // INVARIANT: Physical is the 4 KiB payload frame. The guest leaf
+        // names the decoy, so hiding this GPA does not change the fetch.
+        // Kernel stores through Virtual must already be finished: the main
+        // and hook roots translate this GPA to the zero page after this call.
+        //
+        if (INJECT_HIDE_PAGE(HacDbgGuestPhysicalAddress(Owned[index].Physical)) == FALSE)
+        {
+            ULONG HookUsed;
+            ULONG HookMax;
+            ULONG HiddenUsed;
+            ULONG HiddenMax;
+
+            INJECT_SLOT_USAGE(&HookUsed, &HookMax, &HiddenUsed, &HiddenMax);
+            HACDBG_LOG("HacDbg: Err, DLL inject hide failed pa=0x%I64x hook_slots=%lu/%lu hidden_slots=%lu/%lu.\n",
+                       Owned[index].Physical, HookUsed, HookMax, HiddenUsed, HiddenMax);
+            ok = FALSE;
+            continue;
+        }
+
+        Owned[index].Hidden = TRUE;
+        Owned[index].Poison = FALSE;
+        HACDBG_LOG("HacDbg: DLL inject hide pa=0x%I64x.\n", Owned[index].Physical);
+    }
+
+    return ok;
+}
+
+BOOLEAN
+InjectQuiesceCurrentProcess(
+    _In_ UINT64 GuestRip
+    )
+{
+    PEPROCESS process;
+    ULONG index;
+    BOOLEAN changed;
+
+    changed = FALSE;
+    if (g_CleanVa == 0 || KeGetCurrentIrql() > DISPATCH_LEVEL)
+    {
+        return FALSE;
+    }
+
+    if (GuestRip != g_CleanVa && GuestRip != g_CleanVa + INJECT_CLEAN_CPUID_OFFSET)
+    {
+        return FALSE;
+    }
+
+    process = PsGetCurrentProcess();
+    for (index = 0; index < INJECT_MAPS; index++)
+    {
+        BOOLEAN unhid;
+
+        if (g_Maps[index].Live == 0 || g_Maps[index].Busy != 0 || g_Maps[index].Process != process ||
+            g_Maps[index].Edits == NULL)
+        {
+            continue;
+        }
+
+        if (InterlockedCompareExchange(&g_Maps[index].Quiesced, 1, 0) != 0)
+        {
+            continue;
+        }
+
+        unhid = InjectUnhideOwned(g_Maps[index].Owned, g_Maps[index].OwnedCount);
+        if (unhid != FALSE)
+        {
+            changed = TRUE;
+        }
+
+        InjectRestoreEdits(g_Maps[index].Edits, g_Maps[index].EditCount);
+        HACDBG_LOG("HacDbg: DLL inject quiesced pid=%llu unhide=%u before address space rundown.\n",
+                   (UINT64)(ULONG_PTR)PsGetProcessId(process), unhid != FALSE ? 1u : 0u);
+    }
+
+    return changed;
 }
 
 static VOID
@@ -3348,6 +3826,7 @@ InjectRegisterMap(
             g_Maps[index].OwnedCount = OwnedCount;
             g_Maps[index].Edits = Edits;
             g_Maps[index].EditCount = EditCount;
+            g_Maps[index].Quiesced = 0;
             g_Maps[index].Busy = 1;
             InterlockedDecrement(&g_MapBuilding);
 
@@ -3369,6 +3848,7 @@ static NTSTATUS
 InjectStartEntry(
     _In_ PEPROCESS Process,
     _In_ UINT64 StubVa,
+    _In_ PVOID StubHost,
     _In_ PVOID ContextHost,
     _Inout_ INJECT_MAP* Map
     )
@@ -3389,7 +3869,19 @@ InjectStartEntry(
         return STATUS_NOT_SUPPORTED;
     }
 
-    Status = InjectSuspendOne(Process, &ThreadHandle, &Thread);
+    {
+        UINT64 int2e;
+        UINT64 alert;
+
+        alert = InjectAlertReturn(Process, &int2e);
+        if (alert == 0 && int2e == 0)
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject found no NtWaitForAlertByThreadId.\n");
+            return STATUS_NOT_FOUND;
+        }
+
+        Status = InjectSuspendOne(Process, TRUE, alert, int2e, &ThreadHandle, &Thread);
+    }
     if (!NT_SUCCESS(Status))
     {
         HACDBG_LOG("HacDbg: Err, DLL inject found no thread to hijack: 0x%08x.\n", Status);
@@ -3448,11 +3940,22 @@ InjectStartEntry(
     Captured->SegCs = Cs;
     Captured->SegSs = INJECT_USER_SS;
     Captured->EFlags = (*(ULONG*)(Trap + INJECT_TRAP_EFLAGS) | 2u) & ~0x100u;
-    Captured->Rip = OldRip;
+    Captured->Rip = StubVa + INJECT_EPILOGUE;
+    //
+    // This store uses the kernel mapping of the stub frame. It has to finish
+    // before InjectArmHide redirects that GPA to the zero page.
+    //
+    if (StubHost != NULL)
+    {
+        *(UINT64*)((PUCHAR)StubHost + INJECT_EPILOGUE_RIP) = OldRip;
+    }
+
+    *(UINT64*)((PUCHAR)ContextHost + INJECT_CONTEXT_MARK) = INJECT_CONTEXT_MAGIC;
     Captured->Rsp = *(UINT64*)(Trap + INJECT_TRAP_RSP);
     //
     // The stub resumes at the saved user return address. RAX is the status
     // RtlWaitOnAddress sees after NtContinue, not the kernel wait result.
+    // The epilogue must pop this value back after its disarm CPUID.
     //
     Captured->Rax = INJECT_STATUS_TIMEOUT;
     Captured->Rcx = *(UINT64*)(Trap + INJECT_TRAP_RCX);
@@ -3483,6 +3986,20 @@ InjectStartEntry(
         }
 
         Map->Thread = Thread;
+    }
+
+    if (InjectArmHide(Map->Owned, Map->OwnedCount) == FALSE)
+    {
+        ZwResumeThread(ThreadHandle, &PreviousSuspend);
+        if (Kept == FALSE)
+        {
+            ObDereferenceObject(Thread);
+        }
+
+        ZwClose(ThreadHandle);
+        ExFreePool(Captured);
+        HACDBG_LOG("HacDbg: Err, DLL inject hide failed stub=0x%I64x.\n", StubVa);
+        return STATUS_UNSUCCESSFUL;
     }
 
     if (InjectFlush() == FALSE)
@@ -3537,6 +4054,7 @@ InjectMapImage(
     _Out_ ULONG* HiddenCount,
     _Out_ ULONG* DataCount,
     _Out_ PVOID* ContextHost,
+    _Out_ PVOID* StubHost,
     _Out_ INJECT_MAP** Map
     )
 {
@@ -3555,6 +4073,7 @@ InjectMapImage(
     *HiddenCount = 0;
     *DataCount = 0;
     *ContextHost = NULL;
+    *StubHost = NULL;
     *Map = NULL;
     Directory = InjectDirectory(Process, INJECT_DIR_TABLE);
     UserDirectory = InjectUsableUserDirectory(Process, Directory);
@@ -3624,6 +4143,7 @@ InjectMapImage(
         {
             Source = Stub;
             Execute = TRUE;
+            *StubHost = RealVirtual;
         }
 
         if (Source != NULL)
@@ -3684,29 +4204,12 @@ InjectMapImage(
                 if (HidePayload != FALSE)
                 {
                     //
-                    // INVARIANT: Real is the 4 KiB frame copied into the
-                    // execute shadow. The guest leaf points at Decoy, so
-                    // hiding Real does not change the fetch. A guest read
-                    // of this GPA translates to the zero page.
+                    // Hide waits until the stub return address is stored
+                    // through this frame's kernel mapping. Hiding now would
+                    // send that store to the zero page.
                     //
-                    if (INJECT_HIDE_PAGE(HacDbgGuestPhysicalAddress(Real)) == FALSE)
-                    {
-                        ULONG HookUsed;
-                        ULONG HookMax;
-                        ULONG HiddenUsed;
-                        ULONG HiddenMax;
-
-                        INJECT_SLOT_USAGE(&HookUsed, &HookMax, &HiddenUsed, &HiddenMax);
-                        HACDBG_LOG("HacDbg: Err, DLL inject hide failed pa=0x%I64x hook_slots=%lu/%lu hidden_slots=%lu/%lu.\n",
-                                   Real, HookUsed, HookMax, HiddenUsed, HiddenMax);
-                        Failed = TRUE;
-                        Status = STATUS_UNSUCCESSFUL;
-                        break;
-                    }
-
-                    Owned[RealIndex].Hidden = TRUE;
+                    Owned[RealIndex].Poison = TRUE;
                     *HiddenCount += 1;
-                    HACDBG_LOG("HacDbg: DLL inject hide pa=0x%I64x.\n", Real);
                 }
             }
         }
@@ -4200,6 +4703,7 @@ InjectPteBody(
     UINT64 Ntdll;
     UINT64 NtContinue;
     PVOID ContextHost;
+    PVOID StubHost;
     INJECT_MAP* Map;
     ULONG Hooks;
     ULONG Hidden;
@@ -4363,16 +4867,17 @@ InjectPteBody(
     Hidden = 0;
     Data = 0;
     ContextHost = NULL;
+    StubHost = NULL;
     Map = NULL;
     Status = InjectMapImage(Process, Image, Pages * PAGE_SIZE, Base, ExecuteBits, Stub, HidePayload, &Hooks, &Hidden,
-                            &Data, &ContextHost, &Map);
+                            &Data, &ContextHost, &StubHost, &Map);
     ExFreePool(Image);
     if (!NT_SUCCESS(Status))
     {
         return Status;
     }
 
-    Status = InjectStartEntry(Process, Base + ((UINT64)Pages * PAGE_SIZE), ContextHost, Map);
+    Status = InjectStartEntry(Process, Base + ((UINT64)Pages * PAGE_SIZE), StubHost, ContextHost, Map);
     Map->Busy = 0;
     KeMemoryBarrier();
     if (!NT_SUCCESS(Status))
@@ -4556,6 +5061,137 @@ InjectWatchMaps(
     PsTerminateSystemThread(STATUS_SUCCESS);
 }
 
+static VOID
+InjectArmCleanHook(
+    VOID
+    )
+{
+    UNICODE_STRING name;
+    PVOID attach;
+    PUCHAR image;
+    LONG lfanew;
+    ULONG size;
+    ULONG index;
+
+    RtlInitUnicodeString(&name, L"KeStackAttachProcess");
+    attach = MmGetSystemRoutineAddress(&name);
+    if (attach == NULL)
+    {
+        return;
+    }
+
+    image = (PUCHAR)PAGE_ALIGN(attach);
+    while ((ULONG_PTR)((PUCHAR)attach - image) < 0x2000000)
+    {
+        if (image[0] == 'M' && image[1] == 'Z')
+        {
+            lfanew = *(LONG*)(image + 0x3C);
+            if (lfanew > 0 && lfanew < 0x800 && *(ULONG*)(image + lfanew) == IMAGE_NT_SIGNATURE)
+            {
+                break;
+            }
+        }
+
+        if (image < (PUCHAR)0x10000)
+        {
+            return;
+        }
+
+        image -= PAGE_SIZE;
+    }
+
+    if (image[0] != 'M')
+    {
+        return;
+    }
+
+    lfanew = *(LONG*)(image + 0x3C);
+    size = *(ULONG*)(image + lfanew + 0x50);
+    for (index = 0; index + 16 < size; index++)
+    {
+        INT32 relative;
+        ULONG follow;
+
+        if (image[index] != 0xE8)
+        {
+            continue;
+        }
+
+        relative = *(INT32*)(image + index + 1);
+        if (image + index + 5 + relative != (PUCHAR)attach)
+        {
+            continue;
+        }
+
+        for (follow = 0; follow + 12 < 48; follow++)
+        {
+            ULONG at = index + 5 + follow;
+            INT32 second;
+            UINT64 clean;
+
+            if (at + 16 >= size || image[at] != 0x48 || image[at + 1] != 0x8B || image[at + 2] != 0xCF ||
+                image[at + 3] != 0xE8 || image[at + 8] != 0x48 || image[at + 9] != 0x8B || image[at + 10] != 0xCF ||
+                image[at + 11] != 0xE8)
+            {
+                continue;
+            }
+
+            second = *(INT32*)(image + at + 12);
+            clean = (UINT64)(image + at + 16 + second);
+            if (clean < (UINT64)image || clean + 15 >= (UINT64)image + size || *(UCHAR*)clean != 0x4C ||
+                *((UCHAR*)clean + 1) != 0x8B || *((UCHAR*)clean + 2) != 0xDC ||
+                RtlCompareMemory((PVOID)(clean + 3), "\x49\x89\x5B\x10\x49\x89\x6B\x18\x49\x89\x73\x20", 12) != 12)
+            {
+                continue;
+            }
+
+            if (INJECT_KERNEL_HOOK(HacDbgGuestPhysicalAddress(MmGetPhysicalAddress((PVOID)clean).QuadPart & ~0xFFFull),
+                                   HacDbgGuestPhysicalAddress(
+                                       MmGetPhysicalAddress((PVOID)PAGE_ALIGN((PVOID)clean)).QuadPart)) == FALSE)
+            {
+                HACDBG_LOG("HacDbg: Err, DLL inject clean hook failed va=0x%I64x.\n", clean);
+                return;
+            }
+
+            {
+                UCHAR patch[INJECT_CLEAN_PATCH_BYTES];
+                PHYSICAL_ADDRESS page;
+
+                //
+                // Incoming R11 is dead: the stolen prologue's first instruction
+                // is mov r11, rsp. Save RCX there. CPUID clobbers EAX/ECX, and
+                // the exit RIP is the CPUID itself. Putting CPUID last means
+                // advancing by its 2-byte length resumes at the original push.
+                // A 15-byte advance from the CPUID splits sub rsp,50h into
+                // sub esp,50h and zero-extends the kernel stack pointer.
+                //
+                patch[0] = 0x4C;
+                patch[1] = 0x8B;
+                patch[2] = 0xD9;
+                patch[3] = 0xB8;
+                *(UINT32*)(patch + 4) = HACDBG_INJECT_QUIESCE_LEAF;
+                patch[8] = 0xB9;
+                *(UINT32*)(patch + 9) = HACDBG_INJECT_QUIESCE_SUBLEAF;
+                patch[INJECT_CLEAN_CPUID_OFFSET] = 0x0F;
+                patch[INJECT_CLEAN_CPUID_OFFSET + 1] = 0xA2;
+                page = MmGetPhysicalAddress((PVOID)PAGE_ALIGN((PVOID)clean));
+                if (INJECT_PATCH_HOOK(HacDbgGuestPhysicalAddress(page.QuadPart), (ULONG)(clean & 0xFFF), patch,
+                                      sizeof(patch)) == FALSE)
+                {
+                    HACDBG_LOG("HacDbg: Err, DLL inject clean prologue patch failed va=0x%I64x.\n", clean);
+                    return;
+                }
+            }
+
+            g_CleanVa = clean;
+            HACDBG_LOG("HacDbg: DLL inject clean hook va=0x%I64x.\n", clean);
+            return;
+        }
+    }
+
+    HACDBG_LOG("HacDbg: Err, DLL inject found no address-space rundown.\n");
+}
+
 NTSTATUS
 InjectInitialize(
     VOID
@@ -4593,6 +5229,7 @@ InjectInitialize(
     g_MapThread = thread;
     g_InjectReady = TRUE;
     KeMemoryBarrier();
+    InjectArmCleanHook();
     return STATUS_SUCCESS;
 }
 

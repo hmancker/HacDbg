@@ -13,10 +13,13 @@
 #define HACDBG_NPT_TAG              'TcaH'
 #define HACDBG_NPT_MAX_HOOKS        256
 #define HACDBG_NPT_MAX_HIDDEN       1024
+#define HACDBG_NPT_INJECT_HOOKS     256
+#define HACDBG_NPT_INJECT_HIDDEN    1024
 #define HACDBG_NPT_COVERED_BYTES    HACDBG_GUEST_PHYSICAL_LIMIT
 #define HACDBG_NPT_TABLE_PAGES      ((HACDBG_NPT_COVERED_BYTES / (2ull * 1024ull * 1024ull)) / 512ull * 2ull + 6ull)
 #define HACDBG_NPT_FIXED_PAGES      (HACDBG_NPT_TABLE_PAGES + 1ull)
-#define HACDBG_NPT_SPLIT_PAGES      (HACDBG_NPT_MAX_HOOKS * 2ull + HACDBG_NPT_MAX_HIDDEN * 2ull + 128ull)
+#define HACDBG_NPT_SPLIT_PAGES      ((HACDBG_NPT_MAX_HOOKS + HACDBG_NPT_INJECT_HOOKS) * 2ull + \
+                                     (HACDBG_NPT_MAX_HIDDEN + HACDBG_NPT_INJECT_HIDDEN) * 2ull + 128ull)
 #define HACDBG_NPT_POOL_PAGES       (HACDBG_NPT_FIXED_PAGES + HACDBG_NPT_SPLIT_PAGES)
 #define HACDBG_NPT_FIXED_CHUNK_PAGES 64ull
 #define HACDBG_NPT_SPLIT_CHUNK_PAGES 8ull
@@ -66,6 +69,11 @@ static PVOID g_HookCopyVa[HACDBG_NPT_MAX_HOOKS];
 static UINT64 g_HookCopyPa[HACDBG_NPT_MAX_HOOKS];
 static NPT_HOOK g_Hooks[HACDBG_NPT_MAX_HOOKS];
 static NPT_HIDDEN_PAGE g_HiddenPages[HACDBG_NPT_MAX_HIDDEN];
+static PVOID g_InjectHookCopyAllocation;
+static PVOID g_InjectHookCopyVa[HACDBG_NPT_INJECT_HOOKS];
+static UINT64 g_InjectHookCopyPa[HACDBG_NPT_INJECT_HOOKS];
+static NPT_HOOK g_InjectHooks[HACDBG_NPT_INJECT_HOOKS];
+static NPT_HIDDEN_PAGE g_InjectHidden[HACDBG_NPT_INJECT_HIDDEN];
 static HACDBG_SPIN_LOCK g_NptLock;
 static BOOLEAN g_Initialized;
 
@@ -76,6 +84,11 @@ NptFindHidden(
 
 static BOOLEAN
 NptAllocateHookCopies(
+    VOID
+    );
+
+static BOOLEAN
+NptAllocateInjectHookCopies(
     VOID
     );
 
@@ -348,6 +361,19 @@ NptFindHook(
         }
     }
 
+    if (IndexOut != NULL)
+    {
+        return FALSE;
+    }
+
+    for (index = 0; index < HACDBG_NPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active != FALSE && g_InjectHooks[index].TargetPage == TargetPage)
+        {
+            return TRUE;
+        }
+    }
+
     return FALSE;
 }
 
@@ -372,6 +398,19 @@ NptContainsShadowPage(
         }
     }
 
+    if (found == FALSE)
+    {
+        for (index = 0; index < HACDBG_NPT_INJECT_HOOKS; index++)
+        {
+            if (g_InjectHooks[index].Active != FALSE &&
+                (g_InjectHooks[index].UserPage == page || g_InjectHookCopyPa[index] == page))
+            {
+                found = TRUE;
+                break;
+            }
+        }
+    }
+
     HacDbgSpinLockRelease(&g_NptLock);
     return found;
 }
@@ -387,6 +426,14 @@ NptFindHidden(
     for (index = 0; index < HACDBG_NPT_MAX_HIDDEN; index++)
     {
         if (g_HiddenPages[index].Active != FALSE && g_HiddenPages[index].Page == Page)
+        {
+            return TRUE;
+        }
+    }
+
+    for (index = 0; index < HACDBG_NPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active != FALSE && g_InjectHidden[index].Page == Page)
         {
             return TRUE;
         }
@@ -598,7 +645,7 @@ NptInitialize(
         return STATUS_INSUFFICIENT_RESOURCES;
     }
 
-    if (NptAllocateHookCopies() == FALSE)
+    if (NptAllocateHookCopies() == FALSE || NptAllocateInjectHookCopies() == FALSE)
     {
         return STATUS_INSUFFICIENT_RESOURCES;
     }
@@ -637,6 +684,12 @@ NptCleanup(
     {
         ExFreePoolWithTag(g_HookCopyAllocation, HACDBG_NPT_TAG);
         g_HookCopyAllocation = NULL;
+    }
+
+    if (g_InjectHookCopyAllocation != NULL)
+    {
+        ExFreePoolWithTag(g_InjectHookCopyAllocation, HACDBG_NPT_TAG);
+        g_InjectHookCopyAllocation = NULL;
     }
 
     RtlZeroMemory(g_HookCopyVa, sizeof(g_HookCopyVa));
@@ -739,6 +792,38 @@ NptAllocateHookCopies(
         physical = MmGetPhysicalAddress(g_HookCopyVa[index]);
         g_HookCopyPa[index] = (UINT64)physical.QuadPart & NPT_ADDRESS_MASK;
         if (g_HookCopyPa[index] == 0)
+        {
+            return FALSE;
+        }
+    }
+
+    return TRUE;
+}
+
+static BOOLEAN
+NptAllocateInjectHookCopies(
+    VOID
+    )
+{
+    SIZE_T bytes = ((SIZE_T)HACDBG_NPT_INJECT_HOOKS * PAGE_SIZE) + PAGE_SIZE;
+    PUCHAR aligned;
+    UINT32 index;
+
+    g_InjectHookCopyAllocation = ExAllocatePool2(POOL_FLAG_NON_PAGED, bytes, HACDBG_NPT_TAG);
+    if (g_InjectHookCopyAllocation == NULL)
+    {
+        return FALSE;
+    }
+
+    aligned = (PUCHAR)(((ULONG_PTR)g_InjectHookCopyAllocation + (PAGE_SIZE - 1)) & ~(ULONG_PTR)(PAGE_SIZE - 1));
+    for (index = 0; index < HACDBG_NPT_INJECT_HOOKS; index++)
+    {
+        PHYSICAL_ADDRESS physical;
+
+        g_InjectHookCopyVa[index] = aligned + ((SIZE_T)index * PAGE_SIZE);
+        physical = MmGetPhysicalAddress(g_InjectHookCopyVa[index]);
+        g_InjectHookCopyPa[index] = (UINT64)physical.QuadPart & NPT_ADDRESS_MASK;
+        if (g_InjectHookCopyPa[index] == 0)
         {
             return FALSE;
         }
@@ -932,6 +1017,23 @@ NptRefreshHookCopies(
         {
             HACDBG_LOG("HacDbg: Err, NPT hook copy refresh failed pa=0x%I64x.\n",
                      g_Hooks[index].UserPage);
+            logged = TRUE;
+        }
+    }
+
+    for (index = 0; index < HACDBG_NPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active == FALSE || g_InjectHooks[index].UserPage == 0 ||
+            g_InjectHookCopyVa[index] == NULL)
+        {
+            continue;
+        }
+
+        if (NptCopyUserPage(g_InjectHooks[index].UserPage, g_InjectHookCopyVa[index], TRUE) == FALSE &&
+            logged == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, NPT inject hook copy refresh failed pa=0x%I64x.\n",
+                     g_InjectHooks[index].UserPage);
             logged = TRUE;
         }
     }
@@ -1457,6 +1559,316 @@ NptUnmapPrivate(
     KeMemoryBarrier();
     HacDbgSpinLockRelease(&g_NptLock);
     return TRUE;
+}
+
+BOOLEAN
+NptAddInjectHook(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage,
+    _In_ GUEST_PHYSICAL_ADDRESS ShadowPage
+    )
+{
+    UINT64 target = TargetPage.Value & NPT_ADDRESS_MASK;
+    UINT64 shadow = ShadowPage.Value & NPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    if (g_Initialized == FALSE || target == 0 || shadow == 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    for (index = 0; index < HACDBG_NPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active != FALSE && g_InjectHooks[index].TargetPage == target)
+        {
+            HacDbgSpinLockRelease(&g_NptLock);
+            return FALSE;
+        }
+    }
+
+    for (index = 0; index < HACDBG_NPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active == FALSE)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_NPT_INJECT_HOOKS || g_InjectHookCopyVa[index] == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    mainPte = NptPte(g_MainRootPa, target, FALSE);
+    hookPte = NptPte(g_HookRootPa, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL || NptCopyUserPage(shadow, g_InjectHookCopyVa[index], FALSE) == FALSE)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    g_InjectHooks[index].TargetPage = target;
+    g_InjectHooks[index].UserPage = shadow;
+    g_InjectHooks[index].Active = FALSE;
+    *hookPte = g_InjectHookCopyPa[index] | NPT_PRESENT | NPT_WRITE | NPT_USER;
+    NptSetAdjacentExecutable(target);
+    KeMemoryBarrier();
+    g_InjectHooks[index].Active = TRUE;
+    KeMemoryBarrier();
+    *mainPte |= NPT_NX;
+    HacDbgSpinLockRelease(&g_NptLock);
+    return TRUE;
+}
+
+BOOLEAN
+NptRemoveInjectHook(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    )
+{
+    UINT64 target = TargetPage.Value & NPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+    UINT32 other;
+    BOOLEAN keep;
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    for (index = 0; index < HACDBG_NPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active != FALSE && g_InjectHooks[index].TargetPage == target)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_NPT_INJECT_HOOKS)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    mainPte = NptPte(g_MainRootPa, target, FALSE);
+    hookPte = NptPte(g_HookRootPa, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    keep = FALSE;
+    for (other = 0; other < HACDBG_NPT_MAX_HOOKS; other++)
+    {
+        if (g_Hooks[other].Active != FALSE && g_Hooks[other].TargetPage == target)
+        {
+            keep = TRUE;
+        }
+    }
+
+    if (keep == FALSE)
+    {
+        *mainPte &= ~NPT_NX;
+    }
+
+    KeMemoryBarrier();
+    g_InjectHooks[index].Active = FALSE;
+    g_InjectHooks[index].UserPage = 0;
+    g_InjectHooks[index].TargetPage = 0;
+    if (NptFindHidden(target) != FALSE)
+    {
+        *hookPte = g_DummyPagePa | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NX;
+    }
+    else
+    {
+        *hookPte = target | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NX;
+    }
+
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_NptLock);
+    return TRUE;
+}
+
+BOOLEAN
+NptHideInjectPage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    )
+{
+    UINT64 target = TargetPage.Value & NPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    if (g_Initialized == FALSE || (TargetPage.Value & (PAGE_SIZE - 1)) != 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    for (index = 0; index < HACDBG_NPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active != FALSE && g_InjectHidden[index].Page == target)
+        {
+            HacDbgSpinLockRelease(&g_NptLock);
+            return FALSE;
+        }
+    }
+
+    for (index = 0; index < HACDBG_NPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active == FALSE)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_NPT_INJECT_HIDDEN)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    mainPte = NptPte(g_MainRootPa, target, FALSE);
+    hookPte = NptPte(g_HookRootPa, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    g_InjectHidden[index].Page = target;
+    g_InjectHidden[index].Active = TRUE;
+    if (NptFindHook(target, NULL) != FALSE)
+    {
+        *mainPte = g_DummyPagePa | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NX;
+    }
+    else
+    {
+        *mainPte = g_DummyPagePa | NPT_PRESENT | NPT_WRITE | NPT_USER;
+        *hookPte = g_DummyPagePa | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NX;
+    }
+
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_NptLock);
+    return TRUE;
+}
+
+BOOLEAN
+NptUnhideInjectPage(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage
+    )
+{
+    UINT64 target = TargetPage.Value & NPT_ADDRESS_MASK;
+    UINT64* mainPte;
+    UINT64* hookPte;
+    UINT32 index;
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    for (index = 0; index < HACDBG_NPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active != FALSE && g_InjectHidden[index].Page == target)
+        {
+            break;
+        }
+    }
+
+    if (index == HACDBG_NPT_INJECT_HIDDEN)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    mainPte = NptPte(g_MainRootPa, target, FALSE);
+    hookPte = NptPte(g_HookRootPa, target, TRUE);
+    if (mainPte == NULL || hookPte == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    g_InjectHidden[index].Active = FALSE;
+    g_InjectHidden[index].Page = 0;
+    if (NptFindHook(target, NULL) != FALSE)
+    {
+        *mainPte = target | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NX;
+    }
+    else
+    {
+        *mainPte = target | NPT_PRESENT | NPT_WRITE | NPT_USER;
+        *hookPte = target | NPT_PRESENT | NPT_WRITE | NPT_USER | NPT_NX;
+    }
+
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_NptLock);
+    return TRUE;
+}
+
+BOOLEAN
+NptPatchHookCopy(
+    _In_ GUEST_PHYSICAL_ADDRESS TargetPage,
+    _In_ ULONG Offset,
+    _In_reads_bytes_(Length) const VOID* Bytes,
+    _In_ ULONG Length
+    )
+{
+    UINT64 target = TargetPage.Value & NPT_ADDRESS_MASK;
+    UINT32 index;
+
+    if (Offset + Length < Offset || Offset + Length > PAGE_SIZE || Bytes == NULL)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    if (NptFindHook(target, &index) == FALSE || g_HookCopyVa[index] == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    RtlCopyMemory((PUCHAR)g_HookCopyVa[index] + Offset, Bytes, Length);
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_NptLock);
+    return TRUE;
+}
+
+VOID
+NptInjectSlotUsage(
+    _Out_ ULONG* HookUsed,
+    _Out_ ULONG* HookMax,
+    _Out_ ULONG* HiddenUsed,
+    _Out_ ULONG* HiddenMax
+    )
+{
+    UINT32 index;
+    ULONG hooks;
+    ULONG hidden;
+
+    hooks = 0;
+    hidden = 0;
+    HacDbgSpinLockAcquire(&g_NptLock);
+    for (index = 0; index < HACDBG_NPT_INJECT_HOOKS; index++)
+    {
+        if (g_InjectHooks[index].Active != FALSE)
+        {
+            hooks++;
+        }
+    }
+
+    for (index = 0; index < HACDBG_NPT_INJECT_HIDDEN; index++)
+    {
+        if (g_InjectHidden[index].Active != FALSE)
+        {
+            hidden++;
+        }
+    }
+
+    HacDbgSpinLockRelease(&g_NptLock);
+    *HookUsed = hooks;
+    *HookMax = HACDBG_NPT_INJECT_HOOKS;
+    *HiddenUsed = hidden;
+    *HiddenMax = HACDBG_NPT_INJECT_HIDDEN;
 }
 
 VOID
