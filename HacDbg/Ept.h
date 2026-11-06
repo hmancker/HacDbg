@@ -180,6 +180,45 @@ EptMapPrivate(
 
 BOOLEAN
 /**
+ * @brief Restores one private-root leaf to the main-root identity translation.
+ *
+ * @param DecoyPage Guest physical page previously passed to EptMapPrivate.
+ *
+ * @return TRUE when that leaf no longer names a payload frame.
+ *
+ * @details Does not allocate and does not discard the private root. A missing
+ * private override is success. FALSE means the leaf could not be rewritten.
+ */
+EptUnmapPrivate(
+    _In_ GUEST_PHYSICAL_ADDRESS DecoyPage
+    );
+
+VOID
+/**
+ * @brief Counts occupied execute-hook and hidden-page slots.
+ *
+ * @param HookUsed Receives the number of active hooks.
+ * @param HookMax Receives the hook table capacity.
+ * @param HiddenUsed Receives the number of active hidden pages.
+ * @param HiddenMax Receives the hidden-page capacity.
+ */
+EptSlotUsage(
+    _Out_ ULONG* HookUsed,
+    _Out_ ULONG* HookMax,
+    _Out_ ULONG* HiddenUsed,
+    _Out_ ULONG* HiddenMax
+    );
+
+BOOLEAN
+/**
+ * @brief Reports whether any logical processor is marked for the private root.
+ */
+EptAnyCpuPrivate(
+    VOID
+    );
+
+BOOLEAN
+/**
  * @brief Makes subsequent VM-exits install the private root as the data root.
  *
  * @param Enable TRUE publishes the private root. FALSE returns to the main root.

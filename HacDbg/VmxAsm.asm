@@ -1,7 +1,7 @@
 ;
 ; @file       VmxAsm.asm
 ;
-; @brief      VMX enter, VM-exit register save, and INVEPT.
+; @brief      VMX enter, VM-exit register save, INVEPT, and INVVPID.
 ;
 ; @author     HacDbg
 ;
@@ -88,6 +88,26 @@ VmxInveptFail:
         mov     eax, 1
         ret
 VmxInvept endp
+
+; RCX is the INVVPID type. DX is the VPID. Bits 63:16 of the descriptor stay 0.
+VmxInvvpid proc
+        sub     rsp, 28h
+        movzx   rdx, dx
+        mov     [rsp], rdx
+        mov     qword ptr [rsp+8], 0
+        ; INVARIANT: The processor is in VMX operation. DX is this processor's
+        ; VPID, or zero for the all-context type. Type 3 drops non-global
+        ; translations for that VPID.
+        invvpid rcx, oword ptr [rsp]
+        add     rsp, 28h
+        jc      VmxInvvpidFail
+        jz      VmxInvvpidFail
+        xor     eax, eax
+        ret
+VmxInvvpidFail:
+        mov     eax, 1
+        ret
+VmxInvvpid endp
 
 ; RCX is the processor context. RDX is the host RSP, and [RDX] holds that context.
 VmxLaunchVm proc

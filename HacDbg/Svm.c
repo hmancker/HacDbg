@@ -12,7 +12,7 @@
 #include "PhysicalMemory.h"
 
 BOOLEAN InjectSlatArmed(VOID);
-BOOLEAN InjectSlatCr3Private(UINT64 GuestCr3);
+BOOLEAN InjectSlatThreadPrivate(PETHREAD Thread);
 
 #include <intrin.h>
 
@@ -1255,10 +1255,11 @@ SvmNoteThreadRoot(
 
     //
     // Do not translate GS here. This exit can run above DISPATCH_LEVEL, and
-    // the temporary physical map rejects that IRQL. The directory compare
-    // does not read guest memory.
+    // the temporary physical map rejects that IRQL. VMEXIT does not SWAPGS.
+    // At CPL 0 the guest kernel GS is the KPCR, so KeGetCurrentThread is
+    // KPRCB.CurrentThread. Do not call this at CPL 3.
     //
-    NptNoteCpuPrivate(KeGetCurrentProcessorNumber(), InjectSlatCr3Private(Vmcb->StateSaveArea.Cr3));
+    NptNoteCpuPrivate(KeGetCurrentProcessorNumber(), InjectSlatThreadPrivate((PETHREAD)KeGetCurrentThread()));
 }
 
 static VOID
@@ -1432,7 +1433,17 @@ SvmHandleVmExit(
             //
             vmcb->StateSaveArea.Cr3 = ((UINT64*)GuestContext->Registers)[reg];
             vmcb->StateSaveArea.Rip = vmcb->ControlArea.NRip;
-            vmcb->ControlArea.VmcbClean &= ~(1ull << 9);
+            //
+            // INVARIANT: APM Vol 2 15.15.3 clean bit 5 is CR0/CR3/CR4/EFER.
+            // Bit 9 is CR2. TLB_CONTROL is not a clean-bit field. Encoding 3
+            // flushes this guest's TLB, which a guest CR3 write requires.
+            // Encoding 1 flushes every ASID and already covers that flush.
+            //
+            vmcb->ControlArea.VmcbClean &= ~SVM_VMCB_CLEAN_CRX;
+            if (vmcb->ControlArea.TlbControl == 0)
+            {
+                vmcb->ControlArea.TlbControl = SVM_TLB_CONTROL_FLUSH_GUEST;
+            }
         }
         break;
 

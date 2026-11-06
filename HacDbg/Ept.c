@@ -1188,7 +1188,19 @@ EptAddHook(
 
     if (index == HACDBG_EPT_MAX_HOOKS)
     {
-        HACDBG_LOG("HacDbg: Err, EPT hook table is full.\n");
+        ULONG used = 0;
+        UINT32 scan;
+
+        for (scan = 0; scan < HACDBG_EPT_MAX_HOOKS; scan++)
+        {
+            if (g_Hooks[scan].Active != FALSE)
+            {
+                used++;
+            }
+        }
+
+        HACDBG_LOG("HacDbg: Err, EPT hook table is full used=%lu max=%lu.\n", used,
+                   (ULONG)HACDBG_EPT_MAX_HOOKS);
         HacDbgSpinLockRelease(&g_EptLock);
         return FALSE;
     }
@@ -1356,7 +1368,19 @@ EptHidePage(
 
     if (index == HACDBG_EPT_MAX_HIDDEN)
     {
-        HACDBG_LOG("HacDbg: Err, EPT hidden page table is full.\n");
+        ULONG used = 0;
+        UINT32 scan;
+
+        for (scan = 0; scan < HACDBG_EPT_MAX_HIDDEN; scan++)
+        {
+            if (g_HiddenPages[scan].Active != FALSE)
+            {
+                used++;
+            }
+        }
+
+        HACDBG_LOG("HacDbg: Err, EPT hidden page table is full used=%lu max=%lu.\n", used,
+                   (ULONG)HACDBG_EPT_MAX_HIDDEN);
         HacDbgSpinLockRelease(&g_EptLock);
         return FALSE;
     }
@@ -1630,6 +1654,237 @@ EptMapPrivate(
     KeMemoryBarrier();
     HacDbgSpinLockRelease(&g_EptLock);
     return TRUE;
+}
+
+static UINT64*
+EptPrivateLeaf(
+    _In_ UINT64 GuestPage,
+    _Out_ BOOLEAN* Missing
+    )
+{
+    UINT64* mainPml4;
+    UINT64* privatePml4;
+    UINT64* mainPdpt;
+    UINT64* privatePdpt;
+    UINT64* mainPd;
+    UINT64* privatePd;
+    UINT64* pt;
+    UINT64 pml4Index;
+    UINT64 pdptIndex;
+    UINT64 pdIndex;
+
+    *Missing = FALSE;
+    if (g_PrivateEptp == 0)
+    {
+        return NULL;
+    }
+
+    mainPml4 = EptVirtualFromPhysical(g_MainEptp & EPT_ADDRESS_MASK);
+    privatePml4 = EptVirtualFromPhysical(g_PrivateEptp & EPT_ADDRESS_MASK);
+    if (mainPml4 == NULL || privatePml4 == NULL)
+    {
+        *Missing = TRUE;
+        return NULL;
+    }
+
+    pml4Index = (GuestPage >> 39) & 0x1ffull;
+    if ((privatePml4[pml4Index] & EPT_ADDRESS_MASK) == (mainPml4[pml4Index] & EPT_ADDRESS_MASK))
+    {
+        return NULL;
+    }
+
+    privatePdpt = EptPageFromEntry(privatePml4[pml4Index]);
+    mainPdpt = EptPageFromEntry(mainPml4[pml4Index]);
+    if (privatePdpt == NULL || mainPdpt == NULL)
+    {
+        *Missing = TRUE;
+        return NULL;
+    }
+
+    pdptIndex = (GuestPage >> 30) & 0x1ffull;
+    if ((privatePdpt[pdptIndex] & EPT_ADDRESS_MASK) == (mainPdpt[pdptIndex] & EPT_ADDRESS_MASK))
+    {
+        return NULL;
+    }
+
+    privatePd = EptPageFromEntry(privatePdpt[pdptIndex]);
+    mainPd = EptPageFromEntry(mainPdpt[pdptIndex]);
+    if (privatePd == NULL || mainPd == NULL)
+    {
+        *Missing = TRUE;
+        return NULL;
+    }
+
+    pdIndex = (GuestPage >> 21) & 0x1ffull;
+    if ((privatePd[pdIndex] & EPT_LARGE) != 0)
+    {
+        return NULL;
+    }
+
+    if ((mainPd[pdIndex] & EPT_LARGE) == 0 &&
+        (privatePd[pdIndex] & EPT_ADDRESS_MASK) == (mainPd[pdIndex] & EPT_ADDRESS_MASK))
+    {
+        return NULL;
+    }
+
+    pt = EptPageFromEntry(privatePd[pdIndex]);
+    if (pt == NULL)
+    {
+        *Missing = TRUE;
+        return NULL;
+    }
+
+    return &pt[(GuestPage >> PAGE_SHIFT) & 0x1ffull];
+}
+
+static BOOLEAN
+EptIdentityLeaf(
+    _In_ UINT64 GuestPage,
+    _Out_ UINT64* Leaf
+    )
+{
+    UINT64* mainPml4;
+    UINT64* pdpt;
+    UINT64* pd;
+    UINT64* pt;
+    UINT64 pde;
+    UINT64 page;
+
+    mainPml4 = EptVirtualFromPhysical(g_MainEptp & EPT_ADDRESS_MASK);
+    if (mainPml4 == NULL)
+    {
+        return FALSE;
+    }
+
+    pdpt = EptPageFromEntry(mainPml4[(GuestPage >> 39) & 0x1ffull]);
+    if (pdpt == NULL)
+    {
+        return FALSE;
+    }
+
+    pd = EptPageFromEntry(pdpt[(GuestPage >> 30) & 0x1ffull]);
+    if (pd == NULL)
+    {
+        return FALSE;
+    }
+
+    pde = pd[(GuestPage >> 21) & 0x1ffull];
+    if ((pde & EPT_LARGE) != 0)
+    {
+        page = GuestPage & EPT_ADDRESS_MASK;
+        if (EptFindHidden(page) != FALSE)
+        {
+            page = g_DummyPagePa;
+        }
+
+        *Leaf = page | EptAccessFlags(page, (pde & EPT_EXECUTE) != 0);
+        return TRUE;
+    }
+
+    pt = EptPageFromEntry(pde);
+    if (pt == NULL)
+    {
+        return FALSE;
+    }
+
+    *Leaf = pt[(GuestPage >> PAGE_SHIFT) & 0x1ffull];
+    return TRUE;
+}
+
+BOOLEAN
+EptUnmapPrivate(
+    _In_ GUEST_PHYSICAL_ADDRESS DecoyPage
+    )
+{
+    UINT64 decoy = DecoyPage.Value & EPT_ADDRESS_MASK;
+    UINT64* leaf;
+    UINT64 identity;
+    BOOLEAN missing;
+
+    if (g_Initialized == FALSE || (DecoyPage.Value & (PAGE_SIZE - 1)) != 0 || decoy == 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_EptLock);
+    leaf = EptPrivateLeaf(decoy, &missing);
+    if (leaf == NULL)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return missing == FALSE;
+    }
+
+    if (EptIdentityLeaf(decoy, &identity) == FALSE)
+    {
+        HacDbgSpinLockRelease(&g_EptLock);
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: decoy is a 4 KiB guest page. This leaf belongs only to the
+    // private root. The restored value is the main-root identity translation,
+    // so the payload frame is no longer named here.
+    //
+    *leaf = identity;
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_EptLock);
+    return TRUE;
+}
+
+VOID
+EptSlotUsage(
+    _Out_ ULONG* HookUsed,
+    _Out_ ULONG* HookMax,
+    _Out_ ULONG* HiddenUsed,
+    _Out_ ULONG* HiddenMax
+    )
+{
+    UINT32 index;
+    ULONG hooks;
+    ULONG hidden;
+
+    hooks = 0;
+    hidden = 0;
+    HacDbgSpinLockAcquire(&g_EptLock);
+    for (index = 0; index < HACDBG_EPT_MAX_HOOKS; index++)
+    {
+        if (g_Hooks[index].Active != FALSE)
+        {
+            hooks++;
+        }
+    }
+
+    for (index = 0; index < HACDBG_EPT_MAX_HIDDEN; index++)
+    {
+        if (g_HiddenPages[index].Active != FALSE)
+        {
+            hidden++;
+        }
+    }
+
+    HacDbgSpinLockRelease(&g_EptLock);
+    *HookUsed = hooks;
+    *HookMax = HACDBG_EPT_MAX_HOOKS;
+    *HiddenUsed = hidden;
+    *HiddenMax = HACDBG_EPT_MAX_HIDDEN;
+}
+
+BOOLEAN
+EptAnyCpuPrivate(
+    VOID
+    )
+{
+    UINT32 cpu;
+
+    for (cpu = 0; cpu < 256; cpu++)
+    {
+        if (g_CpuPrivate[cpu] != FALSE)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
 }
 
 BOOLEAN

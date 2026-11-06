@@ -38,6 +38,41 @@ InjectPte(
     _In_ BOOLEAN HidePayload
     );
 
+NTSTATUS
+/**
+ * @brief Starts the process-exit watcher used by PTE injection.
+ *
+ * @return STATUS_SUCCESS when the watcher thread is running.
+ *
+ * @details Call this after the processor is a guest. A manual-mapped image
+ * cannot register a process notify routine, so the watcher waits on
+ * referenced process objects.
+ */
+InjectInitialize(
+    VOID
+    );
+
+VOID
+/**
+ * @brief Stops the watcher and retires every live PTE mapping.
+ *
+ * @details Call this while processors are still guests, before virtualization
+ * stops. It does nothing when InjectInitialize did not run.
+ */
+InjectPrepareUnload(
+    VOID
+    );
+
+VOID
+/**
+ * @brief Frees frames that teardown could not release while guests were running.
+ *
+ * @details Call this after virtualization has stopped.
+ */
+InjectReleaseLeaked(
+    VOID
+    );
+
 BOOLEAN
 /**
  * @brief Records one thread that may use the private SLAT root.
@@ -58,7 +93,10 @@ InjectSlatAllow(
 
 BOOLEAN
 /**
- * @brief Reports whether any private-root thread is still recorded.
+ * @brief Reports whether a recorded thread should still open CR3 exits.
+ *
+ * @details A slot whose thread has State==Terminated does not count. The
+ * slot itself stays until the mapping is retired.
  */
 InjectSlatArmed(
     VOID
@@ -66,15 +104,15 @@ InjectSlatArmed(
 
 BOOLEAN
 /**
- * @brief Reports whether this guest CR3 should use the private root.
+ * @brief Reports whether this thread should use the private root.
  *
- * @param GuestCr3 Guest CR3, including PCID bits.
+ * @param Thread KPRCB.CurrentThread. The caller does not pass a reference.
  *
- * @return TRUE when the private root applies.
+ * @return TRUE when the thread is in the allow list and has not terminated.
  *
- * @details Compares the page-aligned CR3 with the directories recorded for
- * an injected process. It does not read guest memory.
+ * @details Pointer compare plus KTHREAD.State. It does not allocate, take a
+ * lock, or dereference the thread. Safe on a VM-exit path.
  */
-InjectSlatCr3Private(
-    _In_ UINT64 GuestCr3
+InjectSlatThreadPrivate(
+    _In_ PETHREAD Thread
     );

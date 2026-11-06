@@ -64,12 +64,16 @@
 #define SVM_EVENT_ERROR_VALID                 (1ull << 11)
 #define SVM_EVENT_VALID                       (1ull << 31)
 #define SVM_VMCB_CLEAN_INTERCEPTS             (1ull << 0)
+#define SVM_VMCB_CLEAN_NP                     (1ull << 4)
+#define SVM_VMCB_CLEAN_CRX                    (1ull << 5)
 
 #define SVM_TLB_CONTROL_FLUSH_GUEST           3ull
 
 //
-// TLB_CONTROL 1 drops translations for the current ASID. The hook NPT root
-// uses the next ASID, so switching nCR3 does not flush either set.
+// APM Vol 2 rev 3.45 Table 15-9: encoding 1 flushes the entire TLB on all
+// ASIDs. It is a superset of a current-ASID flush. Encoding 7 (this guest,
+// non-global) needs CPUID Fn8000_000A_EDX[FlushByAsid]; that bit index is
+// not used here.
 //
 #define SVM_TLB_CONTROL_FLUSH_CURRENT_ASID    1ull
 #define SVM_ASID_MAIN                         1u

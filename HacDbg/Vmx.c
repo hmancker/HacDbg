@@ -13,7 +13,7 @@
 #include "Hypercall.h"
 
 BOOLEAN InjectSlatArmed(VOID);
-BOOLEAN InjectSlatCr3Private(UINT64 GuestCr3);
+BOOLEAN InjectSlatThreadPrivate(PETHREAD Thread);
 #include "PhysicalMemory.h"
 #include "Svm.h"
 
@@ -109,6 +109,9 @@ static BOOLEAN g_PreemptionTimerSticky;
 static volatile LONG g_PreemptionTimerLogged;
 static UINT32 g_ProcControls;
 static UINT32 g_ProcControls2;
+static UINT32 g_Cr3LoadExiting;
+static UINT64 g_EptVpidCap;
+static volatile LONG g_InvvpidLogged;
 static UINT32 g_ExitControls;
 static UINT32 g_EntryControls;
 static UINT64 g_InveptType;
@@ -1226,6 +1229,43 @@ VmxHandleCpuid(
             }
         }
         VmxInvalidateEpt(ProcessorContext);
+        if ((g_ProcControls2 & VMX_PROC2_ENABLE_VPID) != 0 && ProcessorContext->Vpid != 0 &&
+            (g_EptVpidCap & VMX_EPT_CAP_INVVPID) != 0)
+        {
+            UINT64 type;
+            UINT16 vpid;
+
+            vpid = ProcessorContext->Vpid;
+            if ((g_EptVpidCap & VMX_EPT_CAP_INVVPID_RETAIN) != 0)
+            {
+                type = VMX_INVVPID_SINGLE_RETAIN;
+            }
+            else if ((g_EptVpidCap & VMX_EPT_CAP_INVVPID_SINGLE) != 0)
+            {
+                type = VMX_INVVPID_SINGLE_CONTEXT;
+            }
+            else if ((g_EptVpidCap & VMX_EPT_CAP_INVVPID_ALL) != 0)
+            {
+                type = VMX_INVVPID_ALL_CONTEXT;
+                vpid = 0;
+            }
+            else
+            {
+                type = 0;
+            }
+
+            //
+            // INVARIANT: PTE teardown restores guest leaves to not-present.
+            // With VPID enabled those linear translations survive VM-entry
+            // unless INVVPID runs for this processor's VPID.
+            //
+            if (type != 0 && VmxInvvpid(type, vpid) != 0 &&
+                InterlockedCompareExchange(&g_InvvpidLogged, 1, 0) == 0)
+            {
+                HACDBG_LOG("HacDbg: Err, INVVPID failed type=%llu vpid=%u.\n", type, vpid);
+            }
+        }
+
         InterlockedExchange(&ProcessorContext->InveptRequested, 0);
         return VmxAdvanceRip();
     }
@@ -1285,12 +1325,72 @@ VmxHandleCrAccess(
         // register is the value the guest asked to load. RIP stays on the MOV
         // until it is advanced.
         //
-        if (VmxWrite(VMCS_GUEST_CR3, ((UINT64*)&ProcessorContext->Registers)[reg]) == FALSE)
+        source = ((UINT64*)&ProcessorContext->Registers)[reg];
+        if (VmxWrite(VMCS_GUEST_CR3, source) == FALSE)
         {
             return FALSE;
         }
 
-        ProcessorContext->GuestCr3 = ((UINT64*)&ProcessorContext->Registers)[reg];
+        ProcessorContext->GuestCr3 = source;
+        //
+        // INVARIANT: SDM 31.4.3.3 requires INVVPID for this VPID when MOV to
+        // CR3 is emulated and VPID is enabled. Type 3 retains globals.
+        // CR4.PCIDE with source bit 63 set skips it, matching SDM 5.10.4.1.
+        //
+        if ((g_ProcControls2 & VMX_PROC2_ENABLE_VPID) != 0 && ProcessorContext->Vpid != 0)
+        {
+            UINT64 guestCr4 = 0;
+            UINT64 type;
+            UINT16 vpid;
+            BOOLEAN skip;
+
+            skip = FALSE;
+            if (VmxRead(VMCS_GUEST_CR4, &guestCr4) != FALSE &&
+                (guestCr4 & VMX_CR4_PCIDE) != 0 && (source & (1ull << 63)) != 0)
+            {
+                skip = TRUE;
+            }
+
+            if (skip == FALSE && (g_EptVpidCap & VMX_EPT_CAP_INVVPID) == 0)
+            {
+                if (InterlockedCompareExchange(&g_InvvpidLogged, 1, 0) == 0)
+                {
+                    HACDBG_LOG("HacDbg: Err, INVVPID is not supported. Guest CR3 writes keep old translations.\n");
+                }
+            }
+            else if (skip == FALSE)
+            {
+                vpid = ProcessorContext->Vpid;
+                if ((g_EptVpidCap & VMX_EPT_CAP_INVVPID_RETAIN) != 0)
+                {
+                    type = VMX_INVVPID_SINGLE_RETAIN;
+                }
+                else if ((g_EptVpidCap & VMX_EPT_CAP_INVVPID_SINGLE) != 0)
+                {
+                    type = VMX_INVVPID_SINGLE_CONTEXT;
+                }
+                else if ((g_EptVpidCap & VMX_EPT_CAP_INVVPID_ALL) != 0)
+                {
+                    type = VMX_INVVPID_ALL_CONTEXT;
+                    vpid = 0;
+                }
+                else
+                {
+                    type = 0;
+                    if (InterlockedCompareExchange(&g_InvvpidLogged, 1, 0) == 0)
+                    {
+                        HACDBG_LOG("HacDbg: Err, INVVPID has no single-context type. Guest CR3 writes keep old translations.\n");
+                    }
+                }
+
+                if (type != 0 && VmxInvvpid(type, vpid) != 0 &&
+                    InterlockedCompareExchange(&g_InvvpidLogged, 1, 0) == 0)
+                {
+                    HACDBG_LOG("HacDbg: Err, INVVPID failed type=%llu vpid=%u.\n", type, vpid);
+                }
+            }
+        }
+
         return VmxAdvanceRip();
     }
 
@@ -2375,24 +2475,17 @@ VmxNoteThreadRoot(
     VOID
     )
 {
-    UINT64 cr3;
-
     if (VmxGuestCpl() != 0)
     {
         return;
     }
 
-    cr3 = 0;
-    if (VmxRead(VMCS_GUEST_CR3, &cr3) == FALSE)
-    {
-        cr3 = 0;
-    }
-
     //
-    // Do not translate GS here. This exit can run above DISPATCH_LEVEL, and
-    // the temporary physical map rejects that IRQL.
+    // Do not translate guest GS. This exit can run above DISPATCH_LEVEL, and
+    // the temporary physical map rejects that IRQL. Host GS is the KPCR, so
+    // KeGetCurrentThread is KPRCB.CurrentThread.
     //
-    EptNoteCpuPrivate(KeGetCurrentProcessorNumber(), InjectSlatCr3Private(cr3));
+    EptNoteCpuPrivate(KeGetCurrentProcessorNumber(), InjectSlatThreadPrivate((PETHREAD)KeGetCurrentThread()));
 }
 
 static VOID
@@ -2426,7 +2519,7 @@ VmxPublishThreadRoot(
     wanted = g_ProcControls;
     if (InjectSlatArmed() != FALSE)
     {
-        wanted |= VMX_PROC_CR3_LOAD_EXITING;
+        wanted |= g_Cr3LoadExiting;
     }
 
     controls = 0;
@@ -2668,6 +2761,11 @@ VmxLoadControls(
         }
 #endif
         g_ProcControls = VmxAdjust(desiredProc, procMsr);
+        g_Cr3LoadExiting = VmxAdjust(VMX_PROC_CR3_LOAD_EXITING, procMsr) & VMX_PROC_CR3_LOAD_EXITING;
+        if (g_Cr3LoadExiting == 0)
+        {
+            HACDBG_LOG("HacDbg: Err, CR3-load exiting is not allowed. PTE inject still maps, but CR3 writes do not exit.\n");
+        }
     }
 #if HACDBG_HIDE_VIRTUALIZATION
     if (g_SyntheticMsrPassthrough == 0 &&
@@ -2715,6 +2813,7 @@ VmxLoadControls(
     }
 
     eptCap = __readmsr(VMX_MSR_EPT_VPID_CAP);
+    g_EptVpidCap = eptCap;
     if ((eptCap & (VMX_EPT_CAP_WALK4 | VMX_EPT_CAP_WB | VMX_EPT_CAP_2MB | VMX_EPT_CAP_INVEPT)) !=
         (VMX_EPT_CAP_WALK4 | VMX_EPT_CAP_WB | VMX_EPT_CAP_2MB | VMX_EPT_CAP_INVEPT))
     {

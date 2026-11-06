@@ -14,6 +14,7 @@
 #include "Trace.h"
 #include "PatchGuard.h"
 #include "ProcessCtrl.h"
+#include "Inject.h"
 #include "WindowProtect.h"
 #include "Debug.h"
 #include "../shared/hypercall/control.h"
@@ -726,6 +727,7 @@ DriverUnload(
     UNREFERENCED_PARAMETER(DriverObject);
 
     HACDBG_LOG("HacDbg: DriverUnload start.\n");
+    InjectPrepareUnload();
     WindowProtectCleanup();
     ProcessCtrlCleanup();
 
@@ -738,6 +740,7 @@ DriverUnload(
     HacDbgDeleteDevice();
     TraceDisable();
     HACDBG_STOP_ALL();
+    InjectReleaseLeaked();
     PatchGuardCleanup();
     HACDBG_FREE_ALL();
     TraceCleanup();
@@ -950,6 +953,26 @@ DriverEntry(
         return STATUS_UNSUCCESSFUL;
     }
 #endif
+
+    status = InjectInitialize();
+    if (!NT_SUCCESS(status))
+    {
+        HACDBG_LOG("HacDbg: Err, inject watcher failed: 0x%08x.\n", status);
+        HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_PROCESSORS, status);
+        InjectPrepareUnload();
+        TraceDisable();
+        HACDBG_STOP_ALL();
+        InjectReleaseLeaked();
+        PatchGuardCleanup();
+        HacDbgDeleteDevice();
+        HACDBG_FREE_ALL();
+        TraceCleanup();
+        LogsCleanup();
+        HACDBG_SHARED_CLEANUP();
+        HACDBG_PAGING_CLEANUP();
+        PhysicalMemoryCleanup();
+        return status;
+    }
 
     g_VirtualizationSuspended = FALSE;
     HacDbgRecordLoadStatus(RegistryPath, HACDBG_LOAD_STAGE_COMPLETE, STATUS_SUCCESS);

@@ -26,9 +26,11 @@
 #define INJECT_HIDE_PAGE   EptHidePage
 #define INJECT_UNHIDE_PAGE EptUnhidePage
 #define INJECT_MAP_PRIVATE EptMapPrivate
+#define INJECT_UNMAP_PRIVATE EptUnmapPrivate
 #define INJECT_USE_PRIVATE EptUsePrivateRoot
-#define INJECT_DROP_PRIVATE EptDropPrivate
-#define INJECT_PRIVATE_ON (EptDataEptp() != EptMainEptp())
+#define INJECT_SLOT_USAGE EptSlotUsage
+#define INJECT_PRIVATE_ROOT EptPrivateEptp
+#define INJECT_CPU_PRIVATE EptAnyCpuPrivate
 #else
 #include "Npt.h"
 #define INJECT_ADD_HOOK    NptAddHook
@@ -36,15 +38,17 @@
 #define INJECT_HIDE_PAGE   NptHidePage
 #define INJECT_UNHIDE_PAGE NptUnhidePage
 #define INJECT_MAP_PRIVATE NptMapPrivate
+#define INJECT_UNMAP_PRIVATE NptUnmapPrivate
 #define INJECT_USE_PRIVATE NptUsePrivateRoot
-#define INJECT_DROP_PRIVATE NptDropPrivate
-#define INJECT_PRIVATE_ON (NptDataRootPa() != NptMainRootPa())
+#define INJECT_SLOT_USAGE NptSlotUsage
+#define INJECT_PRIVATE_ROOT NptPrivateRootPa
+#define INJECT_CPU_PRIVATE NptAnyCpuPrivate
 #endif
 
 #define INJECT_TAG 'jIaH'
 #define INJECT_MAX_IMAGE (16u * 1024u * 1024u)
 #define INJECT_MAX_PAGES 4096u
-#define INJECT_EXTRA_PAGES 3u
+#define INJECT_EXTRA_PAGES 2u
 #define INJECT_FRAME 0x000FFFFFFFFFF000ull
 #define INJECT_PRESENT 0x1ull
 #define INJECT_WRITE 0x2ull
@@ -99,9 +103,34 @@
 #define INJECT_USER_CS 0x33u
 #define INJECT_USER_SS 0x2Bu
 #define INJECT_USER_EFLAGS 0x202u
-#define INJECT_STATUS_ALERTED 0x101u
+//
+// STATUS_TIMEOUT. RtlWaitOnAddress leaves the user wait block linked when
+// NtWaitForAlertByThreadId returns STATUS_ALERTED (0x101). The next wait
+// then spins in RtlpOptimizeWaitOnAddressWaitList and the UI thread never
+// drains its queue. TIMEOUT is the status that unlinks the block first.
+//
+#define INJECT_STATUS_TIMEOUT 0x102u
 #define INJECT_KTHREAD_THREAD_FLAGS 0x78u
 #define INJECT_ALERTED_BY_THREAD_ID 4u
+#define INJECT_KTHREAD_WAIT_REGISTER 0x70u
+#define INJECT_KTHREAD_STATE 0x184u
+#define INJECT_KTHREAD_WAIT_REASON 0x283u
+#define INJECT_KTHREAD_SUSPEND_COUNT 0x284u
+#define INJECT_KTHREAD_TERMINATED 4u
+#define INJECT_KTHREAD_WAITING 5u
+//
+// KiSchedulerApc passes this reason to KeWaitForSingleObject. It is
+// KWAIT_REASON Suspended, not WrSuspended (12).
+//
+#define INJECT_KTHREAD_WR_SUSPENDED 5u
+#define INJECT_KTHREAD_WR_ALERT_BY_THREAD_ID 37u
+//
+// KiSuspendThread sets the low 3 bits of WaitRegister to this value when it
+// freezes a committed wait in place. KiResumeThread treats that pattern as
+// lightweight-suspended.
+//
+#define INJECT_WAIT_REGISTER_LIGHTWEIGHT 4u
+#define INJECT_SUSPEND_WAITS 50u
 
 typedef NTSTATUS(NTAPI* INJECT_GET_NEXT_THREAD)(HANDLE ProcessHandle, HANDLE ThreadHandle, ACCESS_MASK DesiredAccess,
                                                 ULONG HandleAttributes, ULONG Flags, PHANDLE NewThreadHandle);
@@ -159,6 +188,7 @@ typedef struct _INJECT_OWNED
     UINT64 Physical;
     BOOLEAN Hooked;
     BOOLEAN Hidden;
+    BOOLEAN Private;
 } INJECT_OWNED;
 
 typedef struct _INJECT_EDIT
@@ -196,6 +226,9 @@ InjectWow64(
     return Routine != NULL && Routine(Process) != NULL;
 }
 
+static ULONG g_InjectUbr;
+static volatile LONG g_InjectReady;
+
 static ULONG
 InjectBuild(
     VOID
@@ -208,13 +241,54 @@ InjectBuild(
 }
 
 static ULONG
+InjectReadUbr(
+    VOID
+    )
+{
+    UNICODE_STRING Path = RTL_CONSTANT_STRING(L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion");
+    UNICODE_STRING ValueName = RTL_CONSTANT_STRING(L"UBR");
+    OBJECT_ATTRIBUTES Attributes;
+    HANDLE Key;
+    UCHAR Buffer[sizeof(KEY_VALUE_PARTIAL_INFORMATION) + sizeof(ULONG)];
+    ULONG Length;
+    NTSTATUS Status;
+    KEY_VALUE_PARTIAL_INFORMATION* Info;
+
+    InitializeObjectAttributes(&Attributes, &Path, OBJ_CASE_INSENSITIVE | OBJ_KERNEL_HANDLE, NULL, NULL);
+    Key = NULL;
+    Status = ZwOpenKey(&Key, KEY_QUERY_VALUE, &Attributes);
+    if (!NT_SUCCESS(Status))
+    {
+        return 0;
+    }
+
+    Length = 0;
+    Status = ZwQueryValueKey(Key, &ValueName, KeyValuePartialInformation, Buffer, sizeof(Buffer), &Length);
+    ZwClose(Key);
+    if (!NT_SUCCESS(Status))
+    {
+        return 0;
+    }
+
+    Info = (KEY_VALUE_PARTIAL_INFORMATION*)Buffer;
+    if (Info->Type != REG_DWORD || Info->DataLength < sizeof(ULONG))
+    {
+        return 0;
+    }
+
+    return *(ULONG*)Info->Data;
+}
+
+static ULONG
 InjectUserDirectoryOffset(
     VOID
     )
 {
     ULONG Build;
+    ULONG Ubr;
 
     Build = InjectBuild();
+    Ubr = g_InjectUbr;
     if (Build >= 26100)
     {
         return 0x158u;
@@ -233,6 +307,31 @@ InjectUserDirectoryOffset(
     if (Build >= 17134)
     {
         return 0x278u;
+    }
+
+    if (Build >= 16299)
+    {
+        return Ubr >= 192u ? 0x278u : 0;
+    }
+
+    if (Build >= 15063)
+    {
+        return Ubr >= 850u ? 0x278u : 0;
+    }
+
+    if (Build >= 14393)
+    {
+        return Ubr >= 2007u ? 0x2C0u : 0;
+    }
+
+    if (Build >= 10586)
+    {
+        return 0;
+    }
+
+    if (Build >= 10240)
+    {
+        return Ubr >= 17738u ? 0x278u : 0;
     }
 
     return 0;
@@ -381,17 +480,25 @@ InjectWriteTracked(
     return TRUE;
 }
 
-static VOID
+static BOOLEAN
 InjectRestoreEdits(
     _In_ INJECT_EDIT* Edits,
     _In_ ULONG Count
     )
 {
+    BOOLEAN Ok;
+
+    Ok = TRUE;
     while (Count > 0)
     {
         Count -= 1;
-        InjectWriteEntry(Edits[Count].Table, Edits[Count].Index, Edits[Count].Previous);
+        if (InjectWriteEntry(Edits[Count].Table, Edits[Count].Index, Edits[Count].Previous) == FALSE)
+        {
+            Ok = FALSE;
+        }
     }
+
+    return Ok;
 }
 
 static BOOLEAN
@@ -411,6 +518,7 @@ InjectTrack(
     Owned[*Count].Physical = Physical;
     Owned[*Count].Hooked = FALSE;
     Owned[*Count].Hidden = FALSE;
+    Owned[*Count].Private = FALSE;
     *Count += 1;
     return TRUE;
 }
@@ -434,51 +542,6 @@ InjectAllocFrame(
     RtlZeroMemory(Page, PAGE_SIZE);
     *Virtual = Page;
     return (UINT64)MmGetPhysicalAddress(Page).QuadPart & INJECT_FRAME;
-}
-
-static VOID
-InjectFreeOwned(
-    _Inout_ INJECT_OWNED* Owned,
-    _In_ ULONG Count
-    )
-{
-    ULONG Index;
-
-    for (Index = 0; Index < Count; Index++)
-    {
-        if (Owned[Index].Hidden == FALSE)
-        {
-            continue;
-        }
-
-        if (INJECT_UNHIDE_PAGE(HacDbgGuestPhysicalAddress(Owned[Index].Physical)) == FALSE)
-        {
-            HACDBG_LOG("HacDbg: Err, DLL inject unhide failed pa=0x%I64x.\n", Owned[Index].Physical);
-            continue;
-        }
-
-        Owned[Index].Hidden = FALSE;
-    }
-
-    for (Index = 0; Index < Count; Index++)
-    {
-        if (Owned[Index].Hooked != FALSE)
-        {
-            INJECT_REMOVE_HOOK(HacDbgGuestPhysicalAddress(Owned[Index].Physical));
-            Owned[Index].Hooked = FALSE;
-        }
-    }
-
-    for (Index = 0; Index < Count; Index++)
-    {
-        if (Owned[Index].Virtual == NULL || Owned[Index].Hidden != FALSE)
-        {
-            continue;
-        }
-
-        MmFreeContiguousMemory(Owned[Index].Virtual);
-        Owned[Index].Virtual = NULL;
-    }
 }
 
 static BOOLEAN
@@ -1354,7 +1417,7 @@ InjectSuspendOne(
 }
 
 C_ASSERT(sizeof(CONTEXT) <= 0x800);
-C_ASSERT(INJECT_EXTRA_PAGES >= 3);
+C_ASSERT(INJECT_EXTRA_PAGES >= 2);
 C_ASSERT(FIELD_OFFSET(INJECT_LOAD_RESULT, LastError) == 4);
 C_ASSERT(FIELD_OFFSET(INJECT_LOAD_RESULT, Module) == 8);
 
@@ -2379,6 +2442,11 @@ InjectResolveImports(
         return STATUS_INVALID_IMAGE_FORMAT;
     }
 
+    if (ImportRva + sizeof(IMAGE_IMPORT_DESCRIPTOR) > ImageSize)
+    {
+        return STATUS_INVALID_IMAGE_FORMAT;
+    }
+
     Descriptor = (IMAGE_IMPORT_DESCRIPTOR*)(Image + ImportRva);
     while (Descriptor->Name != 0)
     {
@@ -2388,6 +2456,16 @@ InjectResolveImports(
         UINT64 ModuleBase;
         NTSTATUS Status;
         ULONG NameIndex;
+        ULONG ThunkRva;
+        ULONG IatRva;
+        ULONG ThunkIndex;
+        ULONG DescriptorOffset;
+
+        DescriptorOffset = (ULONG)((UCHAR*)Descriptor - Image);
+        if (DescriptorOffset + sizeof(IMAGE_IMPORT_DESCRIPTOR) > ImageSize)
+        {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
 
         if (Descriptor->Name >= ImageSize)
         {
@@ -2396,6 +2474,11 @@ InjectResolveImports(
 
         for (NameIndex = 0; NameIndex < sizeof(DllName) - 1; NameIndex++)
         {
+            if (Descriptor->Name + NameIndex >= ImageSize)
+            {
+                return STATUS_INVALID_IMAGE_FORMAT;
+            }
+
             DllName[NameIndex] = (CHAR)Image[Descriptor->Name + NameIndex];
             if (DllName[NameIndex] == 0)
             {
@@ -2403,8 +2486,14 @@ InjectResolveImports(
             }
         }
 
+        if (NameIndex == sizeof(DllName) - 1 || Descriptor->Name + NameIndex >= ImageSize ||
+            Image[Descriptor->Name + NameIndex] != 0)
+        {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
         DllName[NameIndex] = 0;
-        if (NameIndex == 0 || Image[Descriptor->Name + NameIndex] != 0)
+        if (NameIndex == 0)
         {
             return STATUS_INVALID_IMAGE_FORMAT;
         }
@@ -2424,17 +2513,30 @@ InjectResolveImports(
             return Status;
         }
 
-        Lookup = (IMAGE_THUNK_DATA64*)(Image + (Descriptor->OriginalFirstThunk != 0 ? Descriptor->OriginalFirstThunk
-                                                                                    : Descriptor->FirstThunk));
-        Iat = (IMAGE_THUNK_DATA64*)(Image + Descriptor->FirstThunk);
-        if (Descriptor->FirstThunk >= ImageSize)
+        ThunkRva = Descriptor->OriginalFirstThunk != 0 ? Descriptor->OriginalFirstThunk : Descriptor->FirstThunk;
+        IatRva = Descriptor->FirstThunk;
+        if (ThunkRva >= ImageSize || IatRva >= ImageSize ||
+            ThunkRva + sizeof(IMAGE_THUNK_DATA64) > ImageSize || IatRva + sizeof(IMAGE_THUNK_DATA64) > ImageSize)
         {
             return STATUS_INVALID_IMAGE_FORMAT;
         }
 
+        Lookup = (IMAGE_THUNK_DATA64*)(Image + ThunkRva);
+        Iat = (IMAGE_THUNK_DATA64*)(Image + IatRva);
+        ThunkIndex = 0;
         while (Lookup->u1.AddressOfData != 0)
         {
             UINT64 Function;
+            ULONG NextThunk;
+            ULONG NextIat;
+
+            NextThunk = ThunkRva + ((ThunkIndex + 1) * (ULONG)sizeof(IMAGE_THUNK_DATA64));
+            NextIat = IatRva + ((ThunkIndex + 1) * (ULONG)sizeof(IMAGE_THUNK_DATA64));
+            if (NextThunk < ThunkRva || NextIat < IatRva || NextThunk + sizeof(IMAGE_THUNK_DATA64) > ImageSize ||
+                NextIat + sizeof(IMAGE_THUNK_DATA64) > ImageSize)
+            {
+                return STATUS_INVALID_IMAGE_FORMAT;
+            }
 
             if (IMAGE_SNAP_BY_ORDINAL64(Lookup->u1.Ordinal) != FALSE)
             {
@@ -2444,14 +2546,26 @@ InjectResolveImports(
             {
                 IMAGE_IMPORT_BY_NAME* ImportName;
                 ULONG HintRva;
+                ULONG NameByte;
 
                 HintRva = (ULONG)Lookup->u1.AddressOfData;
-                if (HintRva >= ImageSize || HintRva + sizeof(IMAGE_IMPORT_BY_NAME) >= ImageSize)
+                if (HintRva >= ImageSize || HintRva + sizeof(IMAGE_IMPORT_BY_NAME) > ImageSize)
                 {
                     return STATUS_INVALID_IMAGE_FORMAT;
                 }
 
                 ImportName = (IMAGE_IMPORT_BY_NAME*)(Image + HintRva);
+                NameByte = HintRva + FIELD_OFFSET(IMAGE_IMPORT_BY_NAME, Name);
+                while (NameByte < ImageSize && Image[NameByte] != 0)
+                {
+                    NameByte++;
+                }
+
+                if (NameByte >= ImageSize)
+                {
+                    return STATUS_INVALID_IMAGE_FORMAT;
+                }
+
                 Function = InjectResolve(Process, ModuleBase, (CHAR*)ImportName->Name, 0);
             }
 
@@ -2462,11 +2576,18 @@ InjectResolveImports(
             }
 
             Iat->u1.Function = Function;
-            Lookup++;
-            Iat++;
+            ThunkIndex++;
+            Lookup = (IMAGE_THUNK_DATA64*)(Image + NextThunk);
+            Iat = (IMAGE_THUNK_DATA64*)(Image + NextIat);
         }
 
-        Descriptor++;
+        DescriptorOffset += sizeof(IMAGE_IMPORT_DESCRIPTOR);
+        if (DescriptorOffset + sizeof(IMAGE_IMPORT_DESCRIPTOR) > ImageSize)
+        {
+            return STATUS_INVALID_IMAGE_FORMAT;
+        }
+
+        Descriptor = (IMAGE_IMPORT_DESCRIPTOR*)(Image + DescriptorOffset);
     }
 
     return STATUS_SUCCESS;
@@ -2718,6 +2839,8 @@ InjectWriteStub(
 }
 
 #define INJECT_SLAT_SLOTS 8u
+#define INJECT_MAPS 8u
+#define INJECT_LEAK_SLOTS 16u
 #define INJECT_SLAT_CR3_MASK 0x000FFFFFFFFFFFF000ull
 
 typedef struct _INJECT_SLAT_SLOT
@@ -2728,42 +2851,71 @@ typedef struct _INJECT_SLAT_SLOT
     UINT64 UserCr3;
 } INJECT_SLAT_SLOT;
 
-static INJECT_SLAT_SLOT g_SlatSlots[INJECT_SLAT_SLOTS];
-static volatile LONG g_SlatArmed;
+typedef struct _INJECT_MAP
+{
+    volatile LONG Live;
+    volatile LONG Busy;
+    PEPROCESS Process;
+    PETHREAD Thread;
+    INJECT_OWNED* Owned;
+    ULONG OwnedCount;
+    INJECT_EDIT* Edits;
+    ULONG EditCount;
+} INJECT_MAP;
 
-static VOID
-InjectSlatRefreshArmed(
-    VOID
+static INJECT_SLAT_SLOT g_SlatSlots[INJECT_SLAT_SLOTS];
+static INJECT_MAP g_Maps[INJECT_MAPS];
+static FAST_MUTEX g_MapLock;
+static KEVENT g_MapStop;
+static KEVENT g_MapWake;
+static HANDLE g_MapThread;
+static volatile LONG g_MapStopping;
+static volatile LONG g_InjectBusy;
+static volatile LONG g_MapLive;
+static volatile LONG g_MapBuilding;
+static INJECT_OWNED* g_LeakedOwned[INJECT_LEAK_SLOTS];
+static ULONG g_LeakedCount[INJECT_LEAK_SLOTS];
+
+static UCHAR
+InjectThreadState(
+    _In_ PETHREAD Thread
     )
 {
-    ULONG index;
-    LONG armed;
+    return *((UCHAR*)Thread + INJECT_KTHREAD_STATE);
+}
 
-    armed = 0;
-    for (index = 0; index < INJECT_SLAT_SLOTS; index++)
+static BOOLEAN
+InjectThreadSuspended(
+    _In_ PETHREAD Thread
+    )
+{
+    UCHAR Reason;
+    UCHAR Register;
+
+    if (InjectThreadState(Thread) != INJECT_KTHREAD_WAITING)
     {
-        PETHREAD thread = (PETHREAD)g_SlatSlots[index].Thread;
-
-        if (thread == NULL)
-        {
-            continue;
-        }
-
-        if (PsIsThreadTerminating(thread) != FALSE)
-        {
-            if (InterlockedCompareExchange64((LONG64*)&g_SlatSlots[index].Thread, 0, (LONG64)thread) == (LONG64)thread)
-            {
-                ObDereferenceObject(thread);
-            }
-
-            continue;
-        }
-
-        armed = 1;
+        return FALSE;
     }
 
-    g_SlatArmed = armed;
-    KeMemoryBarrier();
+    Reason = *((UCHAR*)Thread + INJECT_KTHREAD_WAIT_REASON);
+    if (Reason == INJECT_KTHREAD_WR_SUSPENDED)
+    {
+        return TRUE;
+    }
+
+    //
+    // NtWaitForAlertByThreadId stays at wait reason 37. Lightweight suspend
+    // does not enter KiSchedulerApc: the low 3 bits of WaitRegister become 4
+    // and SuspendCount is left non-zero. Resume honors AlertedByThreadId for
+    // that reason and returns through the same user trap frame.
+    //
+    Register = *((UCHAR*)Thread + INJECT_KTHREAD_WAIT_REGISTER);
+    if (Reason != INJECT_KTHREAD_WR_ALERT_BY_THREAD_ID || (Register & 7u) != INJECT_WAIT_REGISTER_LIGHTWEIGHT)
+    {
+        return FALSE;
+    }
+
+    return *((CHAR*)Thread + INJECT_KTHREAD_SUSPEND_COUNT) > 0;
 }
 
 BOOLEAN
@@ -2783,7 +2935,7 @@ InjectSlatAllow(
         return FALSE;
     }
 
-    InjectSlatRefreshArmed();
+    ExAcquireFastMutex(&g_MapLock);
     freeSlot = INJECT_SLAT_SLOTS;
     for (index = 0; index < INJECT_SLAT_SLOTS; index++)
     {
@@ -2791,8 +2943,8 @@ InjectSlatAllow(
         {
             g_SlatSlots[index].KernelCr3 = KernelCr3;
             g_SlatSlots[index].UserCr3 = UserCr3;
-            g_SlatArmed = 1;
             KeMemoryBarrier();
+            ExReleaseFastMutex(&g_MapLock);
             HACDBG_LOG("HacDbg: DLL inject slat thread already allowed tid=%llu kernel=0x%I64x user=0x%I64x.\n",
                        (UINT64)(ULONG_PTR)PsGetThreadId(Thread), KernelCr3 & INJECT_SLAT_CR3_MASK,
                        UserCr3 & INJECT_SLAT_CR3_MASK);
@@ -2807,6 +2959,7 @@ InjectSlatAllow(
 
     if (freeSlot == INJECT_SLAT_SLOTS)
     {
+        ExReleaseFastMutex(&g_MapLock);
         HACDBG_LOG("HacDbg: Err, DLL inject slat allow list is full.\n");
         return FALSE;
     }
@@ -2816,8 +2969,8 @@ InjectSlatAllow(
     g_SlatSlots[freeSlot].UserCr3 = UserCr3;
     KeMemoryBarrier();
     g_SlatSlots[freeSlot].Thread = (UINT64)Thread;
-    g_SlatArmed = 1;
     KeMemoryBarrier();
+    ExReleaseFastMutex(&g_MapLock);
     *KeptReference = TRUE;
     HACDBG_LOG("HacDbg: DLL inject slat thread=%p tid=%llu kernel=0x%I64x user=0x%I64x.\n", Thread,
                (UINT64)(ULONG_PTR)PsGetThreadId(Thread), KernelCr3 & INJECT_SLAT_CR3_MASK,
@@ -2830,36 +2983,13 @@ InjectSlatArmed(
     VOID
     )
 {
-    return g_SlatArmed != 0;
-}
-
-BOOLEAN
-InjectSlatCr3Private(
-    _In_ UINT64 GuestCr3
-    )
-{
-    UINT64 page;
     ULONG index;
-
-    page = GuestCr3 & INJECT_SLAT_CR3_MASK;
-    if (page == 0 || g_SlatArmed == 0)
-    {
-        return FALSE;
-    }
 
     for (index = 0; index < INJECT_SLAT_SLOTS; index++)
     {
-        UINT64 kernel;
-        UINT64 user;
+        PETHREAD thread = (PETHREAD)g_SlatSlots[index].Thread;
 
-        if (g_SlatSlots[index].Thread == 0)
-        {
-            continue;
-        }
-
-        kernel = g_SlatSlots[index].KernelCr3 & INJECT_SLAT_CR3_MASK;
-        user = g_SlatSlots[index].UserCr3 & INJECT_SLAT_CR3_MASK;
-        if (page == kernel || (user != 0 && page == user))
+        if (thread != NULL && InjectThreadState(thread) != INJECT_KTHREAD_TERMINATED)
         {
             return TRUE;
         }
@@ -2868,11 +2998,379 @@ InjectSlatCr3Private(
     return FALSE;
 }
 
+BOOLEAN
+InjectSlatThreadPrivate(
+    _In_ PETHREAD Thread
+    )
+{
+    ULONG index;
+
+    if (Thread == NULL)
+    {
+        return FALSE;
+    }
+
+    for (index = 0; index < INJECT_SLAT_SLOTS; index++)
+    {
+        if ((PETHREAD)g_SlatSlots[index].Thread == Thread &&
+            InjectThreadState(Thread) != INJECT_KTHREAD_TERMINATED)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+static VOID
+InjectClearThreadSlot(
+    _In_opt_ PETHREAD Thread
+    )
+{
+    ULONG index;
+
+    if (Thread == NULL)
+    {
+        return;
+    }
+
+    ExAcquireFastMutex(&g_MapLock);
+    for (index = 0; index < INJECT_MAPS; index++)
+    {
+        if (g_Maps[index].Live != 0 && g_Maps[index].Thread == Thread)
+        {
+            ExReleaseFastMutex(&g_MapLock);
+            return;
+        }
+    }
+
+    for (index = 0; index < INJECT_SLAT_SLOTS; index++)
+    {
+        if (InterlockedCompareExchange64((LONG64*)&g_SlatSlots[index].Thread, 0, (LONG64)Thread) == (LONG64)Thread)
+        {
+            g_SlatSlots[index].KernelCr3 = 0;
+            g_SlatSlots[index].UserCr3 = 0;
+            g_SlatSlots[index].Process = NULL;
+            ExReleaseFastMutex(&g_MapLock);
+            ObDereferenceObject(Thread);
+            return;
+        }
+    }
+
+    ExReleaseFastMutex(&g_MapLock);
+}
+
+static VOID
+InjectStashOwned(
+    _In_ INJECT_OWNED* Owned,
+    _In_ ULONG Count
+    )
+{
+    ULONG index;
+
+    ExAcquireFastMutex(&g_MapLock);
+    for (index = 0; index < INJECT_LEAK_SLOTS; index++)
+    {
+        if (g_LeakedOwned[index] == NULL)
+        {
+            g_LeakedOwned[index] = Owned;
+            g_LeakedCount[index] = Count;
+            ExReleaseFastMutex(&g_MapLock);
+            HACDBG_LOG("HacDbg: Err, DLL inject kept %lu frames until virtualization stops.\n", Count);
+            return;
+        }
+    }
+
+    ExReleaseFastMutex(&g_MapLock);
+    HACDBG_LOG("HacDbg: Err, DLL inject leak stash is full count=%lu.\n", Count);
+}
+
+static BOOLEAN
+InjectUnmapOwned(
+    _Inout_ INJECT_OWNED* Owned,
+    _In_ ULONG Count
+    )
+{
+    ULONG index;
+    BOOLEAN ok;
+
+    ok = TRUE;
+    for (index = 0; index < Count; index++)
+    {
+        if (Owned[index].Private == FALSE)
+        {
+            continue;
+        }
+
+        if (INJECT_UNMAP_PRIVATE(HacDbgGuestPhysicalAddress(Owned[index].Physical)) == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject private unmap failed pa=0x%I64x.\n", Owned[index].Physical);
+            ok = FALSE;
+            continue;
+        }
+
+        Owned[index].Private = FALSE;
+    }
+
+    return ok;
+}
+
+static BOOLEAN
+InjectUnhookOwned(
+    _Inout_ INJECT_OWNED* Owned,
+    _In_ ULONG Count
+    )
+{
+    ULONG index;
+    BOOLEAN ok;
+
+    ok = TRUE;
+    for (index = 0; index < Count; index++)
+    {
+        if (Owned[index].Hidden == FALSE)
+        {
+            continue;
+        }
+
+        if (INJECT_UNHIDE_PAGE(HacDbgGuestPhysicalAddress(Owned[index].Physical)) == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject unhide failed pa=0x%I64x.\n", Owned[index].Physical);
+            ok = FALSE;
+            continue;
+        }
+
+        Owned[index].Hidden = FALSE;
+    }
+
+    for (index = 0; index < Count; index++)
+    {
+        if (Owned[index].Hooked == FALSE)
+        {
+            continue;
+        }
+
+        if (INJECT_REMOVE_HOOK(HacDbgGuestPhysicalAddress(Owned[index].Physical)) == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject unhook failed pa=0x%I64x.\n", Owned[index].Physical);
+            ok = FALSE;
+            continue;
+        }
+
+        Owned[index].Hooked = FALSE;
+    }
+
+    return ok;
+}
+
+static VOID
+InjectFreeFrames(
+    _Inout_ INJECT_OWNED* Owned,
+    _In_ ULONG Count
+    )
+{
+    ULONG index;
+
+    for (index = 0; index < Count; index++)
+    {
+        if (Owned[index].Virtual == NULL || Owned[index].Hidden != FALSE || Owned[index].Hooked != FALSE ||
+            Owned[index].Private != FALSE)
+        {
+            continue;
+        }
+
+        MmFreeContiguousMemory(Owned[index].Virtual);
+        Owned[index].Virtual = NULL;
+    }
+}
+
+static VOID
+InjectReleaseOneOwned(
+    _Inout_ INJECT_OWNED* Owned,
+    _In_ ULONG Count,
+    _In_ INJECT_EDIT* Edits,
+    _In_ ULONG EditCount,
+    _In_ BOOLEAN Building
+    )
+{
+    BOOLEAN unmapped;
+    BOOLEAN unhooked;
+    BOOLEAN restored;
+    BOOLEAN flushed;
+
+    unmapped = InjectUnmapOwned(Owned, Count);
+    ExAcquireFastMutex(&g_MapLock);
+    if (Building != FALSE)
+    {
+        InterlockedDecrement(&g_MapBuilding);
+    }
+
+    if (g_MapLive == 0 && g_MapBuilding == 0)
+    {
+        INJECT_USE_PRIVATE(FALSE);
+    }
+
+    ExReleaseFastMutex(&g_MapLock);
+    flushed = InjectFlush();
+    if (INJECT_CPU_PRIVATE() != FALSE)
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject private root still installed after flush.\n");
+        flushed = FALSE;
+    }
+
+    unhooked = InjectUnhookOwned(Owned, Count);
+    restored = InjectRestoreEdits(Edits, EditCount);
+    if (InjectFlush() == FALSE)
+    {
+        flushed = FALSE;
+    }
+
+    if (unmapped != FALSE && unhooked != FALSE && restored != FALSE && flushed != FALSE &&
+        INJECT_CPU_PRIVATE() == FALSE)
+    {
+        InjectFreeFrames(Owned, Count);
+        ExFreePool(Owned);
+    }
+    else if (restored != FALSE)
+    {
+        InjectStashOwned(Owned, Count);
+    }
+    else
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject kept %lu frames because guest PTEs were not restored.\n", Count);
+    }
+
+    ExFreePool(Edits);
+}
+
+static BOOLEAN
+InjectDetachMap(
+    _Inout_ INJECT_MAP* Map
+    )
+{
+    BOOLEAN won;
+
+    won = FALSE;
+    ExAcquireFastMutex(&g_MapLock);
+    if (InterlockedCompareExchange(&Map->Live, 0, 1) == 1)
+    {
+        if (g_MapLive > 0)
+        {
+            g_MapLive--;
+        }
+
+        if (g_MapLive == 0 && g_MapBuilding == 0)
+        {
+            INJECT_USE_PRIVATE(FALSE);
+        }
+
+        won = TRUE;
+    }
+
+    ExReleaseFastMutex(&g_MapLock);
+    return won;
+}
+
+static VOID
+InjectRetireResources(
+    _Inout_ INJECT_MAP* Map
+    )
+{
+    PETHREAD thread;
+    PEPROCESS process;
+    INJECT_OWNED* owned;
+    INJECT_EDIT* edits;
+    ULONG ownedCount;
+    ULONG editCount;
+    UINT64 pid;
+
+    thread = Map->Thread;
+    process = Map->Process;
+    owned = Map->Owned;
+    edits = Map->Edits;
+    ownedCount = Map->OwnedCount;
+    editCount = Map->EditCount;
+    Map->Thread = NULL;
+    Map->Process = NULL;
+    Map->Owned = NULL;
+    Map->Edits = NULL;
+    Map->OwnedCount = 0;
+    Map->EditCount = 0;
+    Map->Busy = 0;
+    KeMemoryBarrier();
+
+    pid = process == NULL ? 0 : (UINT64)(ULONG_PTR)PsGetProcessId(process);
+    InjectClearThreadSlot(thread);
+    if (owned != NULL && edits != NULL)
+    {
+        InjectReleaseOneOwned(owned, ownedCount, edits, editCount, FALSE);
+    }
+    else
+    {
+        if (owned != NULL)
+        {
+            InjectStashOwned(owned, ownedCount);
+        }
+
+        if (edits != NULL)
+        {
+            ExFreePool(edits);
+        }
+    }
+
+    if (process != NULL)
+    {
+        ObDereferenceObject(process);
+    }
+
+    HACDBG_LOG("HacDbg: DLL inject retired pid=%llu frames=%lu.\n", pid, ownedCount);
+}
+
+static INJECT_MAP*
+InjectRegisterMap(
+    _In_ PEPROCESS Process,
+    _In_ INJECT_OWNED* Owned,
+    _In_ ULONG OwnedCount,
+    _In_ INJECT_EDIT* Edits,
+    _In_ ULONG EditCount
+    )
+{
+    ULONG index;
+
+    ExAcquireFastMutex(&g_MapLock);
+    for (index = 0; index < INJECT_MAPS; index++)
+    {
+        if (g_Maps[index].Live == 0 && g_Maps[index].Owned == NULL)
+        {
+            ObReferenceObject(Process);
+            g_Maps[index].Process = Process;
+            g_Maps[index].Thread = NULL;
+            g_Maps[index].Owned = Owned;
+            g_Maps[index].OwnedCount = OwnedCount;
+            g_Maps[index].Edits = Edits;
+            g_Maps[index].EditCount = EditCount;
+            g_Maps[index].Busy = 1;
+            InterlockedDecrement(&g_MapBuilding);
+
+            g_MapLive++;
+            g_Maps[index].Live = 1;
+            KeMemoryBarrier();
+            ExReleaseFastMutex(&g_MapLock);
+            KeSetEvent(&g_MapWake, IO_NO_INCREMENT, FALSE);
+            return &g_Maps[index];
+        }
+    }
+
+    ExReleaseFastMutex(&g_MapLock);
+    HACDBG_LOG("HacDbg: Err, DLL inject map table is full.\n");
+    return NULL;
+}
+
 static NTSTATUS
 InjectStartEntry(
     _In_ PEPROCESS Process,
     _In_ UINT64 StubVa,
-    _In_ PVOID ContextHost
+    _In_ PVOID ContextHost,
+    _Inout_ INJECT_MAP* Map
     )
 {
     HANDLE ThreadHandle;
@@ -2896,6 +3394,30 @@ InjectStartEntry(
     {
         HACDBG_LOG("HacDbg: Err, DLL inject found no thread to hijack: 0x%08x.\n", Status);
         return Status;
+    }
+
+    if (InjectThreadSuspended(Thread) == FALSE)
+    {
+        LARGE_INTEGER Delay;
+        ULONG Wait;
+
+        Delay.QuadPart = -10000;
+        for (Wait = 0; Wait < INJECT_SUSPEND_WAITS && InjectThreadSuspended(Thread) == FALSE; Wait++)
+        {
+            KeDelayExecutionThread(KernelMode, FALSE, &Delay);
+        }
+    }
+
+    if (InjectThreadSuspended(Thread) == FALSE)
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject thread did not reach WrSuspended tid=%llu state=%u reason=%u register=%u.\n",
+                   (UINT64)(ULONG_PTR)PsGetThreadId(Thread), InjectThreadState(Thread),
+                   *((UCHAR*)Thread + INJECT_KTHREAD_WAIT_REASON),
+                   *((UCHAR*)Thread + INJECT_KTHREAD_WAIT_REGISTER));
+        ZwResumeThread(ThreadHandle, &PreviousSuspend);
+        ObDereferenceObject(Thread);
+        ZwClose(ThreadHandle);
+        return STATUS_UNSUCCESSFUL;
     }
 
     Captured = (CONTEXT*)ExAllocatePool2(POOL_FLAG_NON_PAGED, sizeof(CONTEXT), INJECT_TAG);
@@ -2929,10 +3451,10 @@ InjectStartEntry(
     Captured->Rip = OldRip;
     Captured->Rsp = *(UINT64*)(Trap + INJECT_TRAP_RSP);
     //
-    // NtWaitForAlertByThreadId returns STATUS_ALERTED when AlertedByThreadId
-    // is consumed. The stub later resumes at the saved user return address.
+    // The stub resumes at the saved user return address. RAX is the status
+    // RtlWaitOnAddress sees after NtContinue, not the kernel wait result.
     //
-    Captured->Rax = INJECT_STATUS_ALERTED;
+    Captured->Rax = INJECT_STATUS_TIMEOUT;
     Captured->Rcx = *(UINT64*)(Trap + INJECT_TRAP_RCX);
     Captured->Rdx = *(UINT64*)(Trap + INJECT_TRAP_RDX);
     Captured->Rbx = *(UINT64*)(Trap + INJECT_TRAP_RBX);
@@ -2959,6 +3481,8 @@ InjectStartEntry(
             HACDBG_LOG("HacDbg: Err, DLL inject slat allow failed stub=0x%I64x.\n", StubVa);
             return STATUS_UNSUCCESSFUL;
         }
+
+        Map->Thread = Thread;
     }
 
     if (InjectFlush() == FALSE)
@@ -2979,9 +3503,10 @@ InjectStartEntry(
     // Notepad's UI thread waits in NtWaitForAlertByThreadId. That wait is not
     // alertable, so a user APC stays queued and KeAlertThread does not wake
     // it. KeWaitForAlertByThreadId returns STATUS_ALERTED when bit 4 of
-    // KTHREAD.ThreadFlags (AlertedByThreadId) is set. The suspended thread
-    // rechecks that bit after the suspend APC returns, then the patched trap
-    // frame RIP enters the stub.
+    // KTHREAD.ThreadFlags (AlertedByThreadId) is set. Resume either returns
+    // from KiSchedulerApc or, for a lightweight suspend, signals the thread.
+    // The wait loop then consumes the bit and the patched trap frame RIP
+    // enters the stub.
     //
     *(UINT64*)(Trap + INJECT_TRAP_RIP) = StubVa;
     _interlockedbittestandset((volatile LONG*)((PUCHAR)Thread + INJECT_KTHREAD_THREAD_FLAGS),
@@ -3011,14 +3536,14 @@ InjectMapImage(
     _Out_ ULONG* HookCount,
     _Out_ ULONG* HiddenCount,
     _Out_ ULONG* DataCount,
-    _Out_ PVOID* ContextHost
+    _Out_ PVOID* ContextHost,
+    _Out_ INJECT_MAP** Map
     )
 {
     INJECT_OWNED* Owned;
     INJECT_EDIT* Edits;
     ULONG Count;
     ULONG EditCount;
-    BOOLEAN PrivateWasOn;
     ULONG Pages;
     ULONG Index;
     UINT64 Directory;
@@ -3030,6 +3555,7 @@ InjectMapImage(
     *HiddenCount = 0;
     *DataCount = 0;
     *ContextHost = NULL;
+    *Map = NULL;
     Directory = InjectDirectory(Process, INJECT_DIR_TABLE);
     UserDirectory = InjectUsableUserDirectory(Process, Directory);
     if (Directory == 0)
@@ -3058,7 +3584,7 @@ InjectMapImage(
     RtlZeroMemory(Owned, sizeof(INJECT_OWNED) * INJECT_MAX_PAGES);
     Count = 0;
     EditCount = 0;
-    PrivateWasOn = INJECT_PRIVATE_ON;
+    InterlockedIncrement(&g_MapBuilding);
     Failed = FALSE;
     Status = STATUS_SUCCESS;
     for (Index = 0; Index < Pages + INJECT_EXTRA_PAGES && Failed == FALSE; Index++)
@@ -3129,7 +3655,14 @@ InjectMapImage(
                      InjectMapLeaf(UserDirectory, Virtual, Decoy, TRUE, Owned, &Count, Edits, &EditCount) == FALSE) ||
                     INJECT_ADD_HOOK(HacDbgGuestPhysicalAddress(Decoy), HacDbgGuestPhysicalAddress(Real)) == FALSE)
                 {
-                    HACDBG_LOG("HacDbg: Err, DLL inject disguise failed va=0x%I64x.\n", Virtual);
+                    ULONG HookUsed;
+                    ULONG HookMax;
+                    ULONG HiddenUsed;
+                    ULONG HiddenMax;
+
+                    INJECT_SLOT_USAGE(&HookUsed, &HookMax, &HiddenUsed, &HiddenMax);
+                    HACDBG_LOG("HacDbg: Err, DLL inject disguise failed va=0x%I64x hook_slots=%lu/%lu hidden_slots=%lu/%lu.\n",
+                               Virtual, HookUsed, HookMax, HiddenUsed, HiddenMax);
                     Failed = TRUE;
                     Status = STATUS_UNSUCCESSFUL;
                     break;
@@ -3147,6 +3680,7 @@ InjectMapImage(
                     break;
                 }
 
+                Owned[DecoyIndex].Private = TRUE;
                 if (HidePayload != FALSE)
                 {
                     //
@@ -3157,7 +3691,14 @@ InjectMapImage(
                     //
                     if (INJECT_HIDE_PAGE(HacDbgGuestPhysicalAddress(Real)) == FALSE)
                     {
-                        HACDBG_LOG("HacDbg: Err, DLL inject hide failed pa=0x%I64x.\n", Real);
+                        ULONG HookUsed;
+                        ULONG HookMax;
+                        ULONG HiddenUsed;
+                        ULONG HiddenMax;
+
+                        INJECT_SLOT_USAGE(&HookUsed, &HookMax, &HiddenUsed, &HiddenMax);
+                        HACDBG_LOG("HacDbg: Err, DLL inject hide failed pa=0x%I64x hook_slots=%lu/%lu hidden_slots=%lu/%lu.\n",
+                                   Real, HookUsed, HookMax, HiddenUsed, HiddenMax);
                         Failed = TRUE;
                         Status = STATUS_UNSUCCESSFUL;
                         break;
@@ -3190,50 +3731,60 @@ InjectMapImage(
                 Failed = TRUE;
                 Status = STATUS_INSUFFICIENT_RESOURCES;
             }
-            else if (InjectMapLeaf(Directory, Virtual, Decoy, FALSE, Owned, &Count, Edits, &EditCount) == FALSE ||
-                     (UserDirectory != 0 &&
-                      InjectMapLeaf(UserDirectory, Virtual, Decoy, FALSE, Owned, &Count, Edits, &EditCount) == FALSE) ||
-                     INJECT_MAP_PRIVATE(HacDbgGuestPhysicalAddress(Decoy), HacDbgGuestPhysicalAddress(Real), FALSE) ==
-                         FALSE)
-            {
-                HACDBG_LOG("HacDbg: Err, DLL inject private data failed va=0x%I64x decoy=0x%I64x.\n", Virtual, Decoy);
-                Failed = TRUE;
-                Status = STATUS_UNSUCCESSFUL;
-            }
             else
             {
-                *DataCount += 1;
+                ULONG DecoyIndex;
+
+                DecoyIndex = Count - 1;
+                if (InjectMapLeaf(Directory, Virtual, Decoy, FALSE, Owned, &Count, Edits, &EditCount) == FALSE ||
+                    (UserDirectory != 0 &&
+                     InjectMapLeaf(UserDirectory, Virtual, Decoy, FALSE, Owned, &Count, Edits, &EditCount) == FALSE) ||
+                    INJECT_MAP_PRIVATE(HacDbgGuestPhysicalAddress(Decoy), HacDbgGuestPhysicalAddress(Real), FALSE) ==
+                        FALSE)
+                {
+                    HACDBG_LOG("HacDbg: Err, DLL inject private data failed va=0x%I64x decoy=0x%I64x.\n", Virtual,
+                               Decoy);
+                    Failed = TRUE;
+                    Status = STATUS_UNSUCCESSFUL;
+                }
+                else
+                {
+                    Owned[DecoyIndex].Private = TRUE;
+                    *DataCount += 1;
+                }
             }
         }
     }
 
-    if (Failed == FALSE && (INJECT_USE_PRIVATE(TRUE) == FALSE || InjectFlush() == FALSE))
+    if (Failed == FALSE)
     {
-        HACDBG_LOG("HacDbg: Err, DLL inject private root flush failed.\n");
-        if (PrivateWasOn == FALSE)
-        {
-            INJECT_DROP_PRIVATE();
-        }
+        BOOLEAN Published;
 
-        Failed = TRUE;
-        Status = STATUS_UNSUCCESSFUL;
+        ExAcquireFastMutex(&g_MapLock);
+        Published = INJECT_USE_PRIVATE(TRUE);
+        ExReleaseFastMutex(&g_MapLock);
+        if (Published == FALSE || InjectFlush() == FALSE)
+        {
+            HACDBG_LOG("HacDbg: Err, DLL inject private root flush failed.\n");
+            Failed = TRUE;
+            Status = STATUS_UNSUCCESSFUL;
+        }
     }
 
     if (Failed != FALSE)
     {
-        if (PrivateWasOn == FALSE)
-        {
-            INJECT_DROP_PRIVATE();
-            InjectFlush();
-        }
-
-        InjectRestoreEdits(Edits, EditCount);
-        InjectFreeOwned(Owned, Count);
+        InjectReleaseOneOwned(Owned, Count, Edits, EditCount, TRUE);
+        return Status;
     }
 
-    ExFreePool(Edits);
-    ExFreePool(Owned);
-    return Status;
+    *Map = InjectRegisterMap(Process, Owned, Count, Edits, EditCount);
+    if (*Map == NULL)
+    {
+        InjectReleaseOneOwned(Owned, Count, Edits, EditCount, TRUE);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    return STATUS_SUCCESS;
 }
 
 NTSTATUS
@@ -3624,8 +4175,8 @@ InjectChooseBase(
     return 0;
 }
 
-NTSTATUS
-InjectPte(
+static NTSTATUS
+InjectPteBody(
     _In_ PEPROCESS Process,
     _In_ const WCHAR* Path,
     _In_ BOOLEAN HidePayload
@@ -3649,6 +4200,7 @@ InjectPte(
     UINT64 Ntdll;
     UINT64 NtContinue;
     PVOID ContextHost;
+    INJECT_MAP* Map;
     ULONG Hooks;
     ULONG Hidden;
     ULONG Data;
@@ -3811,24 +4363,309 @@ InjectPte(
     Hidden = 0;
     Data = 0;
     ContextHost = NULL;
+    Map = NULL;
     Status = InjectMapImage(Process, Image, Pages * PAGE_SIZE, Base, ExecuteBits, Stub, HidePayload, &Hooks, &Hidden,
-                            &Data, &ContextHost);
+                            &Data, &ContextHost, &Map);
     ExFreePool(Image);
     if (!NT_SUCCESS(Status))
     {
         return Status;
     }
 
-    Status = InjectStartEntry(Process, Base + ((UINT64)Pages * PAGE_SIZE), ContextHost);
+    Status = InjectStartEntry(Process, Base + ((UINT64)Pages * PAGE_SIZE), ContextHost, Map);
+    Map->Busy = 0;
+    KeMemoryBarrier();
     if (!NT_SUCCESS(Status))
     {
         HACDBG_LOG("HacDbg: Err, DLL inject start failed: 0x%08x.\n", Status);
+        if (InjectDetachMap(Map) != FALSE)
+        {
+            InjectRetireResources(Map);
+        }
+
         return Status;
     }
 
-    HACDBG_LOG("HacDbg: DLL inject PTE pid=%llu va=0x%I64x place=%lu hooks=%lu hidden=%lu data=%lu private=1.\n",
-               (UINT64)(ULONG_PTR)PsGetProcessId(Process), Base, Place, Hooks, Hidden, Data);
+    {
+        ULONG HookUsed;
+        ULONG HookMax;
+        ULONG HiddenUsed;
+        ULONG HiddenMax;
+        UINT64 Root;
+        ULONG Private;
+
+        INJECT_SLOT_USAGE(&HookUsed, &HookMax, &HiddenUsed, &HiddenMax);
+        Root = INJECT_PRIVATE_ROOT();
+        Private = Root != 0 ? 1u : 0u;
+        HACDBG_LOG("HacDbg: DLL inject PTE pid=%llu va=0x%I64x place=%lu hooks=%lu hidden=%lu data=%lu "
+                   "private=%lu armed=%u root=0x%I64x hook_slots=%lu/%lu hidden_slots=%lu/%lu.\n",
+                   (UINT64)(ULONG_PTR)PsGetProcessId(Process), Base, Place, Hooks, Hidden, Data, Private,
+                   InjectSlatArmed() != FALSE ? 1u : 0u, Root, HookUsed, HookMax, HiddenUsed, HiddenMax);
+    }
+
     return STATUS_SUCCESS;
+}
+
+NTSTATUS
+InjectPte(
+    _In_ PEPROCESS Process,
+    _In_ const WCHAR* Path,
+    _In_ BOOLEAN HidePayload
+    )
+{
+    NTSTATUS Status;
+
+    if (g_InjectReady == FALSE || g_MapStopping != 0)
+    {
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    InterlockedIncrement(&g_InjectBusy);
+    if (g_MapStopping != 0)
+    {
+        InterlockedDecrement(&g_InjectBusy);
+        return STATUS_DEVICE_NOT_READY;
+    }
+
+    Status = InjectPteBody(Process, Path, HidePayload);
+    InterlockedDecrement(&g_InjectBusy);
+    return Status;
+}
+
+static VOID
+InjectReleaseWaitProcesses(
+    _In_reads_(Count) PVOID* Objects,
+    _In_ ULONG Count
+    )
+{
+    ULONG index;
+
+    for (index = 2; index < Count; index++)
+    {
+        if (Objects[index] != NULL)
+        {
+            ObDereferenceObject(Objects[index]);
+        }
+    }
+}
+
+static VOID
+InjectWatchMaps(
+    _In_ PVOID Context
+    )
+{
+    UNREFERENCED_PARAMETER(Context);
+
+    for (;;)
+    {
+        PVOID objects[2 + INJECT_MAPS];
+        ULONG count;
+        ULONG index;
+        NTSTATUS status;
+        BOOLEAN busyOnly;
+
+        if (g_MapStopping != 0)
+        {
+            break;
+        }
+
+        objects[0] = &g_MapStop;
+        objects[1] = &g_MapWake;
+        count = 2;
+        ExAcquireFastMutex(&g_MapLock);
+        for (index = 0; index < INJECT_MAPS; index++)
+        {
+            PEPROCESS process = g_Maps[index].Process;
+            ULONG seen;
+
+            if (g_Maps[index].Live == 0 || process == NULL)
+            {
+                continue;
+            }
+
+            for (seen = 2; seen < count; seen++)
+            {
+                if (objects[seen] == process)
+                {
+                    break;
+                }
+            }
+
+            if (seen == count)
+            {
+                ObReferenceObject(process);
+                objects[count] = process;
+                count++;
+            }
+        }
+
+        ExReleaseFastMutex(&g_MapLock);
+        status = KeWaitForMultipleObjects(count, objects, WaitAny, Executive, KernelMode, FALSE, NULL, NULL);
+        if (status == STATUS_WAIT_0 || g_MapStopping != 0)
+        {
+            InjectReleaseWaitProcesses(objects, count);
+            break;
+        }
+
+        if (status == STATUS_WAIT_1)
+        {
+            InjectReleaseWaitProcesses(objects, count);
+            continue;
+        }
+
+        if (status < STATUS_WAIT_0 || status >= (NTSTATUS)(STATUS_WAIT_0 + count))
+        {
+            InjectReleaseWaitProcesses(objects, count);
+            continue;
+        }
+
+        busyOnly = FALSE;
+        {
+            PEPROCESS signaled = (PEPROCESS)objects[(ULONG)(status - STATUS_WAIT_0)];
+
+            for (index = 0; index < INJECT_MAPS; index++)
+            {
+                if (g_Maps[index].Live == 0 || g_Maps[index].Process != signaled)
+                {
+                    continue;
+                }
+
+                if (g_Maps[index].Busy != 0)
+                {
+                    busyOnly = TRUE;
+                    continue;
+                }
+
+                if (InjectDetachMap(&g_Maps[index]) != FALSE)
+                {
+                    InjectRetireResources(&g_Maps[index]);
+                }
+            }
+        }
+
+        InjectReleaseWaitProcesses(objects, count);
+        if (busyOnly != FALSE)
+        {
+            LARGE_INTEGER delay;
+
+            delay.QuadPart = -100000;
+            KeDelayExecutionThread(KernelMode, FALSE, &delay);
+        }
+    }
+
+    PsTerminateSystemThread(STATUS_SUCCESS);
+}
+
+NTSTATUS
+InjectInitialize(
+    VOID
+    )
+{
+    OBJECT_ATTRIBUTES attributes;
+    HANDLE thread;
+    NTSTATUS status;
+
+    if (g_InjectReady != FALSE)
+    {
+        return STATUS_SUCCESS;
+    }
+
+    g_InjectUbr = InjectReadUbr();
+    ExInitializeFastMutex(&g_MapLock);
+    KeInitializeEvent(&g_MapStop, NotificationEvent, FALSE);
+    KeInitializeEvent(&g_MapWake, SynchronizationEvent, FALSE);
+    RtlZeroMemory(g_Maps, sizeof(g_Maps));
+    RtlZeroMemory(g_SlatSlots, sizeof(g_SlatSlots));
+    RtlZeroMemory(g_LeakedOwned, sizeof(g_LeakedOwned));
+    g_MapStopping = 0;
+    g_MapLive = 0;
+    g_MapBuilding = 0;
+    g_MapThread = NULL;
+    InitializeObjectAttributes(&attributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+    thread = NULL;
+    status = PsCreateSystemThread(&thread, THREAD_ALL_ACCESS, &attributes, NULL, NULL, InjectWatchMaps, NULL);
+    if (!NT_SUCCESS(status))
+    {
+        HACDBG_LOG("HacDbg: Err, DLL inject watcher failed: 0x%08x.\n", status);
+        return status;
+    }
+
+    g_MapThread = thread;
+    g_InjectReady = TRUE;
+    KeMemoryBarrier();
+    return STATUS_SUCCESS;
+}
+
+VOID
+InjectPrepareUnload(
+    VOID
+    )
+{
+    ULONG index;
+    LARGE_INTEGER delay;
+
+    if (g_InjectReady == FALSE)
+    {
+        return;
+    }
+
+    g_MapStopping = 1;
+    KeMemoryBarrier();
+    delay.QuadPart = -10000;
+    while (g_InjectBusy != 0)
+    {
+        KeDelayExecutionThread(KernelMode, FALSE, &delay);
+    }
+
+    KeSetEvent(&g_MapStop, IO_NO_INCREMENT, FALSE);
+    if (g_MapThread != NULL)
+    {
+        ZwWaitForSingleObject(g_MapThread, FALSE, NULL);
+        ZwClose(g_MapThread);
+        g_MapThread = NULL;
+    }
+
+    for (index = 0; index < INJECT_MAPS; index++)
+    {
+        if (InjectDetachMap(&g_Maps[index]) != FALSE)
+        {
+            InjectRetireResources(&g_Maps[index]);
+        }
+    }
+}
+
+VOID
+InjectReleaseLeaked(
+    VOID
+    )
+{
+    ULONG index;
+    ULONG page;
+
+    for (index = 0; index < INJECT_LEAK_SLOTS; index++)
+    {
+        INJECT_OWNED* owned = g_LeakedOwned[index];
+        ULONG count = g_LeakedCount[index];
+
+        if (owned == NULL)
+        {
+            continue;
+        }
+
+        g_LeakedOwned[index] = NULL;
+        g_LeakedCount[index] = 0;
+        for (page = 0; page < count; page++)
+        {
+            if (owned[page].Virtual != NULL)
+            {
+                MmFreeContiguousMemory(owned[page].Virtual);
+                owned[page].Virtual = NULL;
+            }
+        }
+
+        ExFreePool(owned);
+        HACDBG_LOG("HacDbg: DLL inject released %lu frames after virtualization stopped.\n", count);
+    }
 }
 
 #else
@@ -3855,6 +4692,60 @@ InjectPte(
     UNREFERENCED_PARAMETER(Path);
     UNREFERENCED_PARAMETER(HidePayload);
     return STATUS_NOT_SUPPORTED;
+}
+
+NTSTATUS
+InjectInitialize(
+    VOID
+    )
+{
+    return STATUS_NOT_SUPPORTED;
+}
+
+VOID
+InjectPrepareUnload(
+    VOID
+    )
+{
+}
+
+VOID
+InjectReleaseLeaked(
+    VOID
+    )
+{
+}
+
+BOOLEAN
+InjectSlatAllow(
+    _In_ PETHREAD Thread,
+    _In_ UINT64 KernelCr3,
+    _In_ UINT64 UserCr3,
+    _Out_ BOOLEAN* KeptReference
+    )
+{
+    UNREFERENCED_PARAMETER(Thread);
+    UNREFERENCED_PARAMETER(KernelCr3);
+    UNREFERENCED_PARAMETER(UserCr3);
+    *KeptReference = FALSE;
+    return FALSE;
+}
+
+BOOLEAN
+InjectSlatArmed(
+    VOID
+    )
+{
+    return FALSE;
+}
+
+BOOLEAN
+InjectSlatThreadPrivate(
+    _In_ PETHREAD Thread
+    )
+{
+    UNREFERENCED_PARAMETER(Thread);
+    return FALSE;
 }
 
 #endif

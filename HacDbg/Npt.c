@@ -786,7 +786,19 @@ NptAddHook(
 
     if (index == HACDBG_NPT_MAX_HOOKS)
     {
-        HACDBG_LOG("HacDbg: Err, NPT hook table is full.\n");
+        ULONG used = 0;
+        UINT32 scan;
+
+        for (scan = 0; scan < HACDBG_NPT_MAX_HOOKS; scan++)
+        {
+            if (g_Hooks[scan].Active != FALSE)
+            {
+                used++;
+            }
+        }
+
+        HACDBG_LOG("HacDbg: Err, NPT hook table is full used=%lu max=%lu.\n", used,
+                   (ULONG)HACDBG_NPT_MAX_HOOKS);
         HacDbgSpinLockRelease(&g_NptLock);
         return FALSE;
     }
@@ -964,7 +976,19 @@ NptHidePage(
 
     if (index == HACDBG_NPT_MAX_HIDDEN)
     {
-        HACDBG_LOG("HacDbg: Err, NPT hidden page table is full.\n");
+        ULONG used = 0;
+        UINT32 scan;
+
+        for (scan = 0; scan < HACDBG_NPT_MAX_HIDDEN; scan++)
+        {
+            if (g_HiddenPages[scan].Active != FALSE)
+            {
+                used++;
+            }
+        }
+
+        HACDBG_LOG("HacDbg: Err, NPT hidden page table is full used=%lu max=%lu.\n", used,
+                   (ULONG)HACDBG_NPT_MAX_HIDDEN);
         HacDbgSpinLockRelease(&g_NptLock);
         return FALSE;
     }
@@ -1251,6 +1275,252 @@ NptMapPrivate(
     KeMemoryBarrier();
     HacDbgSpinLockRelease(&g_NptLock);
     return TRUE;
+}
+
+static UINT64*
+NptPrivateLeaf(
+    _In_ UINT64 GuestPage,
+    _Out_ BOOLEAN* Missing
+    )
+{
+    UINT64* mainPml4;
+    UINT64* privatePml4;
+    UINT64* mainPdpt;
+    UINT64* privatePdpt;
+    UINT64* mainPd;
+    UINT64* privatePd;
+    UINT64* pt;
+    UINT64 pml4Index;
+    UINT64 pdptIndex;
+    UINT64 pdIndex;
+
+    *Missing = FALSE;
+    if (g_PrivateRootPa == 0)
+    {
+        return NULL;
+    }
+
+    mainPml4 = NptVirtualFromPhysical(g_MainRootPa & NPT_ADDRESS_MASK);
+    privatePml4 = NptVirtualFromPhysical(g_PrivateRootPa & NPT_ADDRESS_MASK);
+    if (mainPml4 == NULL || privatePml4 == NULL)
+    {
+        *Missing = TRUE;
+        return NULL;
+    }
+
+    pml4Index = (GuestPage >> 39) & 0x1ffull;
+    if ((privatePml4[pml4Index] & NPT_ADDRESS_MASK) == (mainPml4[pml4Index] & NPT_ADDRESS_MASK))
+    {
+        return NULL;
+    }
+
+    privatePdpt = NptPageFromEntry(privatePml4[pml4Index]);
+    mainPdpt = NptPageFromEntry(mainPml4[pml4Index]);
+    if (privatePdpt == NULL || mainPdpt == NULL)
+    {
+        *Missing = TRUE;
+        return NULL;
+    }
+
+    pdptIndex = (GuestPage >> 30) & 0x1ffull;
+    if ((privatePdpt[pdptIndex] & NPT_ADDRESS_MASK) == (mainPdpt[pdptIndex] & NPT_ADDRESS_MASK))
+    {
+        return NULL;
+    }
+
+    privatePd = NptPageFromEntry(privatePdpt[pdptIndex]);
+    mainPd = NptPageFromEntry(mainPdpt[pdptIndex]);
+    if (privatePd == NULL || mainPd == NULL)
+    {
+        *Missing = TRUE;
+        return NULL;
+    }
+
+    pdIndex = (GuestPage >> 21) & 0x1ffull;
+    if ((privatePd[pdIndex] & NPT_LARGE) != 0)
+    {
+        return NULL;
+    }
+
+    if ((mainPd[pdIndex] & NPT_LARGE) == 0 &&
+        (privatePd[pdIndex] & NPT_ADDRESS_MASK) == (mainPd[pdIndex] & NPT_ADDRESS_MASK))
+    {
+        return NULL;
+    }
+
+    pt = NptPageFromEntry(privatePd[pdIndex]);
+    if (pt == NULL)
+    {
+        *Missing = TRUE;
+        return NULL;
+    }
+
+    return &pt[(GuestPage >> PAGE_SHIFT) & 0x1ffull];
+}
+
+static BOOLEAN
+NptIdentityLeaf(
+    _In_ UINT64 GuestPage,
+    _Out_ UINT64* Leaf
+    )
+{
+    UINT64* mainPml4;
+    UINT64* pdpt;
+    UINT64* pd;
+    UINT64* pt;
+    UINT64 pde;
+    UINT64 page;
+    UINT64 flags;
+
+    mainPml4 = NptVirtualFromPhysical(g_MainRootPa & NPT_ADDRESS_MASK);
+    if (mainPml4 == NULL)
+    {
+        return FALSE;
+    }
+
+    pdpt = NptPageFromEntry(mainPml4[(GuestPage >> 39) & 0x1ffull]);
+    if (pdpt == NULL)
+    {
+        return FALSE;
+    }
+
+    pd = NptPageFromEntry(pdpt[(GuestPage >> 30) & 0x1ffull]);
+    if (pd == NULL)
+    {
+        return FALSE;
+    }
+
+    pde = pd[(GuestPage >> 21) & 0x1ffull];
+    if ((pde & NPT_LARGE) != 0)
+    {
+        page = GuestPage & NPT_ADDRESS_MASK;
+        flags = NPT_PRESENT | NPT_WRITE | NPT_USER;
+        if ((pde & NPT_NX) != 0 || NptFindHidden(page) != FALSE)
+        {
+            flags |= NPT_NX;
+        }
+
+        if (NptFindHidden(page) != FALSE)
+        {
+            page = g_DummyPagePa;
+        }
+
+        *Leaf = page | flags;
+        return TRUE;
+    }
+
+    pt = NptPageFromEntry(pde);
+    if (pt == NULL)
+    {
+        return FALSE;
+    }
+
+    *Leaf = pt[(GuestPage >> PAGE_SHIFT) & 0x1ffull];
+    return TRUE;
+}
+
+BOOLEAN
+NptUnmapPrivate(
+    _In_ GUEST_PHYSICAL_ADDRESS DecoyPage
+    )
+{
+    UINT64 decoy = DecoyPage.Value & NPT_ADDRESS_MASK;
+    UINT64* leaf;
+    UINT64 identity;
+    BOOLEAN missing;
+
+    if (g_Initialized == FALSE || (DecoyPage.Value & (PAGE_SIZE - 1)) != 0 || decoy == 0)
+    {
+        return FALSE;
+    }
+
+    HacDbgSpinLockAcquire(&g_NptLock);
+    leaf = NptPrivateLeaf(decoy, &missing);
+    if (leaf == NULL)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return missing == FALSE;
+    }
+
+    if (NptIdentityLeaf(decoy, &identity) == FALSE)
+    {
+        HacDbgSpinLockRelease(&g_NptLock);
+        return FALSE;
+    }
+
+    //
+    // INVARIANT: decoy is a 4 KiB guest page. This leaf belongs only to the
+    // private root. The restored value is the main-root identity translation,
+    // so the payload frame is no longer named here.
+    //
+    *leaf = identity;
+    KeMemoryBarrier();
+    HacDbgSpinLockRelease(&g_NptLock);
+    return TRUE;
+}
+
+VOID
+NptSlotUsage(
+    _Out_ ULONG* HookUsed,
+    _Out_ ULONG* HookMax,
+    _Out_ ULONG* HiddenUsed,
+    _Out_ ULONG* HiddenMax
+    )
+{
+    UINT32 index;
+    ULONG hooks;
+    ULONG hidden;
+
+    hooks = 0;
+    hidden = 0;
+    HacDbgSpinLockAcquire(&g_NptLock);
+    for (index = 0; index < HACDBG_NPT_MAX_HOOKS; index++)
+    {
+        if (g_Hooks[index].Active != FALSE)
+        {
+            hooks++;
+        }
+    }
+
+    for (index = 0; index < HACDBG_NPT_MAX_HIDDEN; index++)
+    {
+        if (g_HiddenPages[index].Active != FALSE)
+        {
+            hidden++;
+        }
+    }
+
+    HacDbgSpinLockRelease(&g_NptLock);
+    *HookUsed = hooks;
+    *HookMax = HACDBG_NPT_MAX_HOOKS;
+    *HiddenUsed = hidden;
+    *HiddenMax = HACDBG_NPT_MAX_HIDDEN;
+}
+
+BOOLEAN
+NptAnyCpuPrivate(
+    VOID
+    )
+{
+    UINT32 cpu;
+
+    for (cpu = 0; cpu < 256; cpu++)
+    {
+        if (g_CpuPrivate[cpu] != FALSE)
+        {
+            return TRUE;
+        }
+    }
+
+    return FALSE;
+}
+
+UINT64
+NptPrivateRootPa(
+    VOID
+    )
+{
+    return g_PrivateRootPa;
 }
 
 BOOLEAN

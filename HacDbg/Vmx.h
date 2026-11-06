@@ -247,8 +247,16 @@
 #define VMX_EPT_CAP_2MB                  (1ull << 16)
 #define VMX_EPT_CAP_INVEPT               (1ull << 20)
 #define VMX_EPT_CAP_INVEPT_SINGLE        (1ull << 25)
+#define VMX_EPT_CAP_INVVPID              (1ull << 32)
+#define VMX_EPT_CAP_INVVPID_SINGLE       (1ull << 41)
+#define VMX_EPT_CAP_INVVPID_ALL          (1ull << 42)
+#define VMX_EPT_CAP_INVVPID_RETAIN       (1ull << 43)
 #define VMX_INVEPT_SINGLE_CONTEXT        1u
 #define VMX_INVEPT_ALL_CONTEXT           2u
+#define VMX_INVVPID_SINGLE_CONTEXT       1ull
+#define VMX_INVVPID_ALL_CONTEXT          2ull
+#define VMX_INVVPID_SINGLE_RETAIN        3ull
+#define VMX_CR4_PCIDE                    (1ull << 17)
 
 /**
  * @brief Per-logical-processor VT-x state.
@@ -486,6 +494,20 @@ EXTERN_C UINT8
 VmxInvept(
     _In_ UINT64 Type,
     _In_ UINT64 Eptp
+    );
+
+EXTERN_C UINT8
+/**
+ * @brief Invalidates guest linear translations tagged with one VPID.
+ *
+ * @param Type INVVPID type. Type 3 retains global translations.
+ * @param Vpid VPID field of the descriptor. Zero for the all-context type.
+ *
+ * @return 0 on success. Non-zero when the instruction sets CF or ZF.
+ */
+VmxInvvpid(
+    _In_ UINT64 Type,
+    _In_ UINT16 Vpid
     );
 
 EXTERN_C UINT16
