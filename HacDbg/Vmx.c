@@ -2625,15 +2625,35 @@ VmxHandleVmExit(
     {
         UINT64 exitInfo1 = 0;
         UINT64 exitInfo2 = 0;
+        UINT64 traceCr3 = ProcessorContext->GuestCr3;
 
-        if (TraceEventsEnabled() != FALSE)
+        if (TraceEventsEnabled() != FALSE || reason == VMX_EXIT_CR_ACCESS)
         {
             VmxRead(VMCS_EXIT_QUALIFICATION, &exitInfo1);
-            VmxRead(VMCS_GUEST_PHYSICAL_ADDRESS, &exitInfo2);
+            if (TraceEventsEnabled() != FALSE)
+            {
+                VmxRead(VMCS_GUEST_PHYSICAL_ADDRESS, &exitInfo2);
+            }
+        }
+
+        if (reason == VMX_EXIT_CR_ACCESS && (exitInfo1 & 0xF) == 3 &&
+            ((exitInfo1 >> 4) & 3u) == 0)
+        {
+            UINT32 source = (UINT32)((exitInfo1 >> 8) & 0xF);
+
+            //
+            // MOV to CR3 exits before CR3 changes. The cr3 field is the
+            // value being loaded. info2 keeps the previous guest CR3.
+            //
+            if (source <= 15)
+            {
+                exitInfo2 = traceCr3;
+                traceCr3 = ((UINT64*)&ProcessorContext->Registers)[source];
+            }
         }
 
         TraceRecordExit(ProcessorContext->TraceState, ProcessorContext->TscAtExit,
-                        ProcessorContext->GuestRip, ProcessorContext->GuestCr3, reason,
+                        ProcessorContext->GuestRip, traceCr3, reason,
                         exitInfo1, exitInfo2,
                         entryFailure != FALSE ? HACDBG_TRACE_EVENT_FLAG_ENTRY_FAILURE : 0,
                         reason == VMX_EXIT_CPUID, ProcessorContext->Registers.Rcx);

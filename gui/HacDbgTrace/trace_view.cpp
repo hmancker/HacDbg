@@ -33,7 +33,8 @@ namespace
 		"svm instruction",
 		"xsetbv",
 		"invd",
-		"monitor trap"
+		"monitor trap",
+		"cr3"
 	};
 
 	constexpr uint32_t reason_colors[HACDBG_TRACE_REASON_COUNT] = {
@@ -52,7 +53,8 @@ namespace
 		0xFFA5D6A7,
 		0xFFB39DDB,
 		0xFFFFB86C,
-		0xFF64B5F6
+		0xFF64B5F6,
+		0xFF3DDC97
 	};
 
 	float color_channel(const uint32_t color, const uint32_t shift)

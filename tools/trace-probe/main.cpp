@@ -56,7 +56,8 @@ namespace
 		"svm-instruction",
 		"xsetbv",
 		"invd",
-		"monitor-trap"
+		"monitor-trap",
+		"cr3"
 	};
 
 	void print_usage()

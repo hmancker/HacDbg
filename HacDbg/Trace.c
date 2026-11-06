@@ -209,7 +209,8 @@ TraceCpuState(
 static UINT32
 TraceMapReason(
     _In_ UINT32 RawReason,
-    _In_ UINT32 Flags
+    _In_ UINT32 Flags,
+    _In_ UINT64 ExitInfo1
     )
 {
 #if HACDBG_BACKEND_INTEL
@@ -236,6 +237,17 @@ TraceMapReason(
         return HACDBG_TRACE_REASON_INVD;
     case VMX_EXIT_MONITOR_TRAP:
         return HACDBG_TRACE_REASON_MONITOR_TRAP;
+    case VMX_EXIT_CR_ACCESS:
+        //
+        // Exit qualification bits 3:0 are the control-register number.
+        // PTE injection exits on MOV to CR3.
+        //
+        if ((ExitInfo1 & 0xF) == 3)
+        {
+            return HACDBG_TRACE_REASON_CR3;
+        }
+
+        return HACDBG_TRACE_REASON_OTHER;
     case VMX_EXIT_VMCALL:
     case VMX_EXIT_VMCLEAR:
     case VMX_EXIT_VMLAUNCH:
@@ -254,15 +266,36 @@ TraceMapReason(
     }
 #else
     UNREFERENCED_PARAMETER(Flags);
+    UNREFERENCED_PARAMETER(ExitInfo1);
+
+    if (RawReason >= SVM_EXIT_EXCP_BASE && RawReason < SVM_EXIT_EXCP_BASE + 32u)
+    {
+        return HACDBG_TRACE_REASON_EXCEPTION;
+    }
 
     switch (RawReason)
     {
+    case SVM_EXIT_READ_CR3:
+    case SVM_EXIT_WRITE_CR3:
+        return HACDBG_TRACE_REASON_CR3;
     case SVM_EXIT_CPUID:
         return HACDBG_TRACE_REASON_CPUID;
     case SVM_EXIT_MSR:
         return HACDBG_TRACE_REASON_MSR;
     case SVM_EXIT_NPF:
         return HACDBG_TRACE_REASON_NESTED_PAGE_FAULT;
+    case SVM_EXIT_IOIO:
+        return HACDBG_TRACE_REASON_IO;
+    case SVM_EXIT_HLT:
+        return HACDBG_TRACE_REASON_HALT;
+    case SVM_EXIT_SHUTDOWN:
+        return HACDBG_TRACE_REASON_SHUTDOWN;
+    case SVM_EXIT_INTR:
+        return HACDBG_TRACE_REASON_EXTERNAL_INTERRUPT;
+    case SVM_EXIT_INVD:
+        return HACDBG_TRACE_REASON_INVD;
+    case SVM_EXIT_XSETBV:
+        return HACDBG_TRACE_REASON_XSETBV;
     case SVM_EXIT_VMRUN:
     case SVM_EXIT_VMLOAD:
     case SVM_EXIT_VMSAVE:
@@ -348,7 +381,7 @@ TraceRecordExit(
         return;
     }
 
-    reason = TraceMapReason(RawReason, Flags);
+    reason = TraceMapReason(RawReason, Flags, ExitInfo1);
 
     if (g_TraceCountersEnabled != 0)
     {

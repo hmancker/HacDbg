@@ -9,9 +9,9 @@ typedef unsigned int hacdbg_trace_uint32_t;
 typedef unsigned long long hacdbg_trace_uint64_t;
 #endif
 
-#define HACDBG_TRACE_VERSION                  1u
+#define HACDBG_TRACE_VERSION                  2u
 #define HACDBG_TRACE_MAX_CPUS                 256u
-#define HACDBG_TRACE_REASON_COUNT             16u
+#define HACDBG_TRACE_REASON_COUNT             17u
 #define HACDBG_TRACE_EVENTS_PER_CPU           16u
 #define HACDBG_TRACE_MAX_EVENTS               256u
 #define HACDBG_TRACE_DEFAULT_SAMPLE_RATE      64u
@@ -56,6 +56,7 @@ typedef unsigned long long hacdbg_trace_uint64_t;
 #define HACDBG_TRACE_REASON_XSETBV            13u
 #define HACDBG_TRACE_REASON_INVD              14u
 #define HACDBG_TRACE_REASON_MONITOR_TRAP      15u
+#define HACDBG_TRACE_REASON_CR3               16u
 
 #define HACDBG_TRACE_BACKEND_AMD              1u
 #define HACDBG_TRACE_BACKEND_INTEL            2u
@@ -96,11 +97,11 @@ typedef struct _HACDBG_TRACE_SNAPSHOT
 } HACDBG_TRACE_SNAPSHOT;
 
 #ifdef __cplusplus
-static_assert(sizeof(HACDBG_TRACE_CPU) == 144, "trace CPU ABI changed");
+static_assert(sizeof(HACDBG_TRACE_CPU) == 152, "trace CPU ABI changed");
 static_assert(sizeof(HACDBG_TRACE_EVENT) == 64, "trace event ABI changed");
-static_assert(sizeof(HACDBG_TRACE_SNAPSHOT) == 53288, "trace snapshot ABI changed");
+static_assert(sizeof(HACDBG_TRACE_SNAPSHOT) == 55336, "trace snapshot ABI changed");
 #else
-_Static_assert(sizeof(HACDBG_TRACE_CPU) == 144, "trace CPU ABI changed");
+_Static_assert(sizeof(HACDBG_TRACE_CPU) == 152, "trace CPU ABI changed");
 _Static_assert(sizeof(HACDBG_TRACE_EVENT) == 64, "trace event ABI changed");
-_Static_assert(sizeof(HACDBG_TRACE_SNAPSHOT) == 53288, "trace snapshot ABI changed");
+_Static_assert(sizeof(HACDBG_TRACE_SNAPSHOT) == 55336, "trace snapshot ABI changed");
 #endif

@@ -45,7 +45,20 @@
 //
 #define SVM_NP_ENABLE                          (1ull << 0)
 
+//
+// EXITCODE values from APM Vol 2, 15.6. CR3 read is 0x03 and CR3 write is
+// 0x13. Exceptions occupy 0x40 plus the vector. PTE injection sets CR3-write
+// intercept bit 3, so those exits are the CR3 switches.
+//
+#define SVM_EXIT_READ_CR3                     0x0003ull
 #define SVM_EXIT_WRITE_CR3                    0x0013ull
+#define SVM_EXIT_EXCP_BASE                    0x0040ull
+#define SVM_EXIT_INTR                         0x0060ull
+#define SVM_EXIT_INVD                         0x0076ull
+#define SVM_EXIT_HLT                          0x0078ull
+#define SVM_EXIT_IOIO                         0x007Bull
+#define SVM_EXIT_SHUTDOWN                     0x007Full
+#define SVM_EXIT_XSETBV                       0x008Dull
 #define SVM_EXIT_CPUID                        0x0072ull
 #define SVM_EXIT_MSR                          0x007cull
 #define SVM_EXIT_VMRUN                        0x0080ull

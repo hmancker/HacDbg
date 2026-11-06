@@ -1323,10 +1323,29 @@ SvmHandleVmExit(
 
     if (TraceIsEnabled() != FALSE)
     {
+        UINT64 traceCr3 = vmcb->StateSaveArea.Cr3;
+        UINT64 traceInfo2 = vmcb->ControlArea.ExitInfo2;
+
+        if (vmcb->ControlArea.ExitCode == SVM_EXIT_WRITE_CR3)
+        {
+            UINT32 source = (UINT32)(vmcb->ControlArea.ExitInfo1 & 0xF);
+
+            //
+            // The intercept is raised before MOV writes CR3. EXITINFO1's low
+            // nibble is that source GPR. Record the value being loaded, and
+            // keep the previous CR3 in the second exit field.
+            //
+            if (source <= 15)
+            {
+                traceInfo2 = traceCr3;
+                traceCr3 = ((UINT64*)GuestContext->Registers)[source];
+            }
+        }
+
         TraceRecordExit(processor->TraceState, processor->TscAtExit,
-                        vmcb->StateSaveArea.Rip, vmcb->StateSaveArea.Cr3,
+                        vmcb->StateSaveArea.Rip, traceCr3,
                         (UINT32)vmcb->ControlArea.ExitCode, vmcb->ControlArea.ExitInfo1,
-                        vmcb->ControlArea.ExitInfo2, 0,
+                        traceInfo2, 0,
                         vmcb->ControlArea.ExitCode == SVM_EXIT_CPUID,
                         GuestContext->Registers->Rcx);
     }
