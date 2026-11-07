@@ -2,6 +2,7 @@
 
 #include "CallbackView.h"
 #include "FilterView.h"
+#include "MinifilterView.h"
 
 #include <QTabWidget>
 #include <QVBoxLayout>
@@ -14,18 +15,26 @@ KernelPage::KernelPage(QWidget* parent)
     m_tabs = new QTabWidget(this);
     m_callbacks = new CallbackView(m_tabs);
     m_filters = new FilterView(m_tabs);
+    m_minifilters = new MinifilterView(m_tabs);
     m_tabs->addTab(m_callbacks, QStringLiteral("Callbacks"));
     m_tabs->addTab(m_filters, QStringLiteral("Filters"));
+    m_tabs->addTab(m_minifilters, QStringLiteral("Minifilters"));
     layout->addWidget(m_tabs);
 
     connect(m_callbacks, &CallbackView::addressActivated, this, &KernelPage::addressActivated);
     connect(m_callbacks, &CallbackView::commandRequested, this, &KernelPage::commandRequested);
     connect(m_filters, &FilterView::addressActivated, this, &KernelPage::addressActivated);
+    connect(m_minifilters, &MinifilterView::addressActivated, this, &KernelPage::addressActivated);
     connect(m_tabs, &QTabWidget::currentChanged, this, [this](int index) {
         if (index == 1 && m_filtersLoaded == false)
         {
             m_filtersLoaded = true;
             m_filters->refresh();
+        }
+        else if (index == 2 && m_minifiltersLoaded == false)
+        {
+            m_minifiltersLoaded = true;
+            m_minifilters->refresh();
         }
     });
 }
@@ -38,6 +47,13 @@ void KernelPage::refresh()
         return;
     }
 
-    m_filtersLoaded = true;
-    m_filters->refresh();
+    if (m_tabs->currentIndex() == 1)
+    {
+        m_filtersLoaded = true;
+        m_filters->refresh();
+        return;
+    }
+
+    m_minifiltersLoaded = true;
+    m_minifilters->refresh();
 }

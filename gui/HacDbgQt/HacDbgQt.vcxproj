@@ -87,6 +87,10 @@
     <None Include="src\callback\FilterDriver.h" />
     <None Include="src\callback\KernelPage.cpp" />
     <None Include="src\callback\KernelPage.h" />
+    <None Include="src\callback\MinifilterView.cpp" />
+    <None Include="src\callback\MinifilterView.h" />
+    <None Include="src\callback\MinifilterDriver.cpp" />
+    <None Include="src\callback\MinifilterDriver.h" />
     <None Include="src\TraceWindow.cpp" />
     <None Include="src\TraceWindow.h" />
     <None Include="src\MainWindow.cpp" />

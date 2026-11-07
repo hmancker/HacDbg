@@ -16,6 +16,7 @@
 #include "WindowProtect.h"
 #include "Callback.h"
 #include "Filter.h"
+#include "Minifilter.h"
 #include "WobComm.h"
 
 #include "../shared/wob_comm.h"
@@ -168,6 +169,10 @@ WobCommHandle(
     {
         BodyBytes = sizeof(HACDBG_FILTER_REQUEST);
     }
+    else if (Header.Kind == HACDBG_WOB_KIND_MINIFILTER)
+    {
+        BodyBytes = sizeof(HACDBG_MINIFILTER_REQUEST);
+    }
     else
     {
         return STATUS_INVALID_PARAMETER;
@@ -220,7 +225,7 @@ WobCommHandle(
         HACDBG_LOG("HacDbg: WOB callback done status=0x%08x count=%u.\n", CallbackRequest->Status,
                    CallbackRequest->Count);
     }
-    else
+    else if (Header.Kind == HACDBG_WOB_KIND_FILTER)
     {
         HACDBG_FILTER_REQUEST* FilterRequest;
 
@@ -228,6 +233,16 @@ WobCommHandle(
         HACDBG_LOG("HacDbg: WOB filter bytes=%u.\n", BodyBytes);
         FilterExecute(FilterRequest);
         HACDBG_LOG("HacDbg: WOB filter done status=0x%08x count=%u.\n", FilterRequest->Status, FilterRequest->Count);
+    }
+    else
+    {
+        HACDBG_MINIFILTER_REQUEST* MinifilterRequest;
+
+        MinifilterRequest = (HACDBG_MINIFILTER_REQUEST*)Body;
+        HACDBG_LOG("HacDbg: WOB minifilter bytes=%u.\n", BodyBytes);
+        MinifilterExecute(MinifilterRequest);
+        HACDBG_LOG("HacDbg: WOB minifilter done status=0x%08x count=%u.\n", MinifilterRequest->Status,
+                   MinifilterRequest->Count);
     }
 
     if (WobCommUserCopy(Body, (UCHAR*)Buffer + sizeof(Header), BodyBytes, TRUE) == FALSE)

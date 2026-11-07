@@ -44,6 +44,10 @@ set(HACDBG_QT_SOURCES
     src/callback/FilterDriver.h
     src/callback/KernelPage.cpp
     src/callback/KernelPage.h
+    src/callback/MinifilterView.cpp
+    src/callback/MinifilterView.h
+    src/callback/MinifilterDriver.cpp
+    src/callback/MinifilterDriver.h
     src/window/WindowAffinity.cpp
     src/window/WindowAffinity.h
     src/Config.h

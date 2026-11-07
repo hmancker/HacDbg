@@ -4,6 +4,7 @@
 
 class CallbackView;
 class FilterView;
+class MinifilterView;
 class QTabWidget;
 
 class KernelPage : public QWidget
@@ -23,5 +24,7 @@ private:
     QTabWidget* m_tabs = nullptr;
     CallbackView* m_callbacks = nullptr;
     FilterView* m_filters = nullptr;
+    MinifilterView* m_minifilters = nullptr;
     bool m_filtersLoaded = false;
+    bool m_minifiltersLoaded = false;
 };

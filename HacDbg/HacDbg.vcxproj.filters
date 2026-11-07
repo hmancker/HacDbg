@@ -60,6 +60,9 @@
     <ClCompile Include="Filter.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Minifilter.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Search.c">
       <Filter>Source Files</Filter>
     </ClCompile>

@@ -18,6 +18,7 @@
 #include "WindowProtect.h"
 #include "Callback.h"
 #include "Filter.h"
+#include "Minifilter.h"
 #if HACDBG_COMM_WOB
 #include "WobComm.h"
 #endif
@@ -676,6 +677,18 @@ HacDbgDeviceControl(
                    ((HACDBG_FILTER_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Count);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = sizeof(HACDBG_FILTER_REQUEST);
+    }
+    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_MINIFILTER &&
+             inputLength >= sizeof(HACDBG_MINIFILTER_REQUEST) &&
+             outputLength >= sizeof(HACDBG_MINIFILTER_REQUEST))
+    {
+        HACDBG_LOG("HacDbg: IOCTL minifilter bytes=%u.\n", inputLength);
+        MinifilterExecute((HACDBG_MINIFILTER_REQUEST*)Irp->AssociatedIrp.SystemBuffer);
+        HACDBG_LOG("HacDbg: IOCTL minifilter done status=0x%08x count=%u.\n",
+                   ((HACDBG_MINIFILTER_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Status,
+                   ((HACDBG_MINIFILTER_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Count);
+        status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = sizeof(HACDBG_MINIFILTER_REQUEST);
     }
     else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FLUSH_SLAT ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_HYPERCALL ||

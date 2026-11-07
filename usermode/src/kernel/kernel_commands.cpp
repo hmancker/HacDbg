@@ -1977,6 +1977,88 @@ std::uint8_t command_filter(std::string_view body)
 
 	return 1;
 }
+
+std::uint8_t command_minifilter(std::string_view body)
+{
+	std::string operation = {};
+	std::string_view arguments = trim_edge(body);
+	unsigned int action = HACDBG_MINIFILTER_OP_SCAN;
+
+	if (take_token(arguments, operation) == 1 &&
+	    (same_text(operation, "disable") == 1 || same_text(operation, "enable") == 1))
+	{
+		std::string address = {};
+		std::uint64_t filter = 0;
+
+		if (take_token(arguments, address) == 0 || parse_callback_address(address, filter) == 0)
+		{
+			output::print("err, invalid syntax\n");
+			output::flush();
+
+			return 1;
+		}
+
+		action = same_text(operation, "disable") == 1 ? HACDBG_MINIFILTER_OP_DISABLE : HACDBG_MINIFILTER_OP_ENABLE;
+		auto* request = new HACDBG_MINIFILTER_REQUEST();
+		request->Reserved = action;
+		request->Rows[0].Filter = filter;
+		const bool sent = kernel_minifilter_request(*request);
+		if (sent == false || request->Status < 0)
+		{
+			output::print("err, minifilter failed: 0x{:08x}\n",
+			              sent == false ? 0xC0000225u : static_cast<std::uint32_t>(request->Status));
+		}
+		else
+		{
+			output::print("minifilter {} filter={:016x}\n", operation, filter);
+		}
+
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	auto* request = new HACDBG_MINIFILTER_REQUEST();
+	const bool sent = kernel_minifilter_request(*request);
+	if (sent == false || request->Status < 0)
+	{
+		output::print("err, minifilter failed: 0x{:08x}\n",
+		              sent == false ? 0xC0000225u : static_cast<std::uint32_t>(request->Status));
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	output::print("minifilter count={} truncated={}\n", request->Count, request->Truncated);
+	for (unsigned int index = 0; index < request->Count && index < HACDBG_MINIFILTER_MAX_ROWS; ++index)
+	{
+		const HACDBG_MINIFILTER_ROW& row = request->Rows[index];
+		const std::wstring path = callback_dos_path(row.Path);
+		std::string company = {};
+		std::string version = {};
+		std::string description = {};
+		char narrow[HACDBG_MINIFILTER_PATH_CHARS] = {};
+		char name[HACDBG_MINIFILTER_NAME_CHARS] = {};
+		char altitude[HACDBG_MINIFILTER_ALTITUDE_CHARS] = {};
+
+		callback_file_details(path, company, version, description);
+		(void)version;
+		WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, narrow, static_cast<int>(sizeof(narrow)), nullptr, nullptr);
+		WideCharToMultiByte(CP_ACP, 0, row.Name, -1, name, static_cast<int>(sizeof(name)), nullptr, nullptr);
+		WideCharToMultiByte(CP_ACP, 0, row.Altitude, -1, altitude, static_cast<int>(sizeof(altitude)), nullptr, nullptr);
+		const std::string indent(static_cast<std::size_t>(row.Depth) * 2u, ' ');
+		output::print("{}{} callback={:016x} filter={:016x} altitude={} {} | {} | {}\n", indent,
+		              name[0] != 0 ? name : "-", row.Callback, row.Filter, altitude[0] != 0 ? altitude : "-", narrow, company,
+		              description);
+	}
+
+	output::flush();
+	delete request;
+
+	return 1;
+}
 }
 
 std::uint8_t dispatch_gui_command(const std::string& command)
@@ -2057,6 +2139,11 @@ std::uint8_t dispatch_gui_command(const std::string& command)
 	if (same_text(name, "filter") == 1)
 	{
 		return command_filter(body);
+	}
+
+	if (same_text(name, "minifilter") == 1)
+	{
+		return command_minifilter(body);
 	}
 
 	return 0;

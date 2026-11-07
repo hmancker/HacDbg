@@ -131,6 +131,9 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(ProjectDir)..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
@@ -144,6 +147,9 @@
       <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
       <AdditionalIncludeDirectories>$(ProjectDir)..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
@@ -161,6 +167,9 @@
       <AdditionalIncludeDirectories>$(ProjectDir)..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>HACDBG_BACKEND_INTEL=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
@@ -175,6 +184,9 @@
       <AdditionalIncludeDirectories>$(ProjectDir)..\shared;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>HACDBG_BACKEND_INTEL=1;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <Link>
+      <AdditionalDependencies>fltMgr.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
@@ -206,6 +218,7 @@
     <ClCompile Include="WindowProtect.c" />
     <ClCompile Include="Callback.c" />
     <ClCompile Include="Filter.c" />
+    <ClCompile Include="Minifilter.c" />
     <ClCompile Include="Search.c">
       <ExcludedFromBuild Condition="'$(HacDbgCommWob)'!='1'">true</ExcludedFromBuild>
     </ClCompile>
