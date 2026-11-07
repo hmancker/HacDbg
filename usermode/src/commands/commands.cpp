@@ -10100,7 +10100,7 @@ static void process_help(const CLI::App* const)
 	output::print("Register:   r .thread\n");
 	output::print("Symbol:     .sympath .sympath+ .symfix .symfix+ .reload .symopt lm lmi ld x ln dt\n");
 	output::print("Process:    !process .process .detach !thread\n");
-	output::print("Target:     kill killk killf suspend resume hide ppl handle inject image window callback\n");
+	output::print("Target:     kill killk killf suspend resume hide ppl handle inject image window callback filter\n");
 	output::print("Trace:      .trace\n");
 	output::print("Misc:       .cls .echo .printf .formats ? .time version .help q\n");
 	output::print("Guest:      rgpm wgpm cgpm gvat rgvm wgvm cgvm gva\n");

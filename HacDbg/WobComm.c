@@ -15,6 +15,7 @@
 #include "Types.h"
 #include "WindowProtect.h"
 #include "Callback.h"
+#include "Filter.h"
 #include "WobComm.h"
 
 #include "../shared/wob_comm.h"
@@ -163,6 +164,10 @@ WobCommHandle(
     {
         BodyBytes = sizeof(HACDBG_CALLBACK_REQUEST);
     }
+    else if (Header.Kind == HACDBG_WOB_KIND_FILTER)
+    {
+        BodyBytes = sizeof(HACDBG_FILTER_REQUEST);
+    }
     else
     {
         return STATUS_INVALID_PARAMETER;
@@ -205,7 +210,7 @@ WobCommHandle(
         WindowProtectExecute(WindowRequest);
         HACDBG_LOG("HacDbg: WOB window done op=%u status=0x%08x.\n", WindowRequest->Operation, WindowRequest->Status);
     }
-    else
+    else if (Header.Kind == HACDBG_WOB_KIND_CALLBACK)
     {
         HACDBG_CALLBACK_REQUEST* CallbackRequest;
 
@@ -214,6 +219,15 @@ WobCommHandle(
         CallbackExecute(CallbackRequest);
         HACDBG_LOG("HacDbg: WOB callback done status=0x%08x count=%u.\n", CallbackRequest->Status,
                    CallbackRequest->Count);
+    }
+    else
+    {
+        HACDBG_FILTER_REQUEST* FilterRequest;
+
+        FilterRequest = (HACDBG_FILTER_REQUEST*)Body;
+        HACDBG_LOG("HacDbg: WOB filter bytes=%u.\n", BodyBytes);
+        FilterExecute(FilterRequest);
+        HACDBG_LOG("HacDbg: WOB filter done status=0x%08x count=%u.\n", FilterRequest->Status, FilterRequest->Count);
     }
 
     if (WobCommUserCopy(Body, (UCHAR*)Buffer + sizeof(Header), BodyBytes, TRUE) == FALSE)

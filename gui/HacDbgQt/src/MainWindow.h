@@ -7,7 +7,7 @@
 #include <QString>
 
 class BreakpointView;
-class CallbackView;
+class KernelPage;
 class CommandView;
 class MonitorView;
 class CpuView;
@@ -78,7 +78,7 @@ private:
     SymbolView* m_symbols = nullptr;
     ProcessThreadView* m_processes = nullptr;
     WindowProtectView* m_windows = nullptr;
-    CallbackView* m_callbacks = nullptr;
+    KernelPage* m_callbacks = nullptr;
     TraceWindow* m_trace = nullptr;
     QTabBar* m_tabs = nullptr;
     QStackedWidget* m_stack = nullptr;

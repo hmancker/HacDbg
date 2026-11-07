@@ -38,6 +38,12 @@ set(HACDBG_QT_SOURCES
     src/callback/CallbackView.h
     src/callback/CallbackDriver.cpp
     src/callback/CallbackDriver.h
+    src/callback/FilterView.cpp
+    src/callback/FilterView.h
+    src/callback/FilterDriver.cpp
+    src/callback/FilterDriver.h
+    src/callback/KernelPage.cpp
+    src/callback/KernelPage.h
     src/window/WindowAffinity.cpp
     src/window/WindowAffinity.h
     src/Config.h

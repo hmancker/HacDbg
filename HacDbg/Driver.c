@@ -17,6 +17,7 @@
 #include "Inject.h"
 #include "WindowProtect.h"
 #include "Callback.h"
+#include "Filter.h"
 #if HACDBG_COMM_WOB
 #include "WobComm.h"
 #endif
@@ -663,6 +664,18 @@ HacDbgDeviceControl(
                    ((HACDBG_CALLBACK_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Count);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = sizeof(HACDBG_CALLBACK_REQUEST);
+    }
+    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FILTER &&
+             inputLength >= sizeof(HACDBG_FILTER_REQUEST) &&
+             outputLength >= sizeof(HACDBG_FILTER_REQUEST))
+    {
+        HACDBG_LOG("HacDbg: IOCTL filter bytes=%u.\n", inputLength);
+        FilterExecute((HACDBG_FILTER_REQUEST*)Irp->AssociatedIrp.SystemBuffer);
+        HACDBG_LOG("HacDbg: IOCTL filter done status=0x%08x count=%u.\n",
+                   ((HACDBG_FILTER_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Status,
+                   ((HACDBG_FILTER_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Count);
+        status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = sizeof(HACDBG_FILTER_REQUEST);
     }
     else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FLUSH_SLAT ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_HYPERCALL ||

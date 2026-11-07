@@ -81,6 +81,12 @@
     <None Include="src\callback\CallbackView.h" />
     <None Include="src\callback\CallbackDriver.cpp" />
     <None Include="src\callback\CallbackDriver.h" />
+    <None Include="src\callback\FilterView.cpp" />
+    <None Include="src\callback\FilterView.h" />
+    <None Include="src\callback\FilterDriver.cpp" />
+    <None Include="src\callback\FilterDriver.h" />
+    <None Include="src\callback\KernelPage.cpp" />
+    <None Include="src\callback\KernelPage.h" />
     <None Include="src\TraceWindow.cpp" />
     <None Include="src\TraceWindow.h" />
     <None Include="src\MainWindow.cpp" />

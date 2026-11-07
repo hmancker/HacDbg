@@ -8,7 +8,7 @@
 #include "ProcessThreadView.h"
 #include "SymbolView.h"
 #include "WindowProtectView.h"
-#include "callback/CallbackView.h"
+#include "callback/KernelPage.h"
 #include "TraceWindow.h"
 
 #include <QAction>
@@ -621,10 +621,10 @@ void MainWindow::ensurePage(int index)
     }
     else if (index == PageCallbacks && m_callbacks == nullptr)
     {
-        m_callbacks = new CallbackView(holder(index));
+        m_callbacks = new KernelPage(holder(index));
         holder(index)->layout()->addWidget(m_callbacks);
-        connect(m_callbacks, &CallbackView::addressActivated, this, &MainWindow::openDisassembly);
-        connect(m_callbacks, &CallbackView::commandRequested, this, &MainWindow::executeCommand);
+        connect(m_callbacks, &KernelPage::addressActivated, this, &MainWindow::openDisassembly);
+        connect(m_callbacks, &KernelPage::commandRequested, this, &MainWindow::executeCommand);
         m_callbacks->refresh();
     }
 }

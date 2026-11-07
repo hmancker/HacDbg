@@ -1786,6 +1786,197 @@ std::uint8_t command_callback(std::string_view body)
 
 	return 1;
 }
+
+std::uint8_t command_filter_operate(unsigned int operation, std::uint64_t driver, std::uint64_t device, std::uint64_t host)
+{
+	auto* request = new HACDBG_FILTER_REQUEST();
+
+	request->Reserved = operation;
+	request->Rows[0].DriverObject = driver;
+	request->Rows[0].DeviceObject = device;
+	request->Rows[0].HostDeviceObject = host;
+	const bool sent = kernel_filter_request(*request);
+
+	if (sent == false || request->Status < 0)
+	{
+		output::print("err, filter failed: 0x{:08x}\n",
+		              sent == false ? 0xC0000225u : static_cast<std::uint32_t>(request->Status));
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	if (operation == HACDBG_FILTER_OP_DETACH)
+	{
+		output::print("filter removed dev={:016x} host={:016x}\n", device, host);
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	output::print("filter count={}\n", request->Count);
+	for (unsigned int index = 0; index < request->Count && index < HACDBG_FILTER_MAX_ROWS; ++index)
+	{
+		const HACDBG_FILTER_ROW& row = request->Rows[index];
+		const std::wstring path = callback_dos_path(row.DriverPath);
+		char narrow[HACDBG_FILTER_PATH_CHARS] = {};
+		char name[HACDBG_FILTER_NAME_CHARS] = {};
+
+		WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, narrow, static_cast<int>(sizeof(narrow)), nullptr, nullptr);
+		WideCharToMultiByte(CP_ACP, 0, operation == HACDBG_FILTER_OP_DEVICES ? row.DeviceName : row.DriverName, -1, name,
+		                    static_cast<int>(sizeof(name)), nullptr, nullptr);
+		if (operation == HACDBG_FILTER_OP_DEVICES)
+		{
+			output::print("  dev={:016x} {} {}\n", row.DeviceObject, name[0] != 0 ? name : "-", narrow);
+		}
+		else
+		{
+			output::print("  {:2} {:016x} {}\n", row.Depth, row.DeviceObject, narrow);
+		}
+	}
+
+	output::flush();
+	delete request;
+
+	return 1;
+}
+
+std::uint8_t command_filter(std::string_view body)
+{
+	std::string operation = {};
+	std::string_view arguments = trim_edge(body);
+
+	if (take_token(arguments, operation) == 1 &&
+	    (same_text(operation, "remove") == 1 || same_text(operation, "devices") == 1 || same_text(operation, "dispatch") == 1))
+	{
+		std::string first = {};
+		std::string second = {};
+		std::uint64_t driver = 0;
+		std::uint64_t device = 0;
+		std::uint64_t host = 0;
+
+		if (take_token(arguments, first) == 0 || parse_callback_address(first, device) == 0)
+		{
+			output::print("err, invalid syntax\n");
+			output::flush();
+
+			return 1;
+		}
+
+		if (same_text(operation, "remove") == 1)
+		{
+			if (take_token(arguments, second) == 0 || parse_callback_address(second, host) == 0)
+			{
+				output::print("err, invalid syntax\n");
+				output::flush();
+
+				return 1;
+			}
+
+			return command_filter_operate(HACDBG_FILTER_OP_DETACH, 0, device, host);
+		}
+
+		driver = device;
+		return command_filter_operate(same_text(operation, "devices") == 1 ? HACDBG_FILTER_OP_DEVICES
+		                                                                   : HACDBG_FILTER_OP_DISPATCH,
+		                              driver, 0, 0);
+	}
+
+	const std::string_view type_name = trim_edge(body);
+	unsigned int selected_type = 0;
+	const std::uint8_t filter_type = type_name.empty() == false ? 1 : 0;
+
+	if (filter_type == 1)
+	{
+		for (unsigned int type = HACDBG_FILTER_FILE; type <= HACDBG_FILTER_PNP; ++type)
+		{
+			if (same_text(type_name, HacDbgFilterTypeName(type)) == 1)
+			{
+				selected_type = type;
+				break;
+			}
+		}
+
+		if (selected_type == 0)
+		{
+			output::print("err, filter type was not found\n");
+			output::flush();
+
+			return 1;
+		}
+	}
+
+	auto* request = new HACDBG_FILTER_REQUEST();
+	const bool sent = kernel_filter_request(*request);
+
+	if (sent == false || request->Status < 0)
+	{
+		output::print("err, filter failed: 0x{:08x}\n",
+		              sent == false ? 0xC0000225u : static_cast<std::uint32_t>(request->Status));
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	unsigned int shown = 0;
+
+	for (unsigned int index = 0; index < request->Count && index < HACDBG_FILTER_MAX_ROWS; ++index)
+	{
+		if (filter_type == 0 || request->Rows[index].Type == selected_type)
+		{
+			++shown;
+		}
+	}
+
+	if (filter_type == 1)
+	{
+		output::print("filter count={} truncated={} type={} shown={}\n", request->Count, request->Truncated,
+		              HacDbgFilterTypeName(selected_type), shown);
+	}
+	else
+	{
+		output::print("filter count={} truncated={}\n", request->Count, request->Truncated);
+	}
+
+	for (unsigned int index = 0; index < request->Count && index < HACDBG_FILTER_MAX_ROWS; ++index)
+	{
+		const HACDBG_FILTER_ROW& row = request->Rows[index];
+
+		if (filter_type == 1 && row.Type != selected_type)
+		{
+			continue;
+		}
+
+		const std::wstring path = callback_dos_path(row.DriverPath);
+		std::string company = {};
+		std::string version = {};
+		std::string description = {};
+		char narrow[HACDBG_FILTER_PATH_CHARS * 2] = {};
+		char device[HACDBG_FILTER_NAME_CHARS * 2] = {};
+		char driver[HACDBG_FILTER_NAME_CHARS * 2] = {};
+		char host[HACDBG_FILTER_NAME_CHARS * 2] = {};
+
+		callback_file_details(path, company, version, description);
+		(void)version;
+		WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, narrow, static_cast<int>(sizeof(narrow)), nullptr, nullptr);
+		WideCharToMultiByte(CP_ACP, 0, row.DriverName, -1, driver, static_cast<int>(sizeof(driver)), nullptr, nullptr);
+		WideCharToMultiByte(CP_ACP, 0, row.DeviceName, -1, device, static_cast<int>(sizeof(device)), nullptr, nullptr);
+		WideCharToMultiByte(CP_ACP, 0, row.HostDriverName, -1, host, static_cast<int>(sizeof(host)), nullptr, nullptr);
+		const std::string indent(static_cast<std::size_t>(row.Depth) * 2u, ' ');
+		output::print("{}{} {} drv={:016x} dev={:016x} device={} host={} hostdrv={:016x} hostdev={:016x} {} | {} | {}\n",
+		              indent, HacDbgFilterTypeName(row.Type), driver[0] != 0 ? driver : "-", row.DriverObject,
+		              row.DeviceObject, device[0] != 0 ? device : "-", host[0] != 0 ? host : "-", row.HostDriverObject,
+		              row.HostDeviceObject, narrow, company, description);
+	}
+
+	output::flush();
+	delete request;
+
+	return 1;
+}
 }
 
 std::uint8_t dispatch_gui_command(const std::string& command)
@@ -1861,6 +2052,11 @@ std::uint8_t dispatch_gui_command(const std::string& command)
 	if (same_text(name, "callback") == 1)
 	{
 		return command_callback(body);
+	}
+
+	if (same_text(name, "filter") == 1)
+	{
+		return command_filter(body);
 	}
 
 	return 0;
