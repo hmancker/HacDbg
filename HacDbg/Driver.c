@@ -19,6 +19,7 @@
 #include "Callback.h"
 #include "Filter.h"
 #include "Minifilter.h"
+#include "Timer.h"
 #if HACDBG_COMM_WOB
 #include "WobComm.h"
 #endif
@@ -689,6 +690,18 @@ HacDbgDeviceControl(
                    ((HACDBG_MINIFILTER_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Count);
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = sizeof(HACDBG_MINIFILTER_REQUEST);
+    }
+    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_TIMER &&
+             inputLength >= sizeof(HACDBG_TIMER_REQUEST) &&
+             outputLength >= sizeof(HACDBG_TIMER_REQUEST))
+    {
+        HACDBG_LOG("HacDbg: IOCTL timer bytes=%u.\n", inputLength);
+        TimerExecute((HACDBG_TIMER_REQUEST*)Irp->AssociatedIrp.SystemBuffer);
+        HACDBG_LOG("HacDbg: IOCTL timer done status=0x%08x count=%u.\n",
+                   ((HACDBG_TIMER_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Status,
+                   ((HACDBG_TIMER_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Count);
+        status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = sizeof(HACDBG_TIMER_REQUEST);
     }
     else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FLUSH_SLAT ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_HYPERCALL ||

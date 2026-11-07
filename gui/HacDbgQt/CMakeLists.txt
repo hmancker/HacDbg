@@ -48,6 +48,10 @@ set(HACDBG_QT_SOURCES
     src/callback/MinifilterView.h
     src/callback/MinifilterDriver.cpp
     src/callback/MinifilterDriver.h
+    src/callback/TimerView.cpp
+    src/callback/TimerView.h
+    src/callback/TimerDriver.cpp
+    src/callback/TimerDriver.h
     src/window/WindowAffinity.cpp
     src/window/WindowAffinity.h
     src/Config.h

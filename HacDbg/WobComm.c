@@ -17,6 +17,7 @@
 #include "Callback.h"
 #include "Filter.h"
 #include "Minifilter.h"
+#include "Timer.h"
 #include "WobComm.h"
 
 #include "../shared/wob_comm.h"
@@ -173,6 +174,10 @@ WobCommHandle(
     {
         BodyBytes = sizeof(HACDBG_MINIFILTER_REQUEST);
     }
+    else if (Header.Kind == HACDBG_WOB_KIND_TIMER)
+    {
+        BodyBytes = sizeof(HACDBG_TIMER_REQUEST);
+    }
     else
     {
         return STATUS_INVALID_PARAMETER;
@@ -234,7 +239,7 @@ WobCommHandle(
         FilterExecute(FilterRequest);
         HACDBG_LOG("HacDbg: WOB filter done status=0x%08x count=%u.\n", FilterRequest->Status, FilterRequest->Count);
     }
-    else
+    else if (Header.Kind == HACDBG_WOB_KIND_MINIFILTER)
     {
         HACDBG_MINIFILTER_REQUEST* MinifilterRequest;
 
@@ -243,6 +248,15 @@ WobCommHandle(
         MinifilterExecute(MinifilterRequest);
         HACDBG_LOG("HacDbg: WOB minifilter done status=0x%08x count=%u.\n", MinifilterRequest->Status,
                    MinifilterRequest->Count);
+    }
+    else
+    {
+        HACDBG_TIMER_REQUEST* TimerRequest;
+
+        TimerRequest = (HACDBG_TIMER_REQUEST*)Body;
+        HACDBG_LOG("HacDbg: WOB timer bytes=%u.\n", BodyBytes);
+        TimerExecute(TimerRequest);
+        HACDBG_LOG("HacDbg: WOB timer done status=0x%08x count=%u.\n", TimerRequest->Status, TimerRequest->Count);
     }
 
     if (WobCommUserCopy(Body, (UCHAR*)Buffer + sizeof(Header), BodyBytes, TRUE) == FALSE)

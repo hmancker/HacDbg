@@ -2059,6 +2059,99 @@ std::uint8_t command_minifilter(std::string_view body)
 
 	return 1;
 }
+
+std::uint8_t command_timer(std::string_view body)
+{
+	std::string operation = {};
+	std::string_view arguments = trim_edge(body);
+
+	if (take_token(arguments, operation) == 1 && same_text(operation, "remove") == 1)
+	{
+		std::string kind = {};
+		std::string address = {};
+		std::uint64_t timer = 0;
+		unsigned int type = 0;
+
+		if (take_token(arguments, kind) == 0 || take_token(arguments, address) == 0 || parse_callback_address(address, timer) == 0)
+		{
+			output::print("err, invalid syntax\n");
+			output::flush();
+
+			return 1;
+		}
+
+		if (same_text(kind, "io") == 1)
+		{
+			type = HACDBG_TIMER_IO;
+		}
+		else if (same_text(kind, "dpc") == 1)
+		{
+			type = HACDBG_TIMER_DPC;
+		}
+		else
+		{
+			output::print("err, timer type was not found\n");
+			output::flush();
+
+			return 1;
+		}
+
+		auto* request = new HACDBG_TIMER_REQUEST();
+		request->Reserved = HACDBG_TIMER_OP_REMOVE;
+		request->Rows[0].Type = type;
+		request->Rows[0].Timer = timer;
+		const bool sent = kernel_timer_request(*request);
+		if (sent == false || request->Status < 0)
+		{
+			output::print("err, timer failed: 0x{:08x}\n",
+			              sent == false ? 0xC0000225u : static_cast<std::uint32_t>(request->Status));
+		}
+		else
+		{
+			output::print("timer removed type={} timer={:016x}\n", kind, timer);
+		}
+
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	auto* request = new HACDBG_TIMER_REQUEST();
+	const bool sent = kernel_timer_request(*request);
+	if (sent == false || request->Status < 0)
+	{
+		output::print("err, timer failed: 0x{:08x}\n",
+		              sent == false ? 0xC0000225u : static_cast<std::uint32_t>(request->Status));
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	output::print("timer count={} truncated={}\n", request->Count, request->Truncated);
+	for (unsigned int index = 0; index < request->Count && index < HACDBG_TIMER_MAX_ROWS; ++index)
+	{
+		const HACDBG_TIMER_ROW& row = request->Rows[index];
+		const std::wstring path = callback_dos_path(row.Path);
+		std::string company = {};
+		std::string version = {};
+		std::string description = {};
+		char narrow[HACDBG_TIMER_PATH_CHARS] = {};
+
+		callback_file_details(path, company, version, description);
+		(void)version;
+		WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, narrow, static_cast<int>(sizeof(narrow)), nullptr, nullptr);
+		output::print("  callback={:016x} {} period={} {} dpc={:016x} timer={:016x} {} | {} | {}\n", row.Callback,
+		              row.Type == HACDBG_TIMER_IO ? "IO Timer" : "DPC Timer", row.Period,
+		              row.Running != 0 ? "running" : "stopped", row.Dpc, row.Timer, narrow, company, description);
+	}
+
+	output::flush();
+	delete request;
+
+	return 1;
+}
 }
 
 std::uint8_t dispatch_gui_command(const std::string& command)
@@ -2144,6 +2237,11 @@ std::uint8_t dispatch_gui_command(const std::string& command)
 	if (same_text(name, "minifilter") == 1)
 	{
 		return command_minifilter(body);
+	}
+
+	if (same_text(name, "timer") == 1)
+	{
+		return command_timer(body);
 	}
 
 	return 0;

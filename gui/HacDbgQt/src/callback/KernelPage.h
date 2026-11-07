@@ -5,6 +5,7 @@
 class CallbackView;
 class FilterView;
 class MinifilterView;
+class TimerView;
 class QTabWidget;
 
 class KernelPage : public QWidget
@@ -25,6 +26,8 @@ private:
     CallbackView* m_callbacks = nullptr;
     FilterView* m_filters = nullptr;
     MinifilterView* m_minifilters = nullptr;
+    TimerView* m_timers = nullptr;
     bool m_filtersLoaded = false;
     bool m_minifiltersLoaded = false;
+    bool m_timersLoaded = false;
 };

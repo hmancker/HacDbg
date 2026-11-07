@@ -161,3 +161,13 @@ bool kernel_minifilter_request(HACDBG_MINIFILTER_REQUEST& request)
 	                      sizeof(request));
 #endif
 }
+
+bool kernel_timer_request(HACDBG_TIMER_REQUEST& request)
+{
+#if HACDBG_COMM_WOB
+	return exchange(HACDBG_WOB_KIND_TIMER, &request, sizeof(request));
+#else
+	return ioctl_exchange(CTL_CODE(FILE_DEVICE_UNKNOWN, 0x808, METHOD_BUFFERED, FILE_ANY_ACCESS), &request,
+	                      sizeof(request));
+#endif
+}

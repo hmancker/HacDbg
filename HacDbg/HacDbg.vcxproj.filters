@@ -63,6 +63,9 @@
     <ClCompile Include="Minifilter.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="Timer.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="Search.c">
       <Filter>Source Files</Filter>
     </ClCompile>

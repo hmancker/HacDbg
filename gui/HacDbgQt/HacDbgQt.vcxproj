@@ -91,6 +91,10 @@
     <None Include="src\callback\MinifilterView.h" />
     <None Include="src\callback\MinifilterDriver.cpp" />
     <None Include="src\callback\MinifilterDriver.h" />
+    <None Include="src\callback\TimerView.cpp" />
+    <None Include="src\callback\TimerView.h" />
+    <None Include="src\callback\TimerDriver.cpp" />
+    <None Include="src\callback\TimerDriver.h" />
     <None Include="src\TraceWindow.cpp" />
     <None Include="src\TraceWindow.h" />
     <None Include="src\MainWindow.cpp" />

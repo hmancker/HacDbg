@@ -219,6 +219,7 @@
     <ClCompile Include="Callback.c" />
     <ClCompile Include="Filter.c" />
     <ClCompile Include="Minifilter.c" />
+    <ClCompile Include="Timer.c" />
     <ClCompile Include="Search.c">
       <ExcludedFromBuild Condition="'$(HacDbgCommWob)'!='1'">true</ExcludedFromBuild>
     </ClCompile>

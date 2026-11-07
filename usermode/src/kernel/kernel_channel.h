@@ -7,6 +7,7 @@
 #include "kernel_callback.h"
 #include "kernel_filter.h"
 #include "kernel_minifilter.h"
+#include "kernel_timer.h"
 
 bool kernel_send_process(HACDBG_PROCESS_REQUEST& request);
 
@@ -18,3 +19,4 @@ bool kernel_window_request(HACDBG_WINDOW_REQUEST& request);
 bool kernel_callback_request(HACDBG_CALLBACK_REQUEST& request);
 bool kernel_filter_request(HACDBG_FILTER_REQUEST& request);
 bool kernel_minifilter_request(HACDBG_MINIFILTER_REQUEST& request);
+bool kernel_timer_request(HACDBG_TIMER_REQUEST& request);
