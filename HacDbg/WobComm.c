@@ -14,6 +14,7 @@
 #include "Search.h"
 #include "Types.h"
 #include "WindowProtect.h"
+#include "Callback.h"
 #include "WobComm.h"
 
 #include "../shared/wob_comm.h"
@@ -158,6 +159,10 @@ WobCommHandle(
     {
         BodyBytes = sizeof(HACDBG_WINDOW_REQUEST);
     }
+    else if (Header.Kind == HACDBG_WOB_KIND_CALLBACK)
+    {
+        BodyBytes = sizeof(HACDBG_CALLBACK_REQUEST);
+    }
     else
     {
         return STATUS_INVALID_PARAMETER;
@@ -191,7 +196,7 @@ WobCommHandle(
         HACDBG_LOG("HacDbg: WOB process done op=%u pid=%u status=0x%08x.\n", ProcessRequest->Operation,
                    ProcessRequest->Pid, ProcessRequest->Status);
     }
-    else
+    else if (Header.Kind == HACDBG_WOB_KIND_WINDOW)
     {
         HACDBG_WINDOW_REQUEST* WindowRequest;
 
@@ -199,6 +204,16 @@ WobCommHandle(
         HACDBG_LOG("HacDbg: WOB window op=%u owner=%u.\n", WindowRequest->Operation, WindowRequest->OwnerPid);
         WindowProtectExecute(WindowRequest);
         HACDBG_LOG("HacDbg: WOB window done op=%u status=0x%08x.\n", WindowRequest->Operation, WindowRequest->Status);
+    }
+    else
+    {
+        HACDBG_CALLBACK_REQUEST* CallbackRequest;
+
+        CallbackRequest = (HACDBG_CALLBACK_REQUEST*)Body;
+        HACDBG_LOG("HacDbg: WOB callback bytes=%u.\n", BodyBytes);
+        CallbackExecute(CallbackRequest);
+        HACDBG_LOG("HacDbg: WOB callback done status=0x%08x count=%u.\n", CallbackRequest->Status,
+                   CallbackRequest->Count);
     }
 
     if (WobCommUserCopy(Body, (UCHAR*)Buffer + sizeof(Header), BodyBytes, TRUE) == FALSE)

@@ -77,6 +77,10 @@
     <None Include="src\process\InjectDialog.h" />
     <None Include="src\process\HandleDialog.cpp" />
     <None Include="src\process\HandleDialog.h" />
+    <None Include="src\callback\CallbackView.cpp" />
+    <None Include="src\callback\CallbackView.h" />
+    <None Include="src\callback\CallbackDriver.cpp" />
+    <None Include="src\callback\CallbackDriver.h" />
     <None Include="src\TraceWindow.cpp" />
     <None Include="src\TraceWindow.h" />
     <None Include="src\MainWindow.cpp" />

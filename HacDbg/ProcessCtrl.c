@@ -1959,6 +1959,10 @@ ProcessCtrlExecute(
         HACDBG_LOG("HacDbg: Err, process op %lu pid %lu failed: 0x%08x.\n", Request->Operation, Request->Pid,
                    Status);
     }
+    else
+    {
+        HACDBG_LOG("HacDbg: Process op %lu pid %lu ok.\n", Request->Operation, Request->Pid);
+    }
 
     return Status;
 }

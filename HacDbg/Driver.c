@@ -16,6 +16,7 @@
 #include "ProcessCtrl.h"
 #include "Inject.h"
 #include "WindowProtect.h"
+#include "Callback.h"
 #if HACDBG_COMM_WOB
 #include "WobComm.h"
 #endif
@@ -651,6 +652,18 @@ HacDbgDeviceControl(
         status = STATUS_SUCCESS;
         Irp->IoStatus.Information = sizeof(HACDBG_WINDOW_REQUEST);
     }
+    else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_CALLBACK &&
+             inputLength >= sizeof(HACDBG_CALLBACK_REQUEST) &&
+             outputLength >= sizeof(HACDBG_CALLBACK_REQUEST))
+    {
+        HACDBG_LOG("HacDbg: IOCTL callback bytes=%u.\n", inputLength);
+        CallbackExecute((HACDBG_CALLBACK_REQUEST*)Irp->AssociatedIrp.SystemBuffer);
+        HACDBG_LOG("HacDbg: IOCTL callback done status=0x%08x count=%u.\n",
+                   ((HACDBG_CALLBACK_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Status,
+                   ((HACDBG_CALLBACK_REQUEST*)Irp->AssociatedIrp.SystemBuffer)->Count);
+        status = STATUS_SUCCESS;
+        Irp->IoStatus.Information = sizeof(HACDBG_CALLBACK_REQUEST);
+    }
     else if (stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_FLUSH_SLAT ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_HYPERCALL ||
              stack->Parameters.DeviceIoControl.IoControlCode == HACDBG_IOCTL_QUERY_VERSION)
@@ -688,6 +701,7 @@ HacDbgCreateDevice(
                             FILE_DEVICE_SECURE_OPEN, FALSE, &g_DeviceObject);
     if (!NT_SUCCESS(status))
     {
+        HACDBG_LOG("HacDbg: Err, device create failed: 0x%08x.\n", status);
         g_DeviceObject = NULL;
         return status;
     }
@@ -710,6 +724,7 @@ HacDbgCreateDevice(
     status = IoCreateSymbolicLink(&symbolicLinkName, &deviceName);
     if (!NT_SUCCESS(status))
     {
+        HACDBG_LOG("HacDbg: Err, device link failed: 0x%08x.\n", status);
         IoDeleteDevice(g_DeviceObject);
         g_DeviceObject = NULL;
         return status;

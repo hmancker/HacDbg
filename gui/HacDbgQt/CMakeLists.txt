@@ -34,6 +34,10 @@ set(HACDBG_QT_SOURCES
     src/ProcessThreadView.h
     src/WindowProtectView.cpp
     src/WindowProtectView.h
+    src/callback/CallbackView.cpp
+    src/callback/CallbackView.h
+    src/callback/CallbackDriver.cpp
+    src/callback/CallbackDriver.h
     src/window/WindowAffinity.cpp
     src/window/WindowAffinity.h
     src/Config.h
@@ -81,7 +85,7 @@ if(MSVC)
         /external:anglebrackets)
 endif()
 
-target_link_libraries(HacDbgQt PRIVATE Qt6::Widgets advapi32 user32 shell32)
+target_link_libraries(HacDbgQt PRIVATE Qt6::Widgets advapi32 user32 shell32 version)
 
 if(MSVC)
     target_link_options(HacDbgQt PRIVATE "/MANIFESTUAC:level='requireAdministrator' uiAccess='false'")

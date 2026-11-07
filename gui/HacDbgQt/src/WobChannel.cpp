@@ -5,6 +5,7 @@
 #include <Windows.h>
 
 #include <cstring>
+#include <vector>
 
 #if HACDBG_COMM_WOB
 namespace
@@ -39,32 +40,28 @@ bool wobExchange(const std::uint32_t kind, void* const body, const std::uint32_t
         return false;
     }
 
-    struct Packet
-    {
-        HACDBG_WOB_HEADER header;
-        unsigned char body[sizeof(HACDBG_WINDOW_REQUEST)];
-    } packet = {};
-
-    if (bodyBytes > sizeof(packet.body))
+    if (bodyBytes > 1024u * 1024u)
     {
         return false;
     }
 
-    std::memcpy(packet.header.Magic, kMagic, sizeof(kMagic));
-    packet.header.Version = HACDBG_WOB_VERSION;
-    packet.header.Kind = kind;
-    packet.header.BodyBytes = bodyBytes;
-    std::memcpy(packet.body, body, bodyBytes);
+    std::vector<unsigned char> packet(sizeof(HACDBG_WOB_HEADER) + bodyBytes);
+    auto* header = reinterpret_cast<HACDBG_WOB_HEADER*>(packet.data());
+    std::memcpy(header->Magic, kMagic, sizeof(kMagic));
+    header->Version = HACDBG_WOB_VERSION;
+    header->Kind = kind;
+    header->BodyBytes = bodyBytes;
+    std::memcpy(packet.data() + sizeof(HACDBG_WOB_HEADER), body, bodyBytes);
 
     unsigned long returned = 0;
-    const auto length = static_cast<unsigned long>(sizeof(packet.header) + bodyBytes);
-    const long status = function(0, &packet, length, &returned);
+    const auto length = static_cast<unsigned long>(packet.size());
+    const long status = function(0, packet.data(), length, &returned);
     if (status < 0)
     {
         return false;
     }
 
-    std::memcpy(body, packet.body, bodyBytes);
+    std::memcpy(body, packet.data() + sizeof(HACDBG_WOB_HEADER), bodyBytes);
     return true;
 }
 #endif

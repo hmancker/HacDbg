@@ -7,6 +7,7 @@
 #include <QString>
 
 class BreakpointView;
+class CallbackView;
 class CommandView;
 class MonitorView;
 class CpuView;
@@ -44,7 +45,8 @@ private:
         PageMonitors,
         PageSymbols,
         PageProcesses,
-        PageWindows
+        PageWindows,
+        PageCallbacks
     };
 
     void startCore();
@@ -76,10 +78,11 @@ private:
     SymbolView* m_symbols = nullptr;
     ProcessThreadView* m_processes = nullptr;
     WindowProtectView* m_windows = nullptr;
+    CallbackView* m_callbacks = nullptr;
     TraceWindow* m_trace = nullptr;
     QTabBar* m_tabs = nullptr;
     QStackedWidget* m_stack = nullptr;
-    QWidget* m_holders[7] = {};
+    QWidget* m_holders[8] = {};
     std::uint32_t m_windowProtectPid = 0;
     QTimer* m_timer = nullptr;
     QTimer* m_connectRetry = nullptr;

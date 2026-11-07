@@ -1536,6 +1536,16 @@ WindowProtectExecute(
 
     Request->Status = Status;
     WindowProtectFillHook(Request);
+    if (!NT_SUCCESS(Status))
+    {
+        HACDBG_LOG("HacDbg: Err, window op %u failed: 0x%08x.\n", Request->Operation, Status);
+    }
+    else
+    {
+        HACDBG_LOG("HacDbg: Window op %u ok armed=%u owner=%u rows=%u.\n", Request->Operation, Request->HookArmed,
+                   Request->OwnerPid, Request->RowCount);
+    }
+
     return Status;
 }
 

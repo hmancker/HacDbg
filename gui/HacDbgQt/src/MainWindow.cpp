@@ -8,6 +8,7 @@
 #include "ProcessThreadView.h"
 #include "SymbolView.h"
 #include "WindowProtectView.h"
+#include "callback/CallbackView.h"
 #include "TraceWindow.h"
 
 #include <QAction>
@@ -202,6 +203,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogContentsView), QStringLiteral("符号"));
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogListView), QStringLiteral("进程/线程"));
     m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_MessageBoxWarning), QStringLiteral("窗口保护"));
+    m_tabs->addTab(tabStyle->standardIcon(QStyle::SP_FileDialogInfoView), QStringLiteral("系统回调"));
 
     m_stack = new QStackedWidget(central);
     m_command = new CommandView(m_stack);
@@ -212,7 +214,7 @@ MainWindow::MainWindow(bool connectCore, QWidget* parent)
     }
     m_stack->addWidget(m_command);
 
-    for (int index = PageDisassembly; index <= PageWindows; ++index)
+    for (int index = PageDisassembly; index <= PageCallbacks; ++index)
     {
         m_holders[index] = new QWidget(m_stack);
         auto* holderLayout = new QVBoxLayout(m_holders[index]);
@@ -616,6 +618,14 @@ void MainWindow::ensurePage(int index)
         {
             m_windows->refresh();
         }
+    }
+    else if (index == PageCallbacks && m_callbacks == nullptr)
+    {
+        m_callbacks = new CallbackView(holder(index));
+        holder(index)->layout()->addWidget(m_callbacks);
+        connect(m_callbacks, &CallbackView::addressActivated, this, &MainWindow::openDisassembly);
+        connect(m_callbacks, &CallbackView::commandRequested, this, &MainWindow::executeCommand);
+        m_callbacks->refresh();
     }
 }
 

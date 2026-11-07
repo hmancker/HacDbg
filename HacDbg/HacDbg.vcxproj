@@ -147,6 +147,9 @@
     <DriverSign>
       <FileDigestAlgorithm>sha256</FileDigestAlgorithm>
     </DriverSign>
+    <PostBuildEvent>
+      <Command>call "$(SolutionDir)build\pack-qt-gui.bat"</Command>
+    </PostBuildEvent>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='DebugIntel|x64'">
     <ClCompile>
@@ -201,6 +204,7 @@
     <ClCompile Include="ProcessCtrl.c" />
     <ClCompile Include="Inject.c" />
     <ClCompile Include="WindowProtect.c" />
+    <ClCompile Include="Callback.c" />
     <ClCompile Include="Search.c">
       <ExcludedFromBuild Condition="'$(HacDbgCommWob)'!='1'">true</ExcludedFromBuild>
     </ClCompile>

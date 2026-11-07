@@ -9,6 +9,7 @@
 #endif
 
 #include <cstring>
+#include <vector>
 
 #if HACDBG_COMM_WOB
 namespace
@@ -42,32 +43,29 @@ bool exchange(const std::uint32_t kind, void* const body, const std::uint32_t bo
 {
 	const manage_wob_ticket_t function = manage_wob_ticket();
 
-	if (function == nullptr || body == nullptr || body_bytes == 0 || body_bytes > sizeof(HACDBG_WINDOW_REQUEST))
+	if (function == nullptr || body == nullptr || body_bytes == 0 || body_bytes > 1024u * 1024u)
 	{
 		return false;
 	}
 
-	struct packet_t
-	{
-		HACDBG_WOB_HEADER header;
-		unsigned char body[sizeof(HACDBG_WINDOW_REQUEST)];
-	} packet = {};
+	std::vector<unsigned char> packet(sizeof(HACDBG_WOB_HEADER) + body_bytes);
+	auto* header = reinterpret_cast<HACDBG_WOB_HEADER*>(packet.data());
 
-	std::memcpy(packet.header.Magic, k_magic, sizeof(k_magic));
-	packet.header.Version = HACDBG_WOB_VERSION;
-	packet.header.Kind = kind;
-	packet.header.BodyBytes = body_bytes;
-	std::memcpy(packet.body, body, body_bytes);
+	std::memcpy(header->Magic, k_magic, sizeof(k_magic));
+	header->Version = HACDBG_WOB_VERSION;
+	header->Kind = kind;
+	header->BodyBytes = body_bytes;
+	std::memcpy(packet.data() + sizeof(HACDBG_WOB_HEADER), body, body_bytes);
 
 	unsigned long returned = 0;
-	const long status = function(0, &packet, static_cast<unsigned long>(sizeof(packet.header) + body_bytes), &returned);
+	const long status = function(0, packet.data(), static_cast<unsigned long>(packet.size()), &returned);
 
 	if (status < 0)
 	{
 		return false;
 	}
 
-	std::memcpy(body, packet.body, body_bytes);
+	std::memcpy(body, packet.data() + sizeof(HACDBG_WOB_HEADER), body_bytes);
 
 	return true;
 }
@@ -130,6 +128,16 @@ bool kernel_window_request(HACDBG_WINDOW_REQUEST& request)
 	return exchange(HACDBG_WOB_KIND_WINDOW, &request, sizeof(request));
 #else
 	return ioctl_exchange(CTL_CODE(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_ANY_ACCESS), &request,
+	                      sizeof(request));
+#endif
+}
+
+bool kernel_callback_request(HACDBG_CALLBACK_REQUEST& request)
+{
+#if HACDBG_COMM_WOB
+	return exchange(HACDBG_WOB_KIND_CALLBACK, &request, sizeof(request));
+#else
+	return ioctl_exchange(CTL_CODE(FILE_DEVICE_UNKNOWN, 0x805, METHOD_BUFFERED, FILE_ANY_ACCESS), &request,
 	                      sizeof(request));
 #endif
 }

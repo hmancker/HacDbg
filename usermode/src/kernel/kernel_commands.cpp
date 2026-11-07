@@ -1349,6 +1349,443 @@ std::uint8_t command_user_kill(std::string_view body)
 
 	return 1;
 }
+
+std::wstring callback_dos_path(const wchar_t* kernel_path)
+{
+	const std::wstring path = kernel_path != nullptr ? kernel_path : L"";
+	const std::wstring root = L"\\SystemRoot";
+
+	if (path.size() >= root.size() && _wcsnicmp(path.c_str(), root.c_str(), root.size()) == 0)
+	{
+		wchar_t windows[MAX_PATH] = {};
+		const UINT chars = GetWindowsDirectoryW(windows, MAX_PATH);
+
+		if (chars == 0 || chars >= MAX_PATH)
+		{
+			return path;
+		}
+
+		return std::wstring(windows) + path.substr(root.size());
+	}
+
+	if (path.rfind(L"\\??\\", 0) == 0)
+	{
+		return path.substr(4);
+	}
+
+	return path;
+}
+
+std::string callback_version_string(const void* block, const std::wstring& key)
+{
+	void* value = nullptr;
+	unsigned int bytes = 0;
+
+	if (VerQueryValueW(block, key.c_str(), &value, &bytes) == FALSE || value == nullptr || bytes < sizeof(wchar_t))
+	{
+		return {};
+	}
+
+	char narrow[256] = {};
+
+	WideCharToMultiByte(CP_ACP, 0, static_cast<const wchar_t*>(value), -1, narrow, static_cast<int>(sizeof(narrow)),
+	                    nullptr, nullptr);
+
+	return narrow;
+}
+
+void callback_file_details(const std::wstring& path, std::string& company, std::string& version, std::string& description)
+{
+	const DWORD bytes = GetFileVersionInfoSizeW(path.c_str(), nullptr);
+
+	if (bytes == 0)
+	{
+		return;
+	}
+
+	std::vector<unsigned char> data(bytes);
+
+	if (GetFileVersionInfoW(path.c_str(), 0, bytes, data.data()) == FALSE)
+	{
+		return;
+	}
+
+	struct translation_t
+	{
+		unsigned short language;
+		unsigned short code_page;
+	}* translation = nullptr;
+	unsigned int translation_bytes = 0;
+
+	if (VerQueryValueW(data.data(), L"\\VarFileInfo\\Translation", reinterpret_cast<void**>(&translation),
+	                   &translation_bytes) == FALSE ||
+	    translation == nullptr || translation_bytes < sizeof(translation_t))
+	{
+		return;
+	}
+
+	wchar_t root[64] = {};
+
+	swprintf_s(root, L"\\StringFileInfo\\%04x%04x\\", translation->language, translation->code_page);
+	company = callback_version_string(data.data(), std::wstring(root) + L"CompanyName");
+	version = callback_version_string(data.data(), std::wstring(root) + L"FileVersion");
+	description = callback_version_string(data.data(), std::wstring(root) + L"FileDescription");
+}
+
+std::string_view trim_edge(std::string_view text)
+{
+	text = skip_space(text);
+
+	while (text.empty() == false && (text.back() == ' ' || text.back() == '\t' || text.back() == '\r' || text.back() == '\n'))
+	{
+		text.remove_suffix(1);
+	}
+
+	return text;
+}
+
+std::uint8_t callback_type_id(const std::string_view name, unsigned int& type_out)
+{
+	for (unsigned int type = HACDBG_CALLBACK_CREATE_PROCESS; type <= HACDBG_CALLBACK_POWER_SETTING; ++type)
+	{
+		if (same_text(name, HacDbgCallbackTypeName(type)) == 1)
+		{
+			type_out = type;
+
+			return 1;
+		}
+	}
+
+	return 0;
+}
+
+std::uint8_t callback_type_span(const std::string_view name, unsigned int& first_out, unsigned int& last_out, const char*& label_out)
+{
+	const struct
+	{
+		const char* label;
+		unsigned int first;
+		unsigned int last;
+	} groups[] = {
+	    {"CreateProcess", HACDBG_CALLBACK_CREATE_PROCESS, HACDBG_CALLBACK_CREATE_PROCESS_EX2},
+	    {"CreateThread", HACDBG_CALLBACK_CREATE_THREAD, HACDBG_CALLBACK_CREATE_THREAD_EX},
+	    {"LoadImage", HACDBG_CALLBACK_LOAD_IMAGE, HACDBG_CALLBACK_LOAD_IMAGE_EX},
+	    {"ProcessObCallback", HACDBG_CALLBACK_PROCESS_OB_PRE, HACDBG_CALLBACK_PROCESS_OB_POST},
+	    {"ThreadObCallback", HACDBG_CALLBACK_THREAD_OB_PRE, HACDBG_CALLBACK_THREAD_OB_POST},
+	    {"DesktopObCallback", HACDBG_CALLBACK_DESKTOP_OB_PRE, HACDBG_CALLBACK_DESKTOP_OB_POST},
+	    {"ImageVerification", HACDBG_CALLBACK_IMAGE_VERIFICATION, HACDBG_CALLBACK_IMAGE_VERIFICATION},
+	    {"BugCheck", HACDBG_CALLBACK_BUGCHECK, HACDBG_CALLBACK_BUGCHECK_REASON},
+	    {"Shutdown", HACDBG_CALLBACK_SHUTDOWN, HACDBG_CALLBACK_LAST_CHANCE_SHUTDOWN},
+	    {"CmpCallback", HACDBG_CALLBACK_REGISTRY, HACDBG_CALLBACK_REGISTRY},
+	    {"FsNotifyChange", HACDBG_CALLBACK_FS_NOTIFY, HACDBG_CALLBACK_FS_NOTIFY},
+	    {"LogonSessionTerminated", HACDBG_CALLBACK_LOGON_TERMINATED, HACDBG_CALLBACK_LOGON_TERMINATED_EX},
+	    {"PowerSetting", HACDBG_CALLBACK_POWER_SETTING, HACDBG_CALLBACK_POWER_SETTING},
+	};
+
+	for (const auto& group : groups)
+	{
+		if (same_text(name, group.label) == 1)
+		{
+			first_out = group.first;
+			last_out = group.last;
+			label_out = group.label;
+
+			return 1;
+		}
+	}
+
+	unsigned int type = 0;
+
+	if (callback_type_id(name, type) == 0)
+	{
+		return 0;
+	}
+
+	first_out = type;
+	last_out = type;
+	label_out = HacDbgCallbackTypeName(type);
+
+	return 1;
+}
+
+std::uint8_t parse_callback_address(const std::string& text, std::uint64_t& value_out)
+{
+	if (text.size() < 3 || text[0] != '0' || (text[1] != 'x' && text[1] != 'X'))
+	{
+		return 0;
+	}
+
+	char* end = nullptr;
+	const unsigned long long value = std::strtoull(text.c_str(), &end, 16);
+
+	if (end == text.c_str() || *end != '\0')
+	{
+		return 0;
+	}
+
+	value_out = static_cast<std::uint64_t>(value);
+
+	return 1;
+}
+
+std::uint8_t command_callback_edit(const std::vector<std::string>& tokens)
+{
+	unsigned int operation = HACDBG_CALLBACK_OP_SCAN;
+
+	if (same_text(tokens[0], "remove") == 1)
+	{
+		operation = HACDBG_CALLBACK_OP_REMOVE;
+	}
+	else if (same_text(tokens[0], "disable") == 1)
+	{
+		operation = HACDBG_CALLBACK_OP_DISABLE;
+	}
+	else if (same_text(tokens[0], "enable") == 1)
+	{
+		operation = HACDBG_CALLBACK_OP_ENABLE;
+	}
+	else
+	{
+		return 0;
+	}
+
+	if (tokens.size() < 3)
+	{
+		output::print("err, invalid syntax\n");
+		output::flush();
+
+		return 1;
+	}
+
+	std::uint64_t entry = 0;
+	std::uint64_t extra = 0;
+	std::size_t type_end = tokens.size() - 1;
+
+	if (parse_callback_address(tokens.back(), entry) == 0)
+	{
+		output::print("err, invalid syntax\n");
+		output::flush();
+
+		return 1;
+	}
+
+	if (tokens.size() >= 4 && parse_callback_address(tokens[tokens.size() - 2], entry) == 1)
+	{
+		if (parse_callback_address(tokens.back(), extra) == 0)
+		{
+			output::print("err, invalid syntax\n");
+			output::flush();
+
+			return 1;
+		}
+
+		type_end = tokens.size() - 2;
+	}
+
+	std::string type_name = {};
+
+	for (std::size_t index = 1; index < type_end; ++index)
+	{
+		if (type_name.empty() == false)
+		{
+			type_name.push_back(' ');
+		}
+
+		type_name += tokens[index];
+	}
+
+	unsigned int selected_type = 0;
+
+	if (type_name.empty() == true || callback_type_id(type_name, selected_type) == 0)
+	{
+		output::print("err, callback type was not found\n");
+		output::flush();
+
+		return 1;
+	}
+
+	auto* request = new HACDBG_CALLBACK_REQUEST();
+	const bool sent = kernel_callback_request(*request);
+
+	if (sent == false || request->Status < 0)
+	{
+		output::print("err, callback failed: 0x{:08x}\n",
+		              sent == false ? 0xC0000225u : static_cast<std::uint32_t>(request->Status));
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	const HACDBG_CALLBACK_ROW* match = nullptr;
+	unsigned int matches = 0;
+
+	for (unsigned int index = 0; index < request->Count && index < HACDBG_CALLBACK_MAX_ROWS; ++index)
+	{
+		const HACDBG_CALLBACK_ROW& row = request->Rows[index];
+
+		if (row.Type != selected_type || row.Entry != entry)
+		{
+			continue;
+		}
+
+		if (extra != 0 && row.Extra != extra)
+		{
+			continue;
+		}
+
+		match = &row;
+		matches += 1;
+	}
+
+	if (matches == 0)
+	{
+		output::print("err, callback entry was not found\n");
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	if (matches != 1)
+	{
+		output::print("err, callback entry is not unique\n");
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	HACDBG_CALLBACK_REQUEST edit = {};
+	const std::uint64_t printed_entry = match->Entry;
+	const std::uint64_t printed_extra = match->Extra;
+
+	edit.Reserved = operation;
+	edit.Rows[0] = *match;
+	delete request;
+
+	const bool edited = kernel_callback_request(edit);
+
+	if (edited == false || edit.Status < 0)
+	{
+		output::print("err, callback failed: 0x{:08x}\n",
+		              edited == false ? 0xC0000225u : static_cast<std::uint32_t>(edit.Status));
+		output::flush();
+
+		return 1;
+	}
+
+	output::print("callback {} type={} entry={:016x} extra={:016x}\n", tokens[0], HacDbgCallbackTypeName(selected_type),
+	              printed_entry, printed_extra);
+	output::flush();
+
+	return 1;
+}
+
+std::uint8_t command_callback(std::string_view body)
+{
+	std::vector<std::string> tokens = {};
+	std::string token = {};
+	std::string_view remaining = trim_edge(body);
+
+	while (take_token(remaining, token) == 1)
+	{
+		tokens.push_back(token);
+	}
+
+	if (tokens.empty() == false &&
+	    (same_text(tokens[0], "remove") == 1 || same_text(tokens[0], "disable") == 1 || same_text(tokens[0], "enable") == 1))
+	{
+		return command_callback_edit(tokens);
+	}
+
+	const std::string_view type_name = trim_edge(body);
+	unsigned int first_type = 0;
+	unsigned int last_type = 0;
+	const char* type_label = "";
+	const std::uint8_t filter_type = type_name.empty() == false ? 1 : 0;
+
+	if (filter_type == 1 && callback_type_span(type_name, first_type, last_type, type_label) == 0)
+	{
+		output::print("err, callback type was not found\n");
+		output::flush();
+
+		return 1;
+	}
+
+	auto* request = new HACDBG_CALLBACK_REQUEST();
+	const bool sent = kernel_callback_request(*request);
+
+	if (sent == false || request->Status < 0)
+	{
+		output::print("err, callback failed: 0x{:08x}\n",
+		              sent == false ? 0xC0000225u : static_cast<std::uint32_t>(request->Status));
+		output::flush();
+		delete request;
+
+		return 1;
+	}
+
+	unsigned int shown = 0;
+
+	for (unsigned int index = 0; index < request->Count && index < HACDBG_CALLBACK_MAX_ROWS; ++index)
+	{
+		if (filter_type == 0 || (request->Rows[index].Type >= first_type && request->Rows[index].Type <= last_type))
+		{
+			++shown;
+		}
+	}
+
+	if (filter_type == 1)
+	{
+		output::print("callback count={} truncated={} type={} shown={}\n", request->Count, request->Truncated, type_label,
+		              shown);
+	}
+	else
+	{
+		output::print("callback count={} truncated={}\n", request->Count, request->Truncated);
+	}
+
+	for (unsigned int index = 0; index < request->Count && index < HACDBG_CALLBACK_MAX_ROWS; ++index)
+	{
+		const HACDBG_CALLBACK_ROW& row = request->Rows[index];
+
+		if (filter_type == 1 && (row.Type < first_type || row.Type > last_type))
+		{
+			continue;
+		}
+
+		const std::wstring path = callback_dos_path(row.Path);
+		std::string company = {};
+		std::string version = {};
+		std::string description = {};
+		char narrow[HACDBG_CALLBACK_PATH_CHARS * 2] = {};
+
+		callback_file_details(path, company, version, description);
+		WideCharToMultiByte(CP_ACP, 0, path.c_str(), -1, narrow, static_cast<int>(sizeof(narrow)), nullptr, nullptr);
+		const char* state = "正常";
+		if (row.Reserved == HACDBG_CALLBACK_STATE_DISABLED)
+		{
+			state = "禁用";
+		}
+		else if (row.Reserved == HACDBG_CALLBACK_STATE_REMOVED)
+		{
+			state = "移除";
+		}
+		else if (row.Reserved == HACDBG_CALLBACK_STATE_ENABLED)
+		{
+			state = "启用";
+		}
+
+		output::print("  {} {} entry={:016x} extra={:016x} {} | {} | {} | {}\n", HacDbgCallbackTypeName(row.Type), state,
+		              row.Entry, row.Extra, narrow, company, version, description);
+	}
+
+	output::flush();
+	delete request;
+
+	return 1;
+}
 }
 
 std::uint8_t dispatch_gui_command(const std::string& command)
@@ -1419,6 +1856,11 @@ std::uint8_t dispatch_gui_command(const std::string& command)
 	if (same_text(name, ".trace") == 1)
 	{
 		return command_trace(body);
+	}
+
+	if (same_text(name, "callback") == 1)
+	{
+		return command_callback(body);
 	}
 
 	return 0;

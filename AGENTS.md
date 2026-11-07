@@ -157,7 +157,7 @@ MathPower(int Base, int Exp)
 |进程|`!process` `.process`|
 |线程|`!thread` `.thread`|
 |客户机内存和钩子|`rgpm` `wgpm` `cgpm` `gvat` `rgvm` `wgvm` `cgvm` `akh` `rkh` `hgpp` `fl` `hfpc` `lkm` `kme` `dkm` `gva`|
-|GUI 进程、窗口和 trace|`kill` `killk` `killf` `suspend` `resume` `hide` `ppl` `handle` `inject` `image` `window` `.trace`|
+|GUI 进程、窗口、回调和 trace|`kill` `killk` `killf` `suspend` `resume` `hide` `ppl` `handle` `inject` `image` `window` `callback` `.trace`|
 |杂项|`.cls` `cls` `.echo` `.printf` `.formats` `?` `.time` `version` `.help` `q` `.quit` `exit`|
 
 那份表「还没有的常见 WinDbg 系列」里的命令不要自行补上，除非用户要求。这包括 `ba`、`bu`、`bm`、`.frame`、`gu`、`wt`、`ub`、线程调用栈回溯、`dt -r`，以及用 `.symopt` 改选项。
